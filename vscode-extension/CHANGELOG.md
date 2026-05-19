@@ -2,6 +2,11 @@
 
 All notable changes to the VS Code extension will be documented in this file.
 
+## [0.10.1] - 2026-05-19
+
+### Bug Fixes
+- Implement IAnalyzableEcosystem on CopilotCliAdapter to prevent ENOENT errors on virtual session paths (#931)
+
 ## [0.10.0] - 2026-05-19
 
 ### Features
