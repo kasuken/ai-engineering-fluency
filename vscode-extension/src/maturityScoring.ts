@@ -19,12 +19,57 @@ function fmt(n: number): string {
 	return n.toLocaleString('en-US');
 }
 
-type CategoryScore = { stage: number; evidence: string[]; tips: string[] };
+/** Fluency stage levels (1 = AI Skeptic through 4 = AI Strategist). */
+type Stage = 1 | 2 | 3 | 4;
+
+type CategoryScore = { stage: Stage; evidence: string[]; tips: string[] };
+
+/** Promotes a stage to at least `next`, returning the higher of the two. */
+function promoteStage(current: Stage, next: Stage): Stage {
+	return Math.max(current, next) as Stage;
+}
+
+/** Human-readable labels for each stage. */
+const STAGE_LABELS: Record<Stage, string> = {
+	1: 'Stage 1: AI Skeptic',
+	2: 'Stage 2: AI Explorer',
+	3: 'Stage 3: AI Collaborator',
+	4: 'Stage 4: AI Strategist',
+};
+
+/** Computes the median stage from an array of category stage scores. */
+function computeMedianStage(stages: Stage[]): Stage {
+	const sorted = [...stages].sort((a, b) => a - b);
+	const mid = Math.floor(sorted.length / 2);
+	const median = sorted.length % 2 === 0
+		? Math.round((sorted[mid - 1] + sorted[mid]) / 2)
+		: sorted[mid];
+	return median as Stage;
+}
+
+/** VS Code Copilot slash commands (stored as tool calls by the session parser). */
+const SLASH_COMMANDS = ['explain', 'fix', 'tests', 'doc', 'generate', 'optimize', 'new', 'newNotebook', 'search', 'fixTestFailure', 'setupTests'] as const;
+
+/** Claude Code slash commands (stored with __slash__ prefix to avoid inflating tool counts). */
+const CLAUDE_SLASH_COMMANDS = ['review', 'bug', 'think', 'compact', 'pr_comments'] as const;
+
+/** Returns the slash commands actually used, based on tool call data. */
+function getUsedSlashCommands(byTool: Record<string, number>): string[] {
+	return [
+		...SLASH_COMMANDS.filter(cmd => (byTool[cmd] ?? 0) > 0),
+		...CLAUDE_SLASH_COMMANDS.filter(cmd => (byTool[`__slash__${cmd}`] ?? 0) > 0),
+	];
+}
+
+/** Counts tools intentionally invoked by the user (excludes automatic agent tools and slash-command entries). */
+function countNonAutoTools(byTool: Record<string, number>): number {
+	return Object.keys(byTool).filter(t => !AUTOMATIC_TOOL_SET.has(t.toLowerCase()) && !t.startsWith('__slash__')).length;
+}
 
 function _scorePromptEngineering(p: UsageAnalysisPeriod): CategoryScore {
 	const evidence: string[] = [];
 	const tips: string[] = [];
-	let stage = 1;
+	let stage: Stage = 1;
 
 	const totalInteractions = p.modeUsage.ask + p.modeUsage.edit + p.modeUsage.agent + p.modeUsage.cli;
 	if (totalInteractions > 0) { evidence.push(`${fmt(totalInteractions)} total interactions`); }
@@ -41,21 +86,16 @@ function _scorePromptEngineering(p: UsageAnalysisPeriod): CategoryScore {
 		}
 		if (p.conversationPatterns.avgTurnsPerSession >= 3) {
 			evidence.push(`Avg ${p.conversationPatterns.avgTurnsPerSession.toFixed(1)} exchanges per session`);
-			stage = Math.max(stage, 2) as 1 | 2 | 3 | 4;
+			stage = promoteStage(stage, 2);
 		}
 		if (p.conversationPatterns.avgTurnsPerSession >= 5) {
-			stage = Math.max(stage, 3) as 1 | 2 | 3 | 4;
+			stage = promoteStage(stage, 3);
 		}
 	}
 
 	if (totalInteractions >= 5) { stage = 2; }
 
-	const slashCommands = ['explain', 'fix', 'tests', 'doc', 'generate', 'optimize', 'new', 'newNotebook', 'search', 'fixTestFailure', 'setupTests'];
-	const claudeSlashCommands = ['review', 'bug', 'think', 'compact', 'pr_comments'];
-	const usedSlashCommands = [
-		...slashCommands.filter(cmd => (p.toolCalls.byTool[cmd] || 0) > 0),
-		...claudeSlashCommands.filter(cmd => (p.toolCalls.byTool[`__slash__${cmd}`] || 0) > 0),
-	];
+	const usedSlashCommands = getUsedSlashCommands(p.toolCalls.byTool);
 	if (usedSlashCommands.length > 0) { evidence.push(`Used slash commands: /${usedSlashCommands.join(', /')}`); }
 
 	const hasModelSwitching = p.modelSwitching.mixedTierSessions > 0 || p.modelSwitching.switchingFrequency > 0;
@@ -67,7 +107,7 @@ function _scorePromptEngineering(p: UsageAnalysisPeriod): CategoryScore {
 	if (hasModelSwitching) {
 		evidence.push(`Switched models in ${Math.round(p.modelSwitching.switchingFrequency)}% of sessions`);
 		if (stage < 4 && p.modelSwitching.mixedTierSessions > 0) {
-			stage = Math.max(stage, 3) as 1 | 2 | 3 | 4;
+			stage = promoteStage(stage, 3);
 		}
 	}
 
@@ -88,7 +128,7 @@ function _scorePromptEngineering(p: UsageAnalysisPeriod): CategoryScore {
 function _scoreContextEngineering(p: UsageAnalysisPeriod): CategoryScore {
 	const evidence: string[] = [];
 	const tips: string[] = [];
-	let stage = 1;
+	let stage: Stage = 1;
 
 	const refs = p.contextReferences;
 	const totalContextRefs = refs.file + refs.selection + refs.symbol + refs.codebase + refs.workspace;
@@ -118,7 +158,7 @@ function _scoreContextEngineering(p: UsageAnalysisPeriod): CategoryScore {
 	const imageRefs = refs.byKind['copilot.image'] || 0;
 	if (imageRefs > 0) {
 		evidence.push(`${fmt(imageRefs)} image references (vision)`);
-		stage = Math.max(stage, 3) as 1 | 2 | 3 | 4;
+		stage = promoteStage(stage, 3);
 	}
 
 	if (stage < 2) { tips.push('Try adding [#file or #selection](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts) references to give Copilot more context'); }
@@ -169,10 +209,10 @@ function _scoreContextEngineering(p: UsageAnalysisPeriod): CategoryScore {
 function _scoreAgentic(p: UsageAnalysisPeriod): CategoryScore {
 	const evidence: string[] = [];
 	const tips: string[] = [];
-	let stage = 1;
+	let stage: Stage = 1;
 
 	if (p.modeUsage.agent > 0) { evidence.push(`${fmt(p.modeUsage.agent)} agent-mode interactions`); stage = 2; }
-	if (p.modeUsage.cli > 0) { evidence.push(`${fmt(p.modeUsage.cli)} CLI interactions`); stage = Math.max(stage, 2) as 1 | 2 | 3 | 4; }
+	if (p.modeUsage.cli > 0) { evidence.push(`${fmt(p.modeUsage.cli)} CLI interactions`); stage = promoteStage(stage, 2); }
 	if (p.toolCalls.total > 0) { evidence.push(`${fmt(p.toolCalls.total)} tool calls executed`); }
 	if (p.modeUsage.edit > 0) { evidence.push(`${fmt(p.modeUsage.edit)} edit-mode interactions`); }
 
@@ -182,24 +222,24 @@ function _scoreAgentic(p: UsageAnalysisPeriod): CategoryScore {
 			: 0;
 		if (p.editScope.multiFileEdits > 0) {
 			evidence.push(`${fmt(p.editScope.multiFileEdits)} multi-file edit sessions (${multiFileRate}%)`);
-			stage = Math.max(stage, 2) as 1 | 2 | 3 | 4;
+			stage = promoteStage(stage, 2);
 		}
 		if (p.editScope.avgFilesPerSession >= 3) {
 			evidence.push(`Avg ${p.editScope.avgFilesPerSession.toFixed(1)} files per edit session`);
-			stage = Math.max(stage, 3) as 1 | 2 | 3 | 4;
+			stage = promoteStage(stage, 3);
 		}
 	}
 
 	if (p.agentTypes && p.agentTypes.editsAgent > 0) {
 		evidence.push(`${fmt(p.agentTypes.editsAgent)} edits agent sessions`);
-		stage = Math.max(stage, 2) as 1 | 2 | 3 | 4;
+		stage = promoteStage(stage, 2);
 	}
 
-	const nonAutoToolCount = Object.keys(p.toolCalls.byTool).filter(t => !AUTOMATIC_TOOL_SET.has(t.toLowerCase()) && !t.startsWith('__slash__')).length;
+	const nonAutoToolCount = countNonAutoTools(p.toolCalls.byTool);
 	if ((p.modeUsage.agent + p.modeUsage.cli) >= 10 && nonAutoToolCount >= 3) { stage = 3; }
 	if ((p.modeUsage.agent + p.modeUsage.cli) >= 50 && nonAutoToolCount >= 5) { stage = 4; }
 	if (p.editScope && p.editScope.multiFileEdits >= 20 && p.editScope.avgFilesPerSession >= 3) {
-		stage = Math.max(stage, 4) as 1 | 2 | 3 | 4;
+		stage = promoteStage(stage, 4);
 	}
 
 	if (stage < 2) { tips.push('Try [agent mode](https://code.visualstudio.com/docs/copilot/agents/overview) — it can run terminal commands, edit files, and explore your codebase autonomously'); }
@@ -212,10 +252,10 @@ function _scoreAgentic(p: UsageAnalysisPeriod): CategoryScore {
 function _scoreToolUsage(p: UsageAnalysisPeriod): CategoryScore {
 	const evidence: string[] = [];
 	const tips: string[] = [];
-	let stage = 1;
+	let stage: Stage = 1;
 
 	const toolCount = Object.keys(p.toolCalls.byTool).length;
-	const nonAutoToolCount = Object.keys(p.toolCalls.byTool).filter(t => !AUTOMATIC_TOOL_SET.has(t.toLowerCase()) && !t.startsWith('__slash__')).length;
+	const nonAutoToolCount = countNonAutoTools(p.toolCalls.byTool);
 
 	if (nonAutoToolCount > 0) {
 		const autoCount = toolCount - nonAutoToolCount;
@@ -229,7 +269,7 @@ function _scoreToolUsage(p: UsageAnalysisPeriod): CategoryScore {
 	if (p.agentTypes) {
 		if (p.agentTypes.workspaceAgent > 0) {
 			evidence.push(`${fmt(p.agentTypes.workspaceAgent)} @workspace agent sessions`);
-			stage = Math.max(stage, 3) as 1 | 2 | 3 | 4;
+			stage = promoteStage(stage, 3);
 		}
 	}
 
@@ -243,13 +283,13 @@ function _scoreToolUsage(p: UsageAnalysisPeriod): CategoryScore {
 	const usedAdvanced = Object.keys(advancedToolFriendlyNames).filter(t => (p.toolCalls.byTool[t] || 0) > 0);
 	if (usedAdvanced.length > 0) {
 		evidence.push(`Advanced tools: ${usedAdvanced.map(t => advancedToolFriendlyNames[t]).join(', ')}`);
-		if (usedAdvanced.length >= 2) { stage = Math.max(stage, 3) as 1 | 2 | 3 | 4; }
+		if (usedAdvanced.length >= 2) { stage = promoteStage(stage, 3); }
 	}
 
 	const mcpServers = Object.keys(p.mcpTools.byServer);
 	if (p.mcpTools.total > 0) {
 		evidence.push(`${fmt(p.mcpTools.total)} MCP tool calls across ${mcpServers.length} server(s)`);
-		stage = Math.max(stage, 3) as 1 | 2 | 3 | 4;
+		stage = promoteStage(stage, 3);
 		if (mcpServers.length >= 2) { stage = 4; }
 	}
 
@@ -277,7 +317,7 @@ function _scoreToolUsage(p: UsageAnalysisPeriod): CategoryScore {
 function _scoreCustomization(p: UsageAnalysisPeriod, lastCustomizationMatrix: WorkspaceCustomizationMatrix | undefined): CategoryScore {
 	const evidence: string[] = [];
 	const tips: string[] = [];
-	let stage = 1;
+	let stage: Stage = 1;
 
 	const matrix = lastCustomizationMatrix;
 	const totalRepos = matrix?.totalWorkspaces ?? 0;
@@ -296,7 +336,7 @@ function _scoreCustomization(p: UsageAnalysisPeriod, lastCustomizationMatrix: Wo
 		if (hasStage4Models) {
 			stage = 4;
 		} else {
-			stage = Math.max(stage, 3) as 1 | 2 | 3 | 4;
+			stage = promoteStage(stage, 3);
 		}
 	}
 
@@ -350,14 +390,14 @@ function _scoreCustomization(p: UsageAnalysisPeriod, lastCustomizationMatrix: Wo
 function _scoreWorkflowIntegration(p: UsageAnalysisPeriod): CategoryScore {
 	const evidence: string[] = [];
 	const tips: string[] = [];
-	let stage = 1;
+	let stage: Stage = 1;
 
 	if (p.sessions >= 3) { evidence.push(`${fmt(p.sessions)} sessions in the last 30 days`); stage = 2; }
 
 	if (p.applyUsage && p.applyUsage.totalCodeBlocks > 0) {
 		const applyRatePercent = Math.round(p.applyUsage.applyRate);
 		evidence.push(`${applyRatePercent}% code block apply rate (${fmt(p.applyUsage.totalApplies)}/${fmt(p.applyUsage.totalCodeBlocks)})`);
-		if (applyRatePercent >= 50) { stage = Math.max(stage, 2) as 1 | 2 | 3 | 4; }
+		if (applyRatePercent >= 50) { stage = promoteStage(stage, 2); }
 	}
 
 	if (p.sessionDuration && p.sessionDuration.avgDurationMs > 0) {
@@ -370,13 +410,13 @@ function _scoreWorkflowIntegration(p: UsageAnalysisPeriod): CategoryScore {
 	const modesUsed = [p.modeUsage.ask > 0, p.modeUsage.agent > 0, p.modeUsage.cli > 0].filter(Boolean).length;
 	if (modesUsed >= 2) {
 		evidence.push(`Uses ${modesUsed} modes (ask/agent/cli)`);
-		stage = Math.max(stage, 3) as 1 | 2 | 3 | 4;
+		stage = promoteStage(stage, 3);
 	}
 
 	const hasExplicitContext = totalContextRefs >= 10;
 	if (hasExplicitContext) {
 		evidence.push(`${fmt(totalContextRefs)} explicit context references`);
-		if (totalContextRefs >= 20) { stage = Math.max(stage, 3) as 1 | 2 | 3 | 4; }
+		if (totalContextRefs >= 20) { stage = promoteStage(stage, 3); }
 	}
 
 	if (p.sessions >= 15 && modesUsed >= 2 && totalContextRefs >= 20) {
@@ -810,12 +850,6 @@ export function calculateFluencyScoreForTeamMember(fd: {
     multiTurnSessions: number; turnsPerSessionSum: number; turnsPerSessionCount: number;
     sessionCount: number; durationMsSum: number; durationMsCount: number;
   }, dashboardSessions: number): { stage: number; label: string; categories: { category: string; icon: string; stage: number; tips: string[] }[] } {
-    const stageLabels: Record<number, string> = {
-      1: "Stage 1: AI Skeptic",
-      2: "Stage 2: AI Explorer",
-      3: "Stage 3: AI Collaborator",
-      4: "Stage 4: AI Strategist",
-    };
 
     const totalInteractions = fd.askModeCount + fd.editModeCount + fd.agentModeCount + fd.cliModeCount;
     const avgTurnsPerSession = fd.turnsPerSessionCount > 0 ? fd.turnsPerSessionSum / fd.turnsPerSessionCount : 0;
@@ -823,28 +857,20 @@ export function calculateFluencyScoreForTeamMember(fd: {
     const hasModelSwitching = fd.mixedTierSessions > 0 || switchingFrequency > 0;
     const hasAgentMode = (fd.agentModeCount + fd.cliModeCount) > 0;
     const toolCount = Object.keys(fd.toolCallsByTool).length;
-    // Exclude __slash__ pseudo-entries from real tool counts (they track Claude slash commands, not actual tool calls)
-    const nonAutoToolCount = Object.keys(fd.toolCallsByTool).filter(t => !AUTOMATIC_TOOL_SET.has(t.toLowerCase()) && !t.startsWith('__slash__')).length;
+    const nonAutoToolCount = countNonAutoTools(fd.toolCallsByTool);
     const avgFilesPerSession = fd.filesPerEditCount > 0 ? fd.filesPerEditSum / fd.filesPerEditCount : 0;
     const avgApplyRate = fd.applyRateCount > 0 ? fd.applyRateSum / fd.applyRateCount : 0;
     const totalContextRefs = fd.ctxFile + fd.ctxSelection + fd.ctxSymbol + fd.ctxCodebase + fd.ctxWorkspace;
 
     // 1. Prompt Engineering
-    let peStage = 1;
-    // VS Code Copilot slash commands (stored as tool calls by the session parser)
-    const slashCmds = ["explain", "fix", "tests", "doc", "generate", "optimize", "new", "newNotebook", "search", "fixTestFailure", "setupTests"];
-    // Claude Code slash commands (stored with __slash__ prefix to avoid inflating tool counts)
-    const claudeSlashCmds = ["review", "bug", "think", "compact", "pr_comments"];
-    const usedSlashCommands = [
-      ...slashCmds.filter(cmd => (fd.toolCallsByTool[cmd] ?? 0) > 0),
-      ...claudeSlashCmds.filter(cmd => (fd.toolCallsByTool[`__slash__${cmd}`] ?? 0) > 0),
-    ];
-    if (avgTurnsPerSession >= 3) { peStage = Math.max(peStage, 2); }
-    if (avgTurnsPerSession >= 5) { peStage = Math.max(peStage, 3); }
-    if (totalInteractions >= 5) { peStage = Math.max(peStage, 2); }
-    if (totalInteractions >= 30 && (usedSlashCommands.length >= 2 || hasAgentMode)) { peStage = Math.max(peStage, 3); }
+    let peStage: Stage = 1;
+    const usedSlashCommands = getUsedSlashCommands(fd.toolCallsByTool);
+    if (avgTurnsPerSession >= 3) { peStage = promoteStage(peStage, 2); }
+    if (avgTurnsPerSession >= 5) { peStage = promoteStage(peStage, 3); }
+    if (totalInteractions >= 5) { peStage = promoteStage(peStage, 2); }
+    if (totalInteractions >= 30 && (usedSlashCommands.length >= 2 || hasAgentMode)) { peStage = promoteStage(peStage, 3); }
     if (totalInteractions >= 100 && hasAgentMode && (hasModelSwitching || usedSlashCommands.length >= 3)) { peStage = 4; }
-    if (hasModelSwitching && fd.mixedTierSessions > 0) { peStage = Math.max(peStage, 3); }
+    if (hasModelSwitching && fd.mixedTierSessions > 0) { peStage = promoteStage(peStage, 3); }
     const peTips: string[] = [];
     if (peStage < 2) { peTips.push("Try asking Copilot a question using the Chat panel"); }
     if (peStage < 3) {
@@ -858,7 +884,7 @@ export function calculateFluencyScoreForTeamMember(fd: {
     }
 
     // 2. Context Engineering
-    let ceStage = 1;
+    let ceStage: Stage = 1;
     const usedRefTypeCount = [
       fd.ctxFile, fd.ctxSelection, fd.ctxSymbol, fd.ctxCodebase, fd.ctxWorkspace,
       fd.ctxTerminal, fd.ctxVscode, fd.ctxClipboard, fd.ctxChanges,
@@ -867,7 +893,7 @@ export function calculateFluencyScoreForTeamMember(fd: {
     if (totalContextRefs >= 1) { ceStage = 2; }
     if (usedRefTypeCount >= 3 && totalContextRefs >= 10) { ceStage = 3; }
     if (usedRefTypeCount >= 5 && totalContextRefs >= 30) { ceStage = 4; }
-    if ((fd.ctxByKind["copilot.image"] ?? 0) > 0) { ceStage = Math.max(ceStage, 3); }
+    if ((fd.ctxByKind["copilot.image"] ?? 0) > 0) { ceStage = promoteStage(ceStage, 3); }
     const ceTips: string[] = [];
     if (ceStage < 2) { ceTips.push("Add #file or #selection references to give Copilot more context"); }
     if (ceStage < 3) { ceTips.push("Explore @workspace, #codebase, and @terminal for broader context"); }
@@ -914,27 +940,27 @@ export function calculateFluencyScoreForTeamMember(fd: {
     }
 
     // 3. Agentic
-    let agStage = 1;
+    let agStage: Stage = 1;
     if (hasAgentMode) { agStage = 2; }
-    if (fd.multiFileEdits > 0) { agStage = Math.max(agStage, 2); }
-    if (avgFilesPerSession >= 3) { agStage = Math.max(agStage, 3); }
-    if (fd.editsAgentCount > 0) { agStage = Math.max(agStage, 2); }
-    if (fd.agentModeCount >= 10 && nonAutoToolCount >= 3) { agStage = Math.max(agStage, 3); }
+    if (fd.multiFileEdits > 0) { agStage = promoteStage(agStage, 2); }
+    if (avgFilesPerSession >= 3) { agStage = promoteStage(agStage, 3); }
+    if (fd.editsAgentCount > 0) { agStage = promoteStage(agStage, 2); }
+    if (fd.agentModeCount >= 10 && nonAutoToolCount >= 3) { agStage = promoteStage(agStage, 3); }
     if (fd.agentModeCount >= 50 && nonAutoToolCount >= 5) { agStage = 4; }
-    if (fd.multiFileEdits >= 20 && avgFilesPerSession >= 3) { agStage = Math.max(agStage, 4); }
+    if (fd.multiFileEdits >= 20 && avgFilesPerSession >= 3) { agStage = promoteStage(agStage, 4); }
     const agTips: string[] = [];
     if (agStage < 2) { agTips.push("Try agent mode — it can run terminal commands, edit files, and explore codebases autonomously"); }
     if (agStage < 3) { agTips.push("Use agent mode for multi-step tasks; let it chain tools like file search, terminal, and code edits"); }
     if (agStage < 4) { agTips.push("Tackle complex refactoring or debugging tasks in agent mode for deeper autonomous workflows"); }
 
     // 4. Tool Usage
-    let tuStage = 1;
+    let tuStage: Stage = 1;
     if (nonAutoToolCount > 0) { tuStage = 2; }
-    if (fd.workspaceAgentCount > 0) { tuStage = Math.max(tuStage, 3); }
+    if (fd.workspaceAgentCount > 0) { tuStage = promoteStage(tuStage, 3); }
     const advancedToolIds = ["github_pull_request", "github_repo", "run_in_terminal", "editFiles", "listFiles"];
     const usedAdvancedCount = advancedToolIds.filter(t => (fd.toolCallsByTool[t] ?? 0) > 0).length;
-    if (usedAdvancedCount >= 2) { tuStage = Math.max(tuStage, 3); }
-    if (fd.mcpTotal > 0) { tuStage = Math.max(tuStage, 3); }
+    if (usedAdvancedCount >= 2) { tuStage = promoteStage(tuStage, 3); }
+    if (fd.mcpTotal > 0) { tuStage = promoteStage(tuStage, 3); }
     if (Object.keys(fd.mcpByServer).length >= 2) { tuStage = 4; }
     const tuTips: string[] = [];
     if (tuStage < 2) { tuTips.push("Try agent mode to let Copilot use built-in tools for file operations and terminal commands"); }
@@ -948,7 +974,7 @@ export function calculateFluencyScoreForTeamMember(fd: {
     }
 
     // 5. Customization
-    let cuStage = 1;
+    let cuStage: Stage = 1;
     const totalRepos = fd.repositories.size;
     const reposWithCustomization = fd.repositoriesWithCustomization.size;
     const customizationRate = totalRepos > 0 ? reposWithCustomization / totalRepos : 0;
@@ -956,7 +982,7 @@ export function calculateFluencyScoreForTeamMember(fd: {
     if (customizationRate >= 0.3 && reposWithCustomization >= 2) { cuStage = 3; }
     if (customizationRate >= 0.7 && reposWithCustomization >= 3) { cuStage = 4; }
     const uniqueModels = new Set([...fd.standardModels, ...fd.premiumModels]);
-    if (uniqueModels.size >= 3) { cuStage = Math.max(cuStage, 3); }
+    if (uniqueModels.size >= 3) { cuStage = promoteStage(cuStage, 3); }
     if (uniqueModels.size >= 5 && reposWithCustomization >= 3) { cuStage = 4; }
     const cuTips: string[] = [];
     if (cuStage < 2) { cuTips.push("Create a .github/copilot-instructions.md or CLAUDE.md file with project-specific guidelines"); }
@@ -977,12 +1003,12 @@ export function calculateFluencyScoreForTeamMember(fd: {
 
     // 6. Workflow Integration
     const effectiveSessions = Math.max(dashboardSessions, fd.sessionCount);
-    let wiStage = 1;
+    let wiStage: Stage = 1;
     if (effectiveSessions >= 3) { wiStage = 2; }
-    if (avgApplyRate >= 50) { wiStage = Math.max(wiStage, 2); }
+    if (avgApplyRate >= 50) { wiStage = promoteStage(wiStage, 2); }
     const modesUsed = [fd.askModeCount > 0, fd.agentModeCount > 0].filter(Boolean).length;
-    if (modesUsed >= 2) { wiStage = Math.max(wiStage, 3); }
-    if (totalContextRefs >= 20) { wiStage = Math.max(wiStage, 3); }
+    if (modesUsed >= 2) { wiStage = promoteStage(wiStage, 3); }
+    if (totalContextRefs >= 20) { wiStage = promoteStage(wiStage, 3); }
     if (effectiveSessions >= 15 && modesUsed >= 2 && totalContextRefs >= 20) { wiStage = 4; }
     const wiTips: string[] = [];
     if (wiStage < 2) { wiTips.push("Use Copilot more regularly — even for quick questions"); }
@@ -995,16 +1021,11 @@ export function calculateFluencyScoreForTeamMember(fd: {
       wiTips.push("Make Copilot part of every coding task: planning, coding, testing, and reviewing");
     }
 
-    // Overall: median of 6 category stages
-    const scores = [peStage, ceStage, agStage, tuStage, cuStage, wiStage].sort((a, b) => a - b);
-    const mid = Math.floor(scores.length / 2);
-    const overallStage = scores.length % 2 === 0
-      ? Math.round((scores[mid - 1] + scores[mid]) / 2)
-      : scores[mid];
+    const overallStage = computeMedianStage([peStage, ceStage, agStage, tuStage, cuStage, wiStage] as Stage[]);
 
     return {
       stage: overallStage,
-      label: stageLabels[overallStage] ?? `Stage ${overallStage}`,
+      label: STAGE_LABELS[overallStage as Stage] ?? `Stage ${overallStage}`,
       categories: [
         { category: "Prompt Engineering", icon: "💬", stage: peStage, tips: peTips },
         { category: "Context Engineering", icon: "📎", stage: ceStage, tips: ceTips },
@@ -1032,13 +1053,6 @@ export async function calculateMaturityScores(lastCustomizationMatrix: Workspace
 	const stats = await calculateUsageAnalysisStatsFn(useCache);
 	const p = stats.last30Days;
 
-	const stageLabels: Record<number, string> = {
-		1: 'Stage 1: AI Skeptic',
-		2: 'Stage 2: AI Explorer',
-		3: 'Stage 3: AI Collaborator',
-		4: 'Stage 4: AI Strategist'
-	};
-
 	const pe = _scorePromptEngineering(p);
 	const ce = _scoreContextEngineering(p);
 	const ag = _scoreAgentic(p);
@@ -1046,15 +1060,11 @@ export async function calculateMaturityScores(lastCustomizationMatrix: Workspace
 	const cu = _scoreCustomization(p, lastCustomizationMatrix);
 	const wi = _scoreWorkflowIntegration(p);
 
-	const scores = [pe.stage, ce.stage, ag.stage, tu.stage, cu.stage, wi.stage].sort((a, b) => a - b);
-	const mid = Math.floor(scores.length / 2);
-	const overallStage = scores.length % 2 === 0
-		? Math.round((scores[mid - 1] + scores[mid]) / 2)
-		: scores[mid];
+	const overallStage = computeMedianStage([pe.stage, ce.stage, ag.stage, tu.stage, cu.stage, wi.stage]);
 
 	return {
 		overallStage,
-		overallLabel: stageLabels[overallStage] || `Stage ${overallStage}`,
+		overallLabel: STAGE_LABELS[overallStage as Stage] ?? `Stage ${overallStage}`,
 		categories: [
 			{ category: 'Prompt Engineering', icon: '💬', stage: pe.stage, evidence: pe.evidence, tips: pe.tips },
 			{ category: 'Context Engineering', icon: '📎', stage: ce.stage, evidence: ce.evidence, tips: ce.tips },
