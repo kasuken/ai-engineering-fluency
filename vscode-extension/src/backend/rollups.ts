@@ -159,41 +159,52 @@ function _mergeJsonFluencyMetrics(
 	if (val.sessionDurationJson) { ex.sessionDurationJson = mergeJsonMetrics(ex.sessionDurationJson, val.sessionDurationJson); }
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null;
+}
+
+function mergeNumericValues(existing: unknown, delta: number): number {
+	return (typeof existing === 'number' ? existing : 0) + delta;
+}
+
+function mergeNestedObject(
+	existing: Record<string, unknown>,
+	incoming: Record<string, unknown>
+): Record<string, unknown> {
+	const merged = { ...existing };
+	for (const key in incoming) {
+		const incomingVal = incoming[key];
+		merged[key] = typeof incomingVal === 'number'
+			? mergeNumericValues(existing[key], incomingVal)
+			: incomingVal;
+	}
+	return merged;
+}
+
+function mergeMetricEntry(existing: unknown, incoming: unknown): unknown {
+	if (typeof incoming === 'number') {
+		return mergeNumericValues(existing, incoming);
+	}
+	if (isPlainObject(incoming) && isPlainObject(existing)) {
+		return mergeNestedObject(existing, incoming);
+	}
+	return incoming;
+}
+
 /**
  * Helper function to merge JSON-serialized metrics objects.
  * Parses both JSONs, merges numeric values by adding them, and re-serializes.
  */
 function mergeJsonMetrics(existing: string | undefined, incoming: string): string {
 	try {
-		const existingObj = existing ? JSON.parse(existing) : {};
-		const incomingObj = JSON.parse(incoming);
-		
-		// Merge objects by adding numeric values
-		const merged: any = { ...existingObj };
+		const existingObj: Record<string, unknown> = existing ? JSON.parse(existing) : {};
+		const incomingObj: Record<string, unknown> = JSON.parse(incoming);
+
+		const merged: Record<string, unknown> = { ...existingObj };
 		for (const key in incomingObj) {
-			if (typeof incomingObj[key] === 'number') {
-				merged[key] = (merged[key] || 0) + incomingObj[key];
-			} else if (typeof incomingObj[key] === 'object' && incomingObj[key] !== null) {
-				// Recursively merge nested objects
-				if (typeof merged[key] === 'object' && merged[key] !== null) {
-					for (const subKey in incomingObj[key]) {
-						if (typeof incomingObj[key][subKey] === 'number') {
-							if (typeof merged[key][subKey] !== 'number') {
-								merged[key][subKey] = 0;
-							}
-							merged[key][subKey] += incomingObj[key][subKey];
-						} else {
-							merged[key][subKey] = incomingObj[key][subKey];
-						}
-					}
-				} else {
-					merged[key] = incomingObj[key];
-				}
-			} else {
-				merged[key] = incomingObj[key];
-			}
+			merged[key] = mergeMetricEntry(merged[key], incomingObj[key]);
 		}
-		
+
 		return JSON.stringify(merged);
 	} catch {
 		// If parsing fails, return the incoming value
