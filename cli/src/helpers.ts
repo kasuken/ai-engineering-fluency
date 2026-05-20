@@ -17,7 +17,7 @@ import { extractDailyFractions } from '../../vscode-extension/src/dailyAttributi
 import type { DetailedStats, PeriodStats, ModelUsage, EditorUsage, SessionFileCache, UsageAnalysisStats, UsageAnalysisPeriod, WorkspaceCustomizationMatrix } from '../../vscode-extension/src/types';
 import { analyzeSessionUsage, mergeUsageAnalysis, calculateModelSwitching, trackEnhancedMetrics } from '../../vscode-extension/src/usageAnalysis';
 import { createEmptyContextRefs } from '../../vscode-extension/src/tokenEstimation';
-import { withErrorRecovery, withErrorRecoverySync } from '../../vscode-extension/src/utils/errors';
+import { withErrorRecovery } from '../../vscode-extension/src/utils/errors';
 import * as vscodeStub from './vscode-stub';
 import { loadCache, saveCache, disableCache, getCached, setCached, getCacheStats } from './cliCache';
 import { ENVIRONMENTAL } from './constants';
@@ -105,7 +105,8 @@ export async function buildCustomizationMatrix(sessionFiles: string[]): Promise<
 		const workspaceJsonPath = path.join(hashDir, 'workspace.json');
 
 		try {
-			if (!fs.existsSync(workspaceJsonPath)) { continue; }
+			const workspaceJsonExists = await fs.promises.access(workspaceJsonPath).then(() => true).catch(() => false);
+			if (!workspaceJsonExists) { continue; }
 			const content = JSON.parse(await fs.promises.readFile(workspaceJsonPath, 'utf-8'));
 			const folderUri: string | undefined = content.folder;
 			if (!folderUri || !folderUri.startsWith('file://')) { continue; }
@@ -121,11 +122,13 @@ export async function buildCustomizationMatrix(sessionFiles: string[]): Promise<
 
 	let workspacesWithIssues = 0;
 	for (const wsPath of workspacePaths) {
-		const hasIssues = withErrorRecoverySync(
-			() => {
-				const hasInstructions = fs.existsSync(path.join(wsPath, '.github', 'copilot-instructions.md'));
-				const hasAgentsMd    = fs.existsSync(path.join(wsPath, 'agents.md'));
-				const hasClaudeMd    = fs.existsSync(path.join(wsPath, 'CLAUDE.md'));
+		const hasIssues = await withErrorRecovery(
+			async () => {
+				const [hasInstructions, hasAgentsMd, hasClaudeMd] = await Promise.all([
+					fs.promises.access(path.join(wsPath, '.github', 'copilot-instructions.md')).then(() => true).catch(() => false),
+					fs.promises.access(path.join(wsPath, 'agents.md')).then(() => true).catch(() => false),
+					fs.promises.access(path.join(wsPath, 'CLAUDE.md')).then(() => true).catch(() => false),
+				]);
 				return !hasInstructions && !hasAgentsMd && !hasClaudeMd;
 			},
 			true,
