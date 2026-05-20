@@ -151,6 +151,7 @@ import {
 } from './viewRegression';
 import { determineOnboardingAction } from './onboarding';
 import { addModelUsage, addEditorUsage, computeUtcDateRanges, aggregatePeriodStats, type SessionAggregateInput } from './statsHelpers';
+import { getNonce, buildCspMeta } from './utils/webviewUtils';
 
 type LocalViewRegressionProbeResult = {
   pass: boolean;
@@ -4547,18 +4548,10 @@ usageAnalysis: undefined
 	}
 
 	private getEnvironmentalHtml(webview: vscode.Webview, stats: DetailedStats): string {
-		const nonce = this.getNonce();
+		const nonce = getNonce();
 		const scriptUri = webview.asWebviewUri(
 			vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', 'environmental.js')
 		);
-
-		const csp = [
-			`default-src 'none'`,
-			`img-src ${webview.cspSource} https: data:`,
-			`style-src 'unsafe-inline' ${webview.cspSource}`,
-			`font-src ${webview.cspSource} https: data:`,
-			`script-src 'nonce-${nonce}'`,
-		].join('; ');
 
 		const dataWithBackend = {
 			...stats,
@@ -4572,7 +4565,7 @@ usageAnalysis: undefined
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Environmental Impact</title>
 		</head>
 		<body>
@@ -5305,16 +5298,8 @@ Return ONLY the JSON object, no markdown formatting, no explanations.`;
 	}
 
 	private getLogViewerHtml(webview: vscode.Webview, logData: SessionLogData): string {
-		const nonce = this.getNonce();
+		const nonce = getNonce();
 		const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', 'logviewer.js'));
-
-		const csp = [
-			`default-src 'none'`,
-			`img-src ${webview.cspSource} https: data:`,
-			`style-src 'unsafe-inline' ${webview.cspSource}`,
-			`font-src ${webview.cspSource} https: data:`,
-			`script-src 'nonce-${nonce}'`
-		].join('; ');
 
 		const initialData = JSON.stringify({ ...logData, compactNumbers: this.getCompactNumbersSetting() }).replace(/</g, '\\u003c');
 
@@ -5323,7 +5308,7 @@ Return ONLY the JSON object, no markdown formatting, no explanations.`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Session Log Viewer</title>
 		</head>
 		<body>
@@ -5970,7 +5955,7 @@ ${hashtag}`;
       isDebugMode: boolean;
     },
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(
         this.extensionUri,
@@ -5979,14 +5964,6 @@ ${hashtag}`;
         "fluency-level-viewer.js",
       ),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const dataWithBackend = {
       ...data,
@@ -6002,7 +5979,7 @@ ${hashtag}`;
 	<head>
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-		<meta http-equiv="Content-Security-Policy" content="${csp}" />
+		${buildCspMeta(webview, nonce)}
 		<title>Scoring Guide</title>
 	</head>
 	<body>
@@ -6044,18 +6021,10 @@ ${hashtag}`;
       }>;
     },
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "maturity.js"),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const dataWithBackend = {
       ...data,
@@ -6071,7 +6040,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>AI Engineering Fluency Score</title>
 		</head>
 		<body>
@@ -6824,20 +6793,12 @@ ${hashtag}`;
     webview: vscode.Webview,
     data: any | undefined,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "dashboard.js"),
     );
 
     const backendConfig = this.getDashboardBackendConfig();
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const dataWithBackend = data
       ? { ...data, backendConfigured: this.isBackendConfigured(), compactNumbers: this.getCompactNumbersSetting() }
@@ -6852,7 +6813,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Team Dashboard</title>
 		</head>
 		<body>
@@ -6863,16 +6824,6 @@ ${hashtag}`;
 			<script nonce="${nonce}" src="${scriptUri}"></script>
 		</body>
 		</html>`;
-  }
-
-  private getNonce(): string {
-    const possible =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let text = "";
-    for (let i = 0; i < 32; i++) {
-      text += possible.charAt(Math.floor(Math.random() * possible.length));
-    }
-    return text;
   }
 
   /**
@@ -6913,18 +6864,10 @@ ${hashtag}`;
     webview: vscode.Webview,
     stats: DetailedStats,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "details.js"),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const sortSettings = this.context.globalState.get('details.sortSettings', {
       editor: { key: 'name', dir: 'asc' },
@@ -6947,7 +6890,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>AI Engineering Fluency</title>
 		</head>
 		<body>
@@ -8051,7 +7994,7 @@ ${hashtag}`;
     sessionFolders: { dir: string; count: number }[] = [],
     backendStorageInfo: any = null,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(
         this.extensionUri,
@@ -8060,14 +8003,6 @@ ${hashtag}`;
         "diagnostics.js",
       ),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     // Get cache information
     let cacheSizeInMB = 0;
@@ -8163,7 +8098,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Diagnostic Report</title>
 		</head>
 		<body>
@@ -8412,18 +8347,10 @@ ${hashtag}`;
     dailyStats: DailyTokenStats[],
     periodsReady = true,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "chart.js"),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const chartData = { ...this.buildChartData(dailyStats), periodsReady, initialPeriod: this.lastChartPeriod, initialView: this.lastChartView };
 
@@ -8434,7 +8361,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>AI Engineering Fluency — Chart</title>
 		</head>
 		<body>
@@ -8451,18 +8378,10 @@ ${hashtag}`;
     webview: vscode.Webview,
     stats: UsageAnalysisStats | null,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "usage.js"),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     // Detect user's locale for number formatting
     const localeFromEnv =
@@ -8506,7 +8425,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Usage Analysis</title>
 		</head>
 		<body>
