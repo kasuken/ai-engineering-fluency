@@ -4,6 +4,33 @@
  */
 import type { ModelUsage, ModelPricing, ContextReferenceUsage } from './types';
 
+/** Minimum request shape needed by getModelFromRequest. */
+interface ModelRequestSource {
+	modelId?: string;
+	result?: {
+		metadata?: { modelId?: string };
+		details?: string;
+	};
+}
+
+/** Shape of a single delta event line in a JSONL session file. */
+interface DeltaEvent {
+	kind?: number;
+	/** Key path (array of path segments). */
+	k?: unknown;
+	/** Value to set or append. */
+	v?: unknown;
+}
+
+/** Per-model metrics from a session.shutdown event. */
+interface ShutdownModelMetrics {
+	usage?: {
+		inputTokens?: number;
+		outputTokens?: number;
+		cacheReadTokens?: number;
+		cacheWriteTokens?: number;
+	};
+}
 
 export function estimateTokensFromText(text: string, model: string = 'gpt-4', tokenEstimators: { [key: string]: number } = {}): number {
 	// Token estimation based on character count and model
@@ -97,15 +124,14 @@ export class DeltaTokenStrategy implements TokenEstimationStrategy {
 	estimate(lines: string[]): TokenEstimationResult {
 		let totalTokens = 0;
 		let totalThinkingTokens = 0;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		let sessionState: any = {};
+		let sessionState: Record<string, unknown> = {};
 		let parseFailedLines = 0;
 
 		for (const line of lines) {
 			if (!line.trim()) { continue; }
 			try {
 				const event = JSON.parse(line);
-				sessionState = applyDelta(sessionState, event);
+				sessionState = applyDelta(sessionState, event) as Record<string, unknown>;
 
 				// Incremental request messages (kind:2 append to requests array)
 				if (event.kind === 2 && event.k?.[0] === 'requests' && Array.isArray(event.v)) {
@@ -143,14 +169,15 @@ export class DeltaTokenStrategy implements TokenEstimationStrategy {
 		const rawUsageFallback = parseFailedLines > 0
 			? extractPerRequestUsageFromRawLines(lines)
 			: new Map<number, { promptTokens: number; outputTokens: number }>();
-		const requests: any[] = Array.isArray(sessionState.requests) ? sessionState.requests : [];
+		const rawRequests = sessionState['requests'];
+		const requests = (Array.isArray(rawRequests) ? rawRequests : []) as unknown[];
 		let maxIndex = requests.length;
 		for (const idx of rawUsageFallback.keys()) {
 			if (idx + 1 > maxIndex) { maxIndex = idx + 1; }
 		}
 		let totalActualTokens = 0;
 		for (let i = 0; i < maxIndex; i++) {
-			const request = requests[i];
+			const request = requests[i] as { result?: { promptTokens?: number; outputTokens?: number; metadata?: { promptTokens?: number; outputTokens?: number }; usage?: { promptTokens?: number; completionTokens?: number } } } | undefined;
 			let found = false;
 			if (request?.result) {
 				const result = request.result;
@@ -180,8 +207,9 @@ export class DeltaTokenStrategy implements TokenEstimationStrategy {
 		// Sub-agent results are built up char-by-char via delta events and are only
 		// complete in the fully reconstructed state — count them here.
 		for (const request of requests) {
-			if (!request?.response || !Array.isArray(request.response)) { continue; }
-			for (const responseItem of request.response) {
+			const req = request as { response?: unknown[] } | undefined;
+			if (!req?.response || !Array.isArray(req.response)) { continue; }
+			for (const responseItem of req.response) {
 				const subAgent = extractSubAgentData(responseItem);
 				if (subAgent) {
 					if (subAgent.prompt) { totalTokens += estimateTokensFromText(subAgent.prompt); }
@@ -231,7 +259,7 @@ export class EventJsonlTokenStrategy implements TokenEstimationStrategy {
 				if (event.type === 'session.shutdown' && event.data?.modelMetrics) {
 					if (!cliShutdownModelUsage) { cliShutdownModelUsage = {}; }
 					let shutdownTotal = 0;
-					for (const [modelName, metrics] of Object.entries(event.data.modelMetrics) as [string, any][]) {
+					for (const [modelName, metrics] of Object.entries(event.data.modelMetrics) as [string, ShutdownModelMetrics][]) {
 						const usage = metrics?.usage;
 						if (usage) {
 							const input = typeof usage.inputTokens === 'number' ? usage.inputTokens : 0;
@@ -371,7 +399,7 @@ export function estimateTokensFromJsonlSession(fileContent: string): TokenEstima
  * extension host's single-threaded event loop on large files.
  */
 export async function reconstructJsonlStateAsync(lines: string[], yieldInterval = 500): Promise<{ sessionState: any; isDeltaBased: boolean }> {
-	let sessionState: any = {};
+	let sessionState: Record<string, unknown> = {};
 	let isDeltaBased = false;
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i];
@@ -380,7 +408,7 @@ export async function reconstructJsonlStateAsync(lines: string[], yieldInterval 
 			const delta = JSON.parse(line);
 			if (typeof delta.kind === 'number') {
 				isDeltaBased = true;
-				sessionState = applyDelta(sessionState, delta);
+				sessionState = applyDelta(sessionState, delta) as Record<string, unknown>;
 			}
 		} catch {
 			// Skip invalid lines
@@ -455,13 +483,15 @@ export function buildReasoningEffortTimeline(lines: string[]): {
 
   for (const line of lines) {
     if (!line.trim()) { continue; }
-    let delta: any;
-    try { delta = JSON.parse(line); } catch { continue; }
+    let delta: DeltaEvent;
+    try { delta = JSON.parse(line) as DeltaEvent; } catch { continue; }
     if (typeof delta.kind !== 'number') { continue; }
 
     if (delta.kind === 0) {
       // Initial state: extract model from inputState.selectedModel
-      const model = delta.v?.inputState?.selectedModel;
+      const v = delta.v as Record<string, unknown> | undefined;
+      const inputState = v?.['inputState'] as Record<string, unknown> | undefined;
+      const model = inputState?.['selectedModel'];
       const effort = extractEffortFromModel(model);
       if (effort !== null) {
         currentEffort = effort;
@@ -521,7 +551,7 @@ export function extractPerRequestUsageFromRawLines(lines: string[]): Map<number,
 	return usage;
 }
 
-export function getModelFromRequest(request: any, modelPricing: { [key: string]: ModelPricing } = {}): string {
+export function getModelFromRequest(request: ModelRequestSource, modelPricing: { [key: string]: ModelPricing } = {}): string {
 	// Try to determine model from request metadata (most reliable source)
 	// First check the top-level modelId field (VS Code format)
 	if (request.modelId) {
@@ -599,12 +629,13 @@ export function isUuidPointerFile(content: string): boolean {
  * - k = key path (array of strings)
  * - v = value
  */
-export function applyDelta(state: any, delta: any): any {
+export function applyDelta(state: unknown, delta: unknown): unknown {
 	if (typeof delta !== 'object' || delta === null) {
 		return state;
 	}
 
-	const { kind, k, v } = delta;
+	const d = delta as Record<string, unknown>;
+	const { kind, k, v } = d;
 
 	if (kind === 0) {
 		// Initial state - full replacement
@@ -616,8 +647,8 @@ export function applyDelta(state: any, delta: any): any {
 	}
 
 	const pathArr = k.map(String);
-	let root = typeof state === 'object' && state !== null ? state : {};
-	let current: any = root;
+	let root: Record<string, unknown> | unknown[] = typeof state === 'object' && state !== null ? state as Record<string, unknown> | unknown[] : {};
+	let current: Record<string, unknown> | unknown[] = root;
 
 	// Traverse to the parent of the target location
 	for (let i = 0; i < pathArr.length - 1; i++) {
@@ -630,12 +661,12 @@ export function applyDelta(state: any, delta: any): any {
 			if (!current[idx] || typeof current[idx] !== 'object') {
 				current[idx] = wantsArray ? [] : {};
 			}
-			current = current[idx];
+			current = current[idx] as Record<string, unknown> | unknown[];
 		} else {
 			if (!current[seg] || typeof current[seg] !== 'object') {
 				current[seg] = wantsArray ? [] : {};
 			}
-			current = current[seg];
+			current = current[seg] as Record<string, unknown> | unknown[];
 		}
 	}
 
@@ -653,22 +684,22 @@ export function applyDelta(state: any, delta: any): any {
 
 	if (kind === 2) {
 		// Append value(s) to array at key path
-		let target: any[];
+		let target: unknown[];
 		if (Array.isArray(current)) {
 			const idx = Number(lastSeg);
 			if (!Array.isArray(current[idx])) {
 				current[idx] = [];
 			}
-			target = current[idx];
+			target = current[idx] as unknown[];
 		} else {
 			if (!Array.isArray(current[lastSeg])) {
 				current[lastSeg] = [];
 			}
-			target = current[lastSeg];
+			target = current[lastSeg] as unknown[];
 		}
 
 		if (Array.isArray(v)) {
-			target.push(...v);
+			target.push(...(v as unknown[]));
 		} else {
 			target.push(v);
 		}
