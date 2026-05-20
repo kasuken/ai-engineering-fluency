@@ -337,13 +337,13 @@ if (sessionFilePath.endsWith('.jsonl')) {
 const lines = fileContent.split(/\r?\n/).filter(l => l.trim());
 let isDeltaBased = false;
 if (lines.length > 0) {
-try { const first = JSON.parse(lines[0]); if (first && typeof first.kind === 'number') { isDeltaBased = true; } } catch {}
+try { const first = JSON.parse(lines[0]); if (first && typeof first.kind === 'number') { isDeltaBased = true; } } catch (err) { console.error('[sessionParser] Failed to parse first JSONL line to detect format:', err); }
 }
 
 if (isDeltaBased) {
 let sessionState: unknown = Object.create(null);
 for (const line of lines) {
-try { const delta = JSON.parse(line); sessionState = applyDelta(sessionState, delta); } catch { }
+try { const delta = JSON.parse(line); sessionState = applyDelta(sessionState, delta); } catch (err) { console.error('[sessionParser] Failed to parse or apply JSONL delta line:', err); }
 }
 
 const sessionStateObj = isObject(sessionState) ? sessionState : null;
@@ -365,12 +365,12 @@ actualTokens: 0,
 }
 
 // Fallback: sometimes .jsonl contains a single JSON object
-try { sessionJson = JSON.parse(fileContent.trim()); } catch { return { tokens: 0, interactions: 0, modelUsage: {}, thinkingTokens: 0, actualTokens: 0 }; }
+try { sessionJson = JSON.parse(fileContent.trim()); } catch (err) { console.error('[sessionParser] Failed to parse JSONL file as single JSON object:', err); return { tokens: 0, interactions: 0, modelUsage: {}, thinkingTokens: 0, actualTokens: 0 }; }
 }
 
 // Non-jsonl (JSON file) - try to parse full JSON
 if (!sessionJson) {
-try { sessionJson = JSON.parse(fileContent); } catch { return { tokens: 0, interactions: 0, modelUsage: {}, thinkingTokens: 0, actualTokens: 0 }; }
+try { sessionJson = JSON.parse(fileContent); } catch (err) { console.error('[sessionParser] Failed to parse session JSON file:', err); return { tokens: 0, interactions: 0, modelUsage: {}, thinkingTokens: 0, actualTokens: 0 }; }
 }
 
 if (!isObject(sessionJson) || Array.isArray(sessionJson)) {
