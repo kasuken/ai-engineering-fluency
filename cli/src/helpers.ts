@@ -251,6 +251,7 @@ export interface SessionData {
  */
 /** Returns actual tokens when available (more accurate), else falls back to estimated. */
 export function effectiveTokens(data: SessionData): number {
+	if (!data) { return 0; }
 	return data.actualTokens > 0 ? data.actualTokens : data.tokens;
 }
 
@@ -728,6 +729,12 @@ const CHART_COLORS = [
  * returned by `calculateDailyStats`. Includes weekly and monthly period aggregations.
  */
 export function buildChartPayload(labels: string[], days: DailyEntry[], allDaysMap?: Map<string, DailyEntry>): object {
+	if (!labels || !days) {
+		throw new Error('buildChartPayload: labels and days are required');
+	}
+	if (labels.length !== days.length) {
+		throw new Error(`buildChartPayload: labels.length (${labels.length}) !== days.length (${days.length})`);
+	}
 	const fmtKey = (d: Date) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 
 	const buildPeriodFromEntries = (buckets: Array<{ label: string; entry: DailyEntry }>) => {
@@ -863,11 +870,13 @@ export function buildChartPayload(labels: string[], days: DailyEntry[], allDaysM
 
 /** Format a number with thousand separators */
 export function fmt(n: number): string {
-	return n.toLocaleString('en-US');
+	if (n == null || !Number.isFinite(n)) { return '0'; }
+	return Math.round(n).toLocaleString('en-US');
 }
 
 /** Format token counts for display */
 export function formatTokens(tokens: number): string {
+	if (tokens == null || !Number.isFinite(tokens) || tokens < 0) { return '0'; }
 	if (tokens >= 1_000_000_000) {
 		return `${(tokens / 1_000_000_000).toFixed(1)}B`;
 	}
