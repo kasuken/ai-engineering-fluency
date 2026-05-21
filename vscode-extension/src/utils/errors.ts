@@ -203,3 +203,35 @@ export async function withErrorRecovery<T>(fn: () => T | Promise<T>, fallback: T
 		return fallback;
 	}
 }
+
+/**
+ * Discriminated union returned by the Result variants of the recovery helpers.
+ * Callers can branch on `ok` to handle errors explicitly without needing a fallback value.
+ */
+export type Result<T> = { ok: true; value: T } | { ok: false; error: unknown };
+
+/**
+ * Like withErrorRecoverySync but returns a Result instead of requiring a fallback.
+ * Logs the error (same as the fallback variant) so failures remain visible.
+ */
+export function withErrorRecoverySyncResult<T>(fn: () => T, context?: string): Result<T> {
+	try {
+		return { ok: true, value: fn() };
+	} catch (err) {
+		console.error(`[recovery] ${context ?? 'unknown'}:`, err);
+		return { ok: false, error: err };
+	}
+}
+
+/**
+ * Like withErrorRecovery but returns a Result instead of requiring a fallback.
+ * Logs the error (same as the fallback variant) so failures remain visible.
+ */
+export async function withErrorRecoveryResult<T>(fn: () => T | Promise<T>, context?: string): Promise<Result<T>> {
+	try {
+		return { ok: true, value: await fn() };
+	} catch (err) {
+		console.error(`[recovery] ${context ?? 'unknown'}:`, err);
+		return { ok: false, error: err };
+	}
+}
