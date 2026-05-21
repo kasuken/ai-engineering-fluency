@@ -58,6 +58,18 @@ function isSubAgentToolSpecificData(obj: unknown): obj is SubAgentToolSpecificDa
 	return (obj as SubAgentToolSpecificData).kind === 'subagent';
 }
 
+// --- Token estimation ratio constants ---
+// Thresholds for classifying agent sessions by tool-call volume
+const TOOL_CALLS_HIGH_THRESHOLD = 20;
+const TOOL_CALLS_MED_THRESHOLD = 5;
+
+// Empirical input:output token ratios per tool-call tier.
+// Heavy agent sessions (many tool calls) show ~130x input:output ratio;
+// medium sessions ~50x; low/chat sessions ~10x.
+const TOKEN_RATIO_HIGH_TOOLS = 130;
+const TOKEN_RATIO_MED_TOOLS = 50;
+const TOKEN_RATIO_LOW_TOOLS = 10;
+
 export function estimateTokensFromText(text: string, model: string = 'gpt-4', tokenEstimators: Record<string, TokenEstimator> = {}): number {
 	// Token estimation based on character count and model
 	let tokensPerChar = 0.25; // default
@@ -392,7 +404,9 @@ export class EventJsonlTokenStrategy implements TokenEstimationStrategy {
 		// No session.shutdown: use real outputTokens from assistant.message + observed input:output ratios.
 		// Heavy agent sessions show ~130x ratio; cache reads ≈ input (50% of total from completed sessions).
 		if (!cliActualTokens && cliRealOutputByModel) {
-			const inputOutputRatio = totalEstToolCalls > 20 ? 130 : totalEstToolCalls > 5 ? 50 : 10;
+			const inputOutputRatio = totalEstToolCalls > TOOL_CALLS_HIGH_THRESHOLD ? TOKEN_RATIO_HIGH_TOOLS
+			: totalEstToolCalls > TOOL_CALLS_MED_THRESHOLD ? TOKEN_RATIO_MED_TOOLS
+			: TOKEN_RATIO_LOW_TOOLS;
 			for (const realOutput of Object.values(cliRealOutputByModel)) {
 				const estimatedInput = Math.round(realOutput * inputOutputRatio);
 				cliActualTokens += estimatedInput + realOutput;  // input + output (cache is a subset of input)
