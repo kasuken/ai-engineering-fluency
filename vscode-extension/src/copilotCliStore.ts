@@ -14,10 +14,16 @@
  * The '#' character acts as a separator identical to the pattern used by Crush
  * (crush.db#<uuid>) and OpenCode (opencode.db#ses_<id>).
  */
+/// <reference types="sql.js" />
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import initSqlJs from 'sql.js';
+
+// Access SqlJsStatic and Database via the globally declared initSqlJs namespace
+// (made available by the /// <reference types="sql.js" /> directive above).
+type SqlJsStatic = initSqlJs.SqlJsStatic;
+type SqlDatabase = initSqlJs.Database;
 
 export interface CliStoreSession {
 	id: string;
@@ -36,8 +42,29 @@ export interface CliStoreTurn {
 	timestamp: string | null;
 }
 
+export function isCliStoreSession(obj: unknown): obj is CliStoreSession {
+	if (typeof obj !== 'object' || obj === null) { return false; }
+	const r = obj as Record<string, unknown>;
+	return typeof r['id'] === 'string'
+		&& (r['repository'] === null || typeof r['repository'] === 'string')
+		&& (r['branch'] === null || typeof r['branch'] === 'string')
+		&& (r['summary'] === null || typeof r['summary'] === 'string')
+		&& (r['created_at'] === null || typeof r['created_at'] === 'string')
+		&& (r['updated_at'] === null || typeof r['updated_at'] === 'string');
+}
+
+export function isCliStoreTurn(obj: unknown): obj is CliStoreTurn {
+	if (typeof obj !== 'object' || obj === null) { return false; }
+	const r = obj as Record<string, unknown>;
+	return typeof r['session_id'] === 'string'
+		&& typeof r['turn_index'] === 'number'
+		&& (r['user_message'] === null || typeof r['user_message'] === 'string')
+		&& (r['assistant_response'] === null || typeof r['assistant_response'] === 'string')
+		&& (r['timestamp'] === null || typeof r['timestamp'] === 'string');
+}
+
 export class CopilotCliStoreAccess {
-	private _sqlJsModule: any = null;
+	private _sqlJsModule: SqlJsStatic | null = null;
 
 	/** Absolute path to ~/.copilot/session-store.db. */
 	getDbPath(): string {
@@ -75,15 +102,16 @@ export class CopilotCliStoreAccess {
 	}
 
 	/** Lazily initialise and cache the sql.js WASM module. */
-	async initSqlJs(): Promise<any> {
+	async initSqlJs(): Promise<SqlJsStatic> {
 		if (this._sqlJsModule) { return this._sqlJsModule; }
 		const wasmPath = path.join(__dirname, 'sql-wasm.wasm');
 		let wasmBinary: Uint8Array | undefined;
 		if (fs.existsSync(wasmPath)) {
 			wasmBinary = fs.readFileSync(wasmPath);
 		}
-		this._sqlJsModule = await initSqlJs(wasmBinary ? { wasmBinary } : undefined);
-		return this._sqlJsModule;
+		const sqlJs = await initSqlJs(wasmBinary ? { wasmBinary } : undefined);
+		this._sqlJsModule = sqlJs;
+		return sqlJs;
 	}
 
 	/**
@@ -101,7 +129,7 @@ export class CopilotCliStoreAccess {
 			try {
 				const result = db.exec('SELECT id FROM sessions ORDER BY updated_at DESC');
 				if (result.length === 0) { return []; }
-				return (result[0].values as unknown[][])
+				return result[0].values
 					.map(row => row[0] as string)
 					.filter(id => !knownUuids.has(id));
 			} finally {
@@ -131,7 +159,8 @@ export class CopilotCliStoreAccess {
 				const row = result[0].values[0];
 				const obj: Record<string, unknown> = {};
 				cols.forEach((c: string, i: number) => { obj[c] = row[i]; });
-				return obj as unknown as CliStoreSession;
+				if (!isCliStoreSession(obj)) { return null; }
+				return obj;
 			} finally {
 				db.close();
 			}
@@ -156,11 +185,15 @@ export class CopilotCliStoreAccess {
 				);
 				if (result.length === 0) { return []; }
 				const cols = result[0].columns;
-				return (result[0].values as unknown[][]).map(row => {
+				const turns: CliStoreTurn[] = [];
+				for (const row of result[0].values) {
 					const obj: Record<string, unknown> = {};
 					cols.forEach((c: string, i: number) => { obj[c] = row[i]; });
-					return obj as unknown as CliStoreTurn;
-				});
+					if (isCliStoreTurn(obj)) {
+						turns.push(obj);
+					}
+				}
+				return turns;
 			} finally {
 				db.close();
 			}

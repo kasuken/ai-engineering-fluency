@@ -8,6 +8,25 @@ import * as path from 'path';
 import type { CustomizationFileEntry } from './types';
 import * as packageJson from '../package.json';
 import customizationPatternsData from './customizationPatterns.json';
+import { resolveFileUri } from './workspacePathResolver';
+import {
+	fileUriToPath,
+	hasWindowsDriveSegment,
+	normalizePath,
+	normalizePathForComparison,
+	normalizePathForDedup,
+	splitNormalizedPath,
+	stripWindowsDriveUriPrefix,
+	toPlatformPath
+} from './utils/pathUtils';
+import { withErrorRecoverySync } from './utils/errors';
+
+export {
+	fileUriToPath,
+	normalizePathForComparison,
+	normalizePathForDedup,
+	normalizePathSeparators
+} from './utils/pathUtils';
 
 
 // ── Local type definitions ────────────────────────────────────────────────
@@ -61,25 +80,22 @@ interface CustomizationPatternsConfig {
  */
 // Helper: read a workspaceStorage JSON file and extract a candidate folder path from configured keys
 export function parseWorkspaceStorageJsonFile(jsonPath: string, candidateKeys: string[]): string | undefined {
+	if (typeof jsonPath !== 'string' || !jsonPath || !Array.isArray(candidateKeys)) { return undefined; }
 	try {
 		const raw = fs.readFileSync(jsonPath, 'utf8');
 		const obj = JSON.parse(raw);
+		if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) { return undefined; }
 		for (const key of candidateKeys) {
 			const candidate = obj[key];
 			if (typeof candidate !== 'string') { continue; }
-			const pathCandidate = candidate.replace(/^file:\/\//, '');
-			// Prefer vscode.Uri.parse -> fsPath when possible
-			try {
-				const uri = vscode.Uri.parse(candidate);
-				if (uri.fsPath && uri.fsPath.length > 0) {
-					return uri.fsPath;
-				}
-			} catch { }
-			try {
-				return decodeURIComponent(pathCandidate);
-			} catch {
-				return pathCandidate;
+			// Resolve file:// URIs using the safe resolver (handles Windows, POSIX, UNC, encoded chars).
+			if (candidate.startsWith('file://')) {
+				const resolved = resolveFileUri(candidate);
+				if (resolved) { return resolved; }
+				continue;
 			}
+			// Non-URI value — treat as a plain filesystem path.
+			return candidate;
 		}
 	} catch {
 		// ignore parse/read errors
@@ -93,8 +109,7 @@ export function parseWorkspaceStorageJsonFile(jsonPath: string, candidateKeys: s
  */
 export function extractWorkspaceIdFromSessionPath(sessionFilePath: string): string | undefined {
 	try {
-		const normalized = sessionFilePath.replace(/\\/g, '/');
-		const parts = normalized.split('/').filter(p => p.length > 0);
+		const parts = splitNormalizedPath(sessionFilePath);
 		const idx = parts.findIndex(p => p.toLowerCase() === 'workspacestorage');
 		if (idx === -1 || idx + 1 >= parts.length) {
 			return undefined; // Not a workspace-scoped session file
@@ -111,7 +126,7 @@ export function extractWorkspaceIdFromSessionPath(sessionFilePath: string): stri
  */
 export function globToRegExp(glob: string, caseInsensitive: boolean = false): RegExp {
 	// Normalize to posix-style
-	let pattern = glob.replace(/\\/g, '/');
+	let pattern = normalizePath(glob);
 	// Escape regex special chars
 	pattern = pattern.replace(/([.+^=!:${}()|[\]\\])/g, '\\$1');
 	// Replace /**/ or ** with placeholder
@@ -164,7 +179,7 @@ export function resolveExactWorkspacePath(workspaceFolderPath: string, relativeP
 	}
 	if (fs.existsSync(directPath)) { return directPath; }
 
-	const segments = relativePattern.replace(/\\/g, '/').split('/').filter(seg => seg.length > 0 && seg !== '.');
+	const segments = splitNormalizedPath(relativePattern).filter(seg => seg !== '.');
 	let current = workspaceFolderPath;
 	for (let index = 0; index < segments.length; index++) {
 		const resolved = resolvePathSegment(current, segments[index], index === segments.length - 1);
@@ -194,7 +209,7 @@ function buildCustomizationEntry(
 	const name = displayName ?? path.basename(absPath);
 	return {
 		path: absPath,
-		relativePath: path.relative(workspaceFolderPath, absPath).replace(/\\/g, '/'),
+		relativePath: normalizePath(path.relative(workspaceFolderPath, absPath)),
 		type: pattern.type ?? 'unknown',
 		icon: pattern.icon ?? '',
 		label: pattern.label ?? name,
@@ -216,7 +231,7 @@ function scanExactPattern(ctx: PatternScanContext): CustomizationFileEntry | und
 /** Handle `scanMode: "oneLevel"` — enumerate one directory level for wildcard matches. */
 function scanOneLevelPattern(ctx: PatternScanContext, excludeDirs: string[]): CustomizationFileEntry[] {
 	const { workspaceFolderPath, pattern, stalenessDays } = ctx;
-	const normalizedPattern = pattern.path.replace(/\\/g, '/');
+	const normalizedPattern = normalizePath(pattern.path);
 	const starIndex = normalizedPattern.indexOf('*');
 	if (starIndex === -1) { return []; }
 
@@ -253,15 +268,18 @@ function walkDirectoryForPattern(
 	excludeDirs: string[]
 ): CustomizationFileEntry[] {
 	if (depth < 0) { return []; }
-	let children: fs.Dirent[];
-	try { children = fs.readdirSync(dir, { withFileTypes: true }); } catch { return []; }
+	const children = withErrorRecoverySync(
+		() => fs.readdirSync(dir, { withFileTypes: true }),
+		[] as fs.Dirent[],
+		`walkDirectoryForPattern readdir(${dir})`
+	);
 	const results: CustomizationFileEntry[] = [];
 	for (const child of children) {
 		const childPath = path.join(dir, child.name);
 		if (child.isDirectory() && !excludeDirs.includes(child.name)) {
 			results.push(...walkDirectoryForPattern(childPath, depth - 1, ctx, regex, excludeDirs));
 		} else if (child.isFile()) {
-			const rel = path.relative(ctx.workspaceFolderPath, childPath).replace(/\\/g, '/');
+			const rel = normalizePath(path.relative(ctx.workspaceFolderPath, childPath));
 			if (regex.test(rel)) {
 				results.push(buildCustomizationEntry(ctx, childPath));
 			}
@@ -377,11 +395,13 @@ export function extractCustomAgentName(modeId: string): string | null {
 	}
 
 	try {
-		// Handle both file:/// URIs and regular paths
-		const cleanPath = modeId.replace('file:///', '').replace('file://', '');
-		const decodedPath = decodeURIComponent(cleanPath);
-		const parts = decodedPath.split(/[\\/]/);
-		const filename = parts[parts.length - 1];
+		// Resolve file:// URIs via the safe resolver; treat other values as plain paths.
+		const fsPath = modeId.startsWith('file://')
+			? resolveFileUri(modeId)
+			: modeId;
+		if (!fsPath) { return null; }
+
+		const filename = path.basename(fsPath);
 
 		// Remove .agent.md extension
 		if (filename.endsWith('.agent.md')) {
@@ -391,7 +411,7 @@ export function extractCustomAgentName(modeId: string): string | null {
 			// Handle case like TestEngineerAgent.md.agent.md
 			return filename.slice(0, -10).replace('.md', '');
 		}
-	} catch (e) {
+	} catch {
 		return null;
 	}
 
@@ -402,7 +422,7 @@ export function extractCustomAgentName(modeId: string): string | null {
 
 /** Returns true when the root folder belongs to a JetBrains IDE Copilot store. */
 function isJetBrainsRoot(lower: string): boolean {
-	return lower.includes('.copilot/jb') || lower.includes('.copilot\\jb');
+	return lower.includes('.copilot/jb');
 }
 
 /** Returns true when the root folder belongs to Copilot CLI. */
@@ -427,7 +447,7 @@ function isVisualStudioRoot(lower: string): boolean {
 
 /** Returns true when the root folder belongs to VS Code. */
 function isVSCodeRoot(lower: string): boolean {
-	return lower.endsWith('code') || lower.includes(path.sep + 'code' + path.sep) || lower.includes('/code/');
+	return lower.endsWith('code') || lower.includes('/code/');
 }
 
 /**
@@ -436,7 +456,7 @@ function isVSCodeRoot(lower: string): boolean {
  */
 export function getEditorNameFromRoot(rootPath: string): string {
 	if (!rootPath) { return 'Unknown'; }
-	const lower = rootPath.toLowerCase();
+	const lower = normalizePathForComparison(rootPath);
 	// Check obvious markers first (JetBrains must precede Copilot CLI)
 	if (isJetBrainsRoot(lower)) { return 'JetBrains'; }
 	if (isCopilotCliRoot(lower)) { return 'Copilot CLI'; }
@@ -605,10 +625,7 @@ export function extractMcpServerName(toolName: string, toolNameMap: { [key: stri
  * VS Code URI paths on Windows start with "/c:/..." and need the leading slash removed.
  */
 function normalizeWindowsUriPath(rawPath: string): string {
-	if (process.platform === 'win32' && /^\/[a-zA-Z]:/.test(rawPath)) {
-		return rawPath.substring(1);
-	}
-	return rawPath;
+	return stripWindowsDriveUriPrefix(rawPath);
 }
 
 /**
@@ -638,9 +655,8 @@ function collectFilePathsFromRefs(contentReferences: ContentReferenceItem[]): st
  * Returns paths ordered from deepest to shallowest.
  */
 function buildPotentialGitRoots(filePath: string): string[] {
-	const normalizedPath = filePath.replace(/\\/g, '/');
-	const pathParts = normalizedPath.split('/').filter(p => p.length > 0);
-	const isWindowsDrive = process.platform === 'win32' && /^[a-zA-Z]:$/.test(pathParts[0] ?? '');
+	const pathParts = splitNormalizedPath(filePath);
+	const isWindowsDrive = hasWindowsDriveSegment(pathParts[0]);
 	const roots: string[] = [];
 	for (let i = pathParts.length - 1; i >= 1; i--) {
 		let potentialRoot = pathParts.slice(0, i).join('/');
@@ -678,7 +694,7 @@ async function tryReadWorktreeGitRemote(potentialRoot: string): Promise<string |
 		const match = gitFileContent.match(/^gitdir:\s*(.+)$/m);
 		if (!match) { return undefined; }
 		const gitdirPath = match[1].trim();
-		const basePath = potentialRoot.replace(/\//g, path.sep);
+		const basePath = toPlatformPath(potentialRoot);
 		const resolvedGitdir = path.isAbsolute(gitdirPath)
 			? gitdirPath
 			: path.resolve(basePath, gitdirPath);
@@ -721,8 +737,8 @@ export async function extractRepositoryFromContentReferences(contentReferences: 
 export function resolveWorkspaceFolderFromSessionPath(sessionFilePath: string, workspaceIdToFolderCache: Map<string, string | undefined>): string | undefined {
 	try {
 		// Normalize and split path into segments
-		const normalized = sessionFilePath.replace(/\\/g, '/');
-		const parts = normalized.split('/').filter(p => p.length > 0);
+		const normalized = normalizePath(sessionFilePath);
+		const parts = splitNormalizedPath(sessionFilePath);
 		const idx = parts.findIndex(p => p.toLowerCase() === 'workspacestorage');
 		if (idx === -1 || idx + 1 >= parts.length) {
 			return undefined; // Not a workspace-scoped session file
@@ -780,7 +796,7 @@ export function resolveWorkspaceFolderFromSessionPath(sessionFilePath: string, w
 	} catch (err) {
 		// On any error, cache undefined to avoid repeated failures
 		try {
-			const parts = sessionFilePath.replace(/\\/g, '/').split('/').filter(p => p.length > 0);
+			const parts = splitNormalizedPath(sessionFilePath);
 			const idx = parts.findIndex(p => p.toLowerCase() === 'workspacestorage');
 			if (idx !== -1 && idx + 1 < parts.length) {
 				workspaceIdToFolderCache.set(parts[idx + 1], undefined);
@@ -878,7 +894,7 @@ function detectVSCodeVariantFromPath(lowerPath: string): string | undefined {
  *          'Gemini CLI', 'Claude Desktop Cowork', 'Crush', or 'Unknown'.
  */
 export function getEditorTypeFromPath(filePath: string, isOpenCodeSessionFile?: (p: string) => boolean): string {
-	const lowerPath = filePath.toLowerCase().replace(/\\/g, '/');
+	const lowerPath = normalizePathForComparison(filePath);
 	return detectToolEditorFromPath(filePath, lowerPath, isOpenCodeSessionFile) ??
 		detectVSCodeVariantFromPath(lowerPath) ??
 		'Unknown';
@@ -905,7 +921,7 @@ function detectIDEEditorSource(lowerPath: string): string | undefined {
  * Detect which editor the session file belongs to based on its path.
  */
 export function detectEditorSource(filePath: string, isOpenCodeSessionFile?: (p: string) => boolean): string {
-	const lowerPath = filePath.toLowerCase().replace(/\\/g, '/');
+	const lowerPath = normalizePathForComparison(filePath);
 	if (lowerPath.includes('/.copilot/jb/')) { return 'JetBrains'; }
 	if (lowerPath.includes('/.copilot/session-state/')) { return 'Copilot CLI'; }
 	if (isOpenCodeSessionFile?.(filePath)) { return 'OpenCode'; }

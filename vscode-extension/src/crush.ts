@@ -9,14 +9,19 @@
  * Virtual path scheme: `<data_dir>/crush.db#<session_uuid>`
  * Example: `C:\...\repo\.crush\crush.db#c2582fbf-eed8-4fe2-8b30-80129e7373bc`
  */
+/// <reference types="sql.js" />
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import * as vscode from 'vscode';
 import initSqlJs from 'sql.js';
 import type { ModelUsage } from './types';
+import type { UriLike } from './opencode';
 
-type CrushDbCacheEntry = { db: any; mtimeMs: number; size: number };
+// Access SqlJsStatic and Database via the globally declared initSqlJs namespace.
+type SqlJsStatic = initSqlJs.SqlJsStatic;
+type SqlDatabase = initSqlJs.Database;
+
+type CrushDbCacheEntry = { db: SqlDatabase; mtimeMs: number; size: number };
 
 export interface CrushProject {
 	path: string;
@@ -25,12 +30,13 @@ export interface CrushProject {
 }
 
 export class CrushDataAccess {
-	private _sqlJsModule: any = null;
+	private _sqlJsModule: SqlJsStatic | null = null;
+	private _sqlJsInitPromise: Promise<SqlJsStatic> | null = null;
 	private _dbCache: Map<string, CrushDbCacheEntry> = new Map();
-	private _dbCacheInflight: Map<string, Promise<any | null>> = new Map();
-	private readonly extensionUri: vscode.Uri;
+	private _dbCacheInflight: Map<string, Promise<SqlDatabase | null>> = new Map();
+	private readonly extensionUri: UriLike;
 
-	constructor(extensionUri: vscode.Uri) {
+	constructor(extensionUri: UriLike) {
 		this.extensionUri = extensionUri;
 	}
 
@@ -40,9 +46,10 @@ export class CrushDataAccess {
 		}
 		this._dbCache.clear();
 		this._dbCacheInflight.clear();
+		this._sqlJsInitPromise = null;
 	}
 
-	private closeDb(db: any): void {
+	private closeDb(db: SqlDatabase): void {
 		try { db.close(); } catch { /* ignore */ }
 	}
 
@@ -76,8 +83,8 @@ export class CrushDataAccess {
 		return left.mtimeMs === right.mtimeMs && left.size === right.size;
 	}
 
-	private async refreshCrushDb(dbPath: string, stats: fs.Stats): Promise<any | null> {
-		let db: any;
+	private async refreshCrushDb(dbPath: string, stats: fs.Stats): Promise<SqlDatabase | null> {
+		let db: SqlDatabase;
 		try {
 			const SQL = await this.initSqlJs();
 			const buffer = fs.readFileSync(dbPath);
@@ -106,7 +113,7 @@ export class CrushDataAccess {
 	 * Uses single-flight deduplication to prevent concurrent callers from each
 	 * re-reading the DB file and leaving instances unclosed.
 	 */
-	private async getCrushDb(dbPath: string): Promise<any | null> {
+	private async getCrushDb(dbPath: string): Promise<SqlDatabase | null> {
 		const stats = this.statCrushDb(dbPath);
 		if (!stats) { return this._dbCache.get(dbPath)?.db ?? null; }
 
@@ -189,16 +196,29 @@ export class CrushDataAccess {
 
 	/**
 	 * Lazily initialise and cache the sql.js module.
+	 *
+	 * Promise-caches the in-flight load so concurrent callers share a single
+	 * WASM initialization rather than each starting an independent load.
+	 * The cache is reset on failure so a transient error is retryable.
 	 */
-	async initSqlJs(): Promise<any> {
+	async initSqlJs(): Promise<SqlJsStatic> {
 		if (this._sqlJsModule) { return this._sqlJsModule; }
-		const wasmPath = path.join(__dirname, 'sql-wasm.wasm');
-		let wasmBinary: Uint8Array | undefined;
-		if (fs.existsSync(wasmPath)) {
-			wasmBinary = fs.readFileSync(wasmPath);
+		if (!this._sqlJsInitPromise) {
+			this._sqlJsInitPromise = (async () => {
+				const wasmPath = path.join(__dirname, 'sql-wasm.wasm');
+				let wasmBinary: Uint8Array | undefined;
+				if (fs.existsSync(wasmPath)) {
+					wasmBinary = fs.readFileSync(wasmPath);
+				}
+				const module = await initSqlJs(wasmBinary ? { wasmBinary } : undefined);
+				this._sqlJsModule = module;
+				return module;
+			})().catch(err => {
+				this._sqlJsInitPromise = null;
+				throw err;
+			});
 		}
-		this._sqlJsModule = await initSqlJs(wasmBinary ? { wasmBinary } : undefined);
-		return this._sqlJsModule;
+		return this._sqlJsInitPromise;
 	}
 
 	/**

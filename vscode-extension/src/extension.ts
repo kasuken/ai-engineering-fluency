@@ -1,4 +1,4 @@
-﻿import * as vscode from 'vscode';
+import * as vscode from 'vscode';
 import type { AiFluencyExtensionApi, ExtensionPointButton } from './extensionPoints';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -67,30 +67,19 @@ import type {
   SessionLogData,
   WorkspaceCustomizationSummary,
   AgentSessionsResult,
+  TokenEstimator,
 } from './types';
-import { OpenCodeDataAccess } from './opencode';
-import { CrushDataAccess } from './crush';
-import { VisualStudioDataAccess } from './visualstudio';
-import { ContinueDataAccess } from './continue';
-import { ClaudeCodeDataAccess } from './claudecode';
-import { ClaudeDesktopCoworkDataAccess } from './claudedesktop';
-import { MistralVibeDataAccess } from './mistralvibe';
-import { GeminiCliDataAccess } from './geminicli';
+import type { OpenCodeDataAccess } from './opencode';
+import type { CrushDataAccess } from './crush';
+import type { VisualStudioDataAccess } from './visualstudio';
+import type { ContinueDataAccess } from './continue';
+import type { ClaudeCodeDataAccess } from './claudecode';
+import type { ClaudeDesktopCoworkDataAccess } from './claudedesktop';
+import type { MistralVibeDataAccess } from './mistralvibe';
+import type { GeminiCliDataAccess } from './geminicli';
 import type { IEcosystemAdapter } from './ecosystemAdapter';
 import { getEcosystemDisplayName } from './ecosystemAdapter';
-import {
-	OpenCodeAdapter,
-	CrushAdapter,
-	ContinueAdapter,
-	ClaudeDesktopAdapter,
-	ClaudeCodeAdapter,
-	VisualStudioAdapter,
-	MistralVibeAdapter,
-	GeminiCliAdapter,
-	CopilotChatAdapter,
-	CopilotCliAdapter,
-	JetBrainsAdapter,
-} from './adapters';
+import { buildAdapterRegistry, createDataAccessInstances } from './adapters';
 import { getVSCodeUserPaths } from './adapters/copilotChatAdapter';
 import { isJetBrainsSessionPath } from './adapters/jetbrainsAdapter';
 import { detectJetBrainsModelHintFromContent } from './jetbrains';
@@ -110,6 +99,7 @@ import {
   extractSubAgentData as _extractSubAgentData,
   buildReasoningEffortTimeline as _buildReasoningEffortTimeline,
   extractCachedTokensFromDebugLog as _extractCachedTokensFromDebugLog,
+  extractResponseItemText as _extractResponseItemText,
 } from './tokenEstimation';
 import { SessionDiscovery } from './sessionDiscovery';
 import { CacheManager } from './cacheManager';
@@ -163,6 +153,8 @@ import {
 } from './viewRegression';
 import { determineOnboardingAction } from './onboarding';
 import { addModelUsage, addEditorUsage, computeUtcDateRanges, aggregatePeriodStats, type SessionAggregateInput } from './statsHelpers';
+import { getNonce, buildCspMeta } from './utils/webviewUtils';
+import { buildChartData as _buildChartData } from './chartDataBuilder';
 
 type LocalViewRegressionProbeResult = {
   pass: boolean;
@@ -279,7 +271,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private lastChartView: 'total' | 'model' | 'editor' | 'repository' | 'cost' = 'total';
 	private lastUsageAnalysisStats: UsageAnalysisStats | undefined;
 	private lastDashboardData: any | undefined;
-	private tokenEstimators: { [key: string]: number } = tokenEstimatorsData.estimators;
+	private tokenEstimators: Record<string, TokenEstimator> = tokenEstimatorsData.estimators;
 	private co2Per1kTokens = 0.2; // gCO2e per 1000 tokens, a rough estimate
 	private co2AbsorptionPerTreePerYear = 21000; // grams of CO2 per tree per year
 	private waterUsagePer1kTokens = 0.3; // liters of water per 1000 tokens, based on data center usage estimates
@@ -899,31 +891,21 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 	constructor(extensionUri: vscode.Uri, context: vscode.ExtensionContext) {
 		this.extensionUri = extensionUri;
-		this.openCode = new OpenCodeDataAccess(extensionUri);
-		this.crush = new CrushDataAccess(extensionUri);
-		this.continue_ = new ContinueDataAccess();
-		this.visualStudio = new VisualStudioDataAccess();
-		this.claudeCode = new ClaudeCodeDataAccess();
-		this.claudeDesktopCowork = new ClaudeDesktopCoworkDataAccess();
-		this.mistralVibe = new MistralVibeDataAccess();
-		this.geminiCli = new GeminiCliDataAccess();
-		this.ecosystems = [
-			new OpenCodeAdapter(this.openCode),
-			new CrushAdapter(this.crush),
-			new VisualStudioAdapter(this.visualStudio, (t, m) => this.estimateTokensFromText(t, m)),
-			new ContinueAdapter(this.continue_),
-			new ClaudeDesktopAdapter(this.claudeDesktopCowork, (t) => this.isMcpTool(t), (t) => this.extractMcpServerName(t), (t, m) => this.estimateTokensFromText(t, m)),
-			new ClaudeCodeAdapter(this.claudeCode),
-			new MistralVibeAdapter(this.mistralVibe),
-			new GeminiCliAdapter(this.geminiCli),
-			// Copilot Chat / CLI adapters: discovery-only. Their handles() returns
-			// false so the existing fallback parsing in this file continues to
-			// own per-session parsing for VS Code Copilot Chat and CLI files.
-			// See issue #654.
-			new CopilotChatAdapter(),
-			new CopilotCliAdapter(),
-			new JetBrainsAdapter(),
-		];
+		const dataAccess = createDataAccessInstances(extensionUri);
+		this.openCode = dataAccess.openCode;
+		this.crush = dataAccess.crush;
+		this.continue_ = dataAccess.continue_;
+		this.visualStudio = dataAccess.visualStudio;
+		this.claudeCode = dataAccess.claudeCode;
+		this.claudeDesktopCowork = dataAccess.claudeDesktopCowork;
+		this.mistralVibe = dataAccess.mistralVibe;
+		this.geminiCli = dataAccess.geminiCli;
+		this.ecosystems = buildAdapterRegistry({
+			...dataAccess,
+			estimateTokens: (t, m) => this.estimateTokensFromText(t, m),
+			isMcpTool: (t) => this.isMcpTool(t),
+			extractMcpServerName: (t) => this.extractMcpServerName(t),
+		});
 		this.cacheManager = new CacheManager(context, { log: (m: string) => this.log(m), warn: (m: string) => this.warn(m), error: (m: string) => this.error(m) }, CopilotTokenTracker.CACHE_VERSION);
 		this.sessionDiscovery = new SessionDiscovery({
 			log: (m) => this.log(m),
@@ -4227,19 +4209,12 @@ usageAnalysis: undefined
 		const mcpTools: { server: string; tool: string }[] = [];
 
 		for (const item of response) {
-			// Separate thinking items
-			if (item.kind === 'thinking') {
-				if (item.value && typeof item.value === 'string') {
-					thinkingText += item.value;
-				}
-				continue;
-			}
-
-			// Extract text content
-			if (item.value && typeof item.value === 'string') {
-				responseText += item.value;
-			} else if (item.kind === 'markdownContent' && item.content?.value) {
-				responseText += item.content.value;
+			if (!item || typeof item !== 'object') { continue; }
+			// Extract text content and thinking via shared utility
+			const { text: itemText, isThinking: itemIsThinking } = _extractResponseItemText(item);
+			if (itemText) {
+				if (itemIsThinking) { thinkingText += itemText; }
+				else { responseText += itemText; }
 			}
 
 			// Extract tool invocations
@@ -4332,11 +4307,6 @@ usageAnalysis: undefined
 					// Estimate tokens from assistant response (output)
 					if (request.response && Array.isArray(request.response)) {
 						for (const responseItem of request.response) {
-							// Separate thinking tokens
-							if (responseItem.kind === 'thinking' && responseItem.value) {
-								totalThinkingTokens += this.estimateTokensFromText(responseItem.value, this.getModelFromRequest(request));
-								continue;
-							}
 							// Sub-agent invocations: count prompt (input) + result (output)
 							const subAgent = _extractSubAgentData(responseItem);
 							if (subAgent) {
@@ -4345,8 +4315,13 @@ usageAnalysis: undefined
 								if (subAgent.result) { totalOutputTokens += this.estimateTokensFromText(subAgent.result, saModel); }
 								continue;
 							}
-							if (responseItem.value) {
-								totalOutputTokens += this.estimateTokensFromText(responseItem.value, this.getModelFromRequest(request));
+							const { text, isThinking } = _extractResponseItemText(responseItem);
+							if (text) {
+								if (isThinking) {
+									totalThinkingTokens += this.estimateTokensFromText(text, this.getModelFromRequest(request));
+								} else {
+									totalOutputTokens += this.estimateTokensFromText(text, this.getModelFromRequest(request));
+								}
 							}
 						}
 					}
@@ -4569,18 +4544,10 @@ usageAnalysis: undefined
 	}
 
 	private getEnvironmentalHtml(webview: vscode.Webview, stats: DetailedStats): string {
-		const nonce = this.getNonce();
+		const nonce = getNonce();
 		const scriptUri = webview.asWebviewUri(
 			vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', 'environmental.js')
 		);
-
-		const csp = [
-			`default-src 'none'`,
-			`img-src ${webview.cspSource} https: data:`,
-			`style-src 'unsafe-inline' ${webview.cspSource}`,
-			`font-src ${webview.cspSource} https: data:`,
-			`script-src 'nonce-${nonce}'`,
-		].join('; ');
 
 		const dataWithBackend = {
 			...stats,
@@ -4594,7 +4561,7 @@ usageAnalysis: undefined
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Environmental Impact</title>
 		</head>
 		<body>
@@ -5327,16 +5294,8 @@ Return ONLY the JSON object, no markdown formatting, no explanations.`;
 	}
 
 	private getLogViewerHtml(webview: vscode.Webview, logData: SessionLogData): string {
-		const nonce = this.getNonce();
+		const nonce = getNonce();
 		const scriptUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'dist', 'webview', 'logviewer.js'));
-
-		const csp = [
-			`default-src 'none'`,
-			`img-src ${webview.cspSource} https: data:`,
-			`style-src 'unsafe-inline' ${webview.cspSource}`,
-			`font-src ${webview.cspSource} https: data:`,
-			`script-src 'nonce-${nonce}'`
-		].join('; ');
 
 		const initialData = JSON.stringify({ ...logData, compactNumbers: this.getCompactNumbersSetting() }).replace(/</g, '\\u003c');
 
@@ -5345,7 +5304,7 @@ Return ONLY the JSON object, no markdown formatting, no explanations.`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Session Log Viewer</title>
 		</head>
 		<body>
@@ -5992,7 +5951,7 @@ ${hashtag}`;
       isDebugMode: boolean;
     },
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(
         this.extensionUri,
@@ -6001,14 +5960,6 @@ ${hashtag}`;
         "fluency-level-viewer.js",
       ),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const dataWithBackend = {
       ...data,
@@ -6024,7 +5975,7 @@ ${hashtag}`;
 	<head>
 		<meta charset="UTF-8" />
 		<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-		<meta http-equiv="Content-Security-Policy" content="${csp}" />
+		${buildCspMeta(webview, nonce)}
 		<title>Scoring Guide</title>
 	</head>
 	<body>
@@ -6066,18 +6017,10 @@ ${hashtag}`;
       }>;
     },
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "maturity.js"),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const dataWithBackend = {
       ...data,
@@ -6093,7 +6036,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>AI Engineering Fluency Score</title>
 		</head>
 		<body>
@@ -6846,20 +6789,12 @@ ${hashtag}`;
     webview: vscode.Webview,
     data: any | undefined,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "dashboard.js"),
     );
 
     const backendConfig = this.getDashboardBackendConfig();
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const dataWithBackend = data
       ? { ...data, backendConfigured: this.isBackendConfigured(), compactNumbers: this.getCompactNumbersSetting() }
@@ -6874,7 +6809,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Team Dashboard</title>
 		</head>
 		<body>
@@ -6885,16 +6820,6 @@ ${hashtag}`;
 			<script nonce="${nonce}" src="${scriptUri}"></script>
 		</body>
 		</html>`;
-  }
-
-  private getNonce(): string {
-    const possible =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let text = "";
-    for (let i = 0; i < 32; i++) {
-      text += possible.charAt(Math.floor(Math.random() * possible.length));
-    }
-    return text;
   }
 
   /**
@@ -6935,18 +6860,10 @@ ${hashtag}`;
     webview: vscode.Webview,
     stats: DetailedStats,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "details.js"),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const sortSettings = this.context.globalState.get('details.sortSettings', {
       editor: { key: 'name', dir: 'asc' },
@@ -6969,7 +6886,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>AI Engineering Fluency</title>
 		</head>
 		<body>
@@ -8073,7 +7990,7 @@ ${hashtag}`;
     sessionFolders: { dir: string; count: number }[] = [],
     backendStorageInfo: any = null,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(
         this.extensionUri,
@@ -8082,14 +7999,6 @@ ${hashtag}`;
         "diagnostics.js",
       ),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     // Get cache information
     let cacheSizeInMB = 0;
@@ -8185,7 +8094,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Diagnostic Report</title>
 		</head>
 		<body>
@@ -8199,234 +8108,12 @@ ${hashtag}`;
   }
 
   private buildChartData(fullDailyStats: DailyTokenStats[]): ChartDataPayload {
-    const now = new Date();
-
-    const modelColors = [
-      { bg: "rgba(54, 162, 235, 0.6)", border: "rgba(54, 162, 235, 1)" },
-      { bg: "rgba(255, 99, 132, 0.6)", border: "rgba(255, 99, 132, 1)" },
-      { bg: "rgba(75, 192, 192, 0.6)", border: "rgba(75, 192, 192, 1)" },
-      { bg: "rgba(153, 102, 255, 0.6)", border: "rgba(153, 102, 255, 1)" },
-      { bg: "rgba(255, 159, 64, 0.6)", border: "rgba(255, 159, 64, 1)" },
-      { bg: "rgba(255, 205, 86, 0.6)", border: "rgba(255, 205, 86, 1)" },
-      { bg: "rgba(201, 203, 207, 0.6)", border: "rgba(201, 203, 207, 1)" },
-      { bg: "rgba(100, 181, 246, 0.6)", border: "rgba(100, 181, 246, 1)" },
-    ];
-
-    const fmtKey = (d: Date) =>
-      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-
-    const emptyEntry = (date: string): DailyTokenStats => ({
-      date, tokens: 0, sessions: 0, interactions: 0,
-      modelUsage: {}, editorUsage: {}, repositoryUsage: {},
-    });
-
-    const mergeInto = (target: DailyTokenStats, src: DailyTokenStats) => {
-      target.tokens += src.tokens;
-      target.sessions += src.sessions;
-      target.interactions += src.interactions;
-      addModelUsage(target.modelUsage, src.modelUsage);
-      for (const [e, u] of Object.entries(src.editorUsage)) {
-        if (!target.editorUsage[e]) { target.editorUsage[e] = { tokens: 0, sessions: 0 }; }
-        target.editorUsage[e].tokens += u.tokens;
-        target.editorUsage[e].sessions += u.sessions;
-      }
-      for (const [r, u] of Object.entries(src.repositoryUsage)) {
-        if (!target.repositoryUsage[r]) { target.repositoryUsage[r] = { tokens: 0, sessions: 0 }; }
-        target.repositoryUsage[r].tokens += u.tokens;
-        target.repositoryUsage[r].sessions += u.sessions;
-      }
-    };
-
-    type BucketEntry = { label: string; key: string; stats: DailyTokenStats };
-
-    const buildPeriodData = (buckets: BucketEntry[]) => {
-      const entries = buckets.map(b => b.stats);
-      const labels = buckets.map(b => b.label);
-      const tokensData = entries.map(e => e.tokens);
-      const sessionsData = entries.map(e => e.sessions);
-
-      const allModels = new Set<string>();
-      entries.forEach(e => Object.keys(e.modelUsage).forEach(m => allModels.add(m)));
-
-      // Rank models by total tokens across the period; keep top 5, group the rest
-      const modelTotals = new Map<string, number>();
-      for (const model of allModels) {
-        const total = entries.reduce((sum, e) => {
-          const u = e.modelUsage[model];
-          return sum + (u ? u.inputTokens + u.outputTokens : 0);
-        }, 0);
-        modelTotals.set(model, total);
-      }
-      const sortedModels = Array.from(allModels).sort((a, b) => (modelTotals.get(b) || 0) - (modelTotals.get(a) || 0));
-      const topModels = sortedModels.slice(0, 5);
-      const otherModels = sortedModels.slice(5);
-
-      const modelDatasets = topModels.map((model, idx) => {
-        const color = modelColors[idx % modelColors.length];
-        return {
-          label: getModelDisplayName(model),
-          data: entries.map(e => { const u = e.modelUsage[model]; return u ? u.inputTokens + u.outputTokens : 0; }),
-          backgroundColor: color.bg, borderColor: color.border, borderWidth: 1,
-        };
-      });
-      if (otherModels.length > 0) {
-        modelDatasets.push({
-          label: 'Other models',
-          data: entries.map(e => otherModels.reduce((sum, m) => {
-            const u = e.modelUsage[m];
-            return sum + (u ? u.inputTokens + u.outputTokens : 0);
-          }, 0)),
-          backgroundColor: 'rgba(150, 150, 150, 0.5)',
-          borderColor: 'rgba(150, 150, 150, 0.8)',
-          borderWidth: 1,
-        });
-      }
-
-      const allEditors = new Set<string>();
-      entries.forEach(e => Object.keys(e.editorUsage).forEach(ed => allEditors.add(ed)));
-      const editorDatasets = Array.from(allEditors).map((editor, idx) => {
-        const color = modelColors[idx % modelColors.length];
-        return {
-          label: editor,
-          data: entries.map(e => e.editorUsage[editor]?.tokens || 0),
-          backgroundColor: color.bg, borderColor: color.border, borderWidth: 1,
-        };
-      });
-
-      const allRepos = new Set<string>();
-      entries.forEach(e => Object.keys(e.repositoryUsage)
-        .filter(r => r !== 'Unknown')
-        .forEach(r => allRepos.add(r)));
-      const repositoryDatasets = Array.from(allRepos).map((repo, idx) => {
-        const color = modelColors[idx % modelColors.length];
-        return {
-          label: this.getRepoDisplayName(repo),
-          fullRepo: repo,
-          data: entries.map(e => e.repositoryUsage[repo]?.tokens || 0),
-          backgroundColor: color.bg, borderColor: color.border, borderWidth: 1,
-        };
-      });
-
-      const totalTokens = tokensData.reduce((a, b) => a + b, 0);
-      const totalSessions = sessionsData.reduce((a, b) => a + b, 0);
-      const periodCount = buckets.length;
-
-      const costData = entries.map(e => this.calculateEstimatedCost(e.modelUsage, 'copilot'));
-      const totalCost = costData.reduce((a, b) => a + b, 0);
-
-      return {
-        labels, tokensData, sessionsData, modelDatasets, editorDatasets, repositoryDatasets,
-        periodCount, totalTokens, totalSessions,
-        avgPerPeriod: periodCount > 0 ? Math.round(totalTokens / periodCount) : 0,
-        costData,
-        totalCost,
-        avgCostPerPeriod: periodCount > 0 ? totalCost / periodCount : 0,
-      };
-    };
-
-    // ── Daily period: last 30 days with zero-fill ─────────────────────
-    const thirtyDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30);
-    const thirtyDaysAgoStr = fmtKey(thirtyDaysAgo);
-    const todayStr = fmtKey(now);
-    const dailyBucketMap = new Map<string, BucketEntry>();
-    for (let cursor = new Date(thirtyDaysAgo); cursor <= now; cursor.setDate(cursor.getDate() + 1)) {
-      const key = fmtKey(new Date(cursor));
-      dailyBucketMap.set(key, { key, label: key, stats: emptyEntry(key) });
-    }
-    for (const day of fullDailyStats) {
-      if (day.date >= thirtyDaysAgoStr && day.date <= todayStr) {
-        const bucket = dailyBucketMap.get(day.date);
-        if (bucket) { mergeInto(bucket.stats, day); }
-      }
-    }
-    const dailyBuckets = Array.from(dailyBucketMap.values()).sort((a, b) => a.key.localeCompare(b.key));
-    const dailyPeriod = buildPeriodData(dailyBuckets);
-
-    // ── Weekly period: last 6 calendar weeks with zero-fill ──────────
-    const getMondayOfWeek = (d: Date): Date => {
-      const copy = new Date(d); copy.setHours(0, 0, 0, 0);
-      const day = copy.getDay();
-      copy.setDate(copy.getDate() - (day === 0 ? 6 : day - 1));
-      return copy;
-    };
-    const fmtWeekLabel = (monday: Date): string => {
-      const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
-      if (monday.getMonth() === sunday.getMonth()) {
-        return `${monday.toLocaleDateString("en-US", { month: "short" })} ${monday.getDate()}–${sunday.getDate()}`;
-      }
-      return `${monday.toLocaleDateString("en-US", { month: "short", day: "numeric" })}–${sunday.toLocaleDateString("en-US", { month: "short", day: "numeric" })}`;
-    };
-    const thisMonday = getMondayOfWeek(now);
-    const weekBucketMap = new Map<string, BucketEntry>();
-    for (let w = 5; w >= 0; w--) {
-      const monday = new Date(thisMonday); monday.setDate(thisMonday.getDate() - w * 7);
-      const key = fmtKey(monday);
-      weekBucketMap.set(key, { key, label: fmtWeekLabel(monday), stats: emptyEntry(key) });
-    }
-    for (const day of fullDailyStats) {
-      const monday = getMondayOfWeek(new Date(day.date + "T00:00:00"));
-      const bucket = weekBucketMap.get(fmtKey(monday));
-      if (bucket) { mergeInto(bucket.stats, day); }
-    }
-    const weeklyBuckets = Array.from(weekBucketMap.values()).sort((a, b) => a.key.localeCompare(b.key));
-    const weeklyPeriod = buildPeriodData(weeklyBuckets);
-
-    // ── Monthly period: last 12 calendar months with zero-fill ───────
-    const monthBucketMap = new Map<string, BucketEntry>();
-    for (let m = 11; m >= 0; m--) {
-      const monthDate = new Date(now.getFullYear(), now.getMonth() - m, 1);
-      const key = `${monthDate.getFullYear()}-${String(monthDate.getMonth() + 1).padStart(2, "0")}`;
-      const label = monthDate.toLocaleDateString("en-US", { month: "short", year: "numeric" });
-      monthBucketMap.set(key, { key, label, stats: emptyEntry(key) });
-    }
-    for (const day of fullDailyStats) {
-      const monthKey = day.date.slice(0, 7);
-      const bucket = monthBucketMap.get(monthKey);
-      if (bucket) { mergeInto(bucket.stats, day); }
-    }
-    const monthlyBuckets = Array.from(monthBucketMap.values()).sort((a, b) => a.key.localeCompare(b.key));
-    const monthlyPeriod = buildPeriodData(monthlyBuckets);
-
-    // ── Summary totals from the daily period (last 30 days) ──────────
-    const editorTotalsMap: Record<string, number> = {};
-    dailyBuckets.forEach(b => {
-      Object.entries(b.stats.editorUsage).forEach(([editor, usage]) => {
-        editorTotalsMap[editor] = (editorTotalsMap[editor] || 0) + usage.tokens;
-      });
-    });
-    const repositoryTotalsMap: Record<string, number> = {};
-    dailyBuckets.forEach(b => {
-      Object.entries(b.stats.repositoryUsage)
-        .filter(([repo]) => repo !== 'Unknown')
-        .forEach(([repo, usage]) => {
-        const displayName = this.getRepoDisplayName(repo);
-        repositoryTotalsMap[displayName] = (repositoryTotalsMap[displayName] || 0) + usage.tokens;
-      });
-    });
-
-    return {
-      // Backward-compat flat fields (daily period)
-      labels: dailyPeriod.labels,
-      tokensData: dailyPeriod.tokensData,
-      sessionsData: dailyPeriod.sessionsData,
-      modelDatasets: dailyPeriod.modelDatasets,
-      editorDatasets: dailyPeriod.editorDatasets,
-      repositoryDatasets: dailyPeriod.repositoryDatasets,
-      editorTotalsMap,
-      repositoryTotalsMap,
-      dailyCount: dailyPeriod.periodCount,
-      totalTokens: dailyPeriod.totalTokens,
-      avgTokensPerDay: dailyPeriod.avgPerPeriod,
-      totalSessions: dailyPeriod.totalSessions,
-      lastUpdated: new Date().toISOString(),
+    return _buildChartData(fullDailyStats, {
+      getRepoDisplayName: _getRepoDisplayName,
+      calculateEstimatedCost: (modelUsage, pricingSource) => _calculateEstimatedCost(modelUsage, this.modelPricing, pricingSource),
       backendConfigured: this.isBackendConfigured(),
       compactNumbers: this.getCompactNumbersSetting(),
-      periods: {
-        day: dailyPeriod,
-        week: weeklyPeriod,
-        month: monthlyPeriod,
-      },
-    };
+    });
   }
 
   private getChartHtml(
@@ -8434,18 +8121,10 @@ ${hashtag}`;
     dailyStats: DailyTokenStats[],
     periodsReady = true,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "chart.js"),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     const chartData = { ...this.buildChartData(dailyStats), periodsReady, initialPeriod: this.lastChartPeriod, initialView: this.lastChartView };
 
@@ -8456,7 +8135,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>AI Engineering Fluency — Chart</title>
 		</head>
 		<body>
@@ -8473,18 +8152,10 @@ ${hashtag}`;
     webview: vscode.Webview,
     stats: UsageAnalysisStats | null,
   ): string {
-    const nonce = this.getNonce();
+    const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "usage.js"),
     );
-
-    const csp = [
-      `default-src 'none'`,
-      `img-src ${webview.cspSource} https: data:`,
-      `style-src 'unsafe-inline' ${webview.cspSource}`,
-      `font-src ${webview.cspSource} https: data:`,
-      `script-src 'nonce-${nonce}'`,
-    ].join("; ");
 
     // Detect user's locale for number formatting
     const localeFromEnv =
@@ -8528,7 +8199,7 @@ ${hashtag}`;
 		<head>
 			<meta charset="UTF-8" />
 			<meta name="viewport" content="width=device-width, initial-scale=1.0" />
-			<meta http-equiv="Content-Security-Policy" content="${csp}" />
+			${buildCspMeta(webview, nonce)}
 			<title>Usage Analysis</title>
 		</head>
 		<body>

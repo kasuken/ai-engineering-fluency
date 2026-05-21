@@ -8,6 +8,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { ModelUsage } from './types';
+import { withErrorRecoverySync } from './utils/errors';
+import { normalizePathForComparison } from './workspaceHelpers';
 
 /**
  * Normalize a Claude Code API model ID to the dot-notation format used throughout this codebase.
@@ -60,8 +62,8 @@ export class ClaudeCodeDataAccess {
 	 * false-positives on Cowork sessions that have a nested .claude/projects/ sub-path.
 	 */
 	isClaudeCodeSessionFile(filePath: string): boolean {
-		const normalized = filePath.toLowerCase().replace(/\\/g, '/');
-		const projectsDir = this.getClaudeCodeProjectsDir().toLowerCase().replace(/\\/g, '/');
+		const normalized = normalizePathForComparison(filePath);
+		const projectsDir = normalizePathForComparison(this.getClaudeCodeProjectsDir());
 		return normalized.startsWith(projectsDir) && normalized.endsWith('.jsonl');
 	}
 
@@ -87,17 +89,17 @@ export class ClaudeCodeDataAccess {
 								if (stats.size > 0) {
 									results.push(fullPath);
 								}
-							} catch {
-								// Ignore individual file access errors
+							} catch (err) {
+								console.error(`[claudecode] Failed to stat ${fullPath}:`, err);
 							}
 						}
 					}
-				} catch {
-					// Ignore project directory read errors
+				} catch (err) {
+					console.error(`[claudecode] Failed to read project dir ${projectPath}:`, err);
 				}
 			}
-		} catch {
-			// Ignore top-level read errors
+		} catch (err) {
+			console.error('[claudecode] Failed to read projects dir:', err);
 		}
 		return results;
 	}
@@ -106,22 +108,22 @@ export class ClaudeCodeDataAccess {
 	 * Parse a Claude Code session JSONL file and return all events.
 	 */
 	private readSessionEvents(sessionFilePath: string): any[] {
-		try {
-			const content = fs.readFileSync(sessionFilePath, 'utf8');
-			const lines = content.trim().split('\n');
-			const events: any[] = [];
-			for (const line of lines) {
-				if (!line.trim()) { continue; }
-				try {
-					events.push(JSON.parse(line));
-				} catch {
-					// Skip malformed lines
+		return withErrorRecoverySync(
+			() => {
+				const content = fs.readFileSync(sessionFilePath, 'utf8');
+				const lines = content.trim().split('\n');
+				const events: any[] = [];
+				for (const line of lines) {
+					if (!line.trim()) { continue; }
+					try {
+						events.push(JSON.parse(line));
+					} catch { /* skip malformed lines */ }
 				}
-			}
-			return events;
-		} catch {
-			return [];
-		}
+				return events;
+			},
+			[],
+			`claudecode readSessionEvents(${sessionFilePath})`
+		);
 	}
 
 	/**

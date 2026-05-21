@@ -2,10 +2,75 @@
  * Token estimation and model-related utility functions.
  * Pure or near-pure functions extracted from CopilotTokenTracker for reusability.
  */
-import type { ModelUsage, ModelPricing, ContextReferenceUsage } from './types';
+import type { ModelUsage, ModelPricing, ContextReferenceUsage, TokenEstimator } from './types';
 
+/** Minimum request shape needed by getModelFromRequest. */
+interface ModelRequestSource {
+	modelId?: string;
+	result?: {
+		metadata?: { modelId?: string };
+		details?: string;
+	};
+}
 
-export function estimateTokensFromText(text: string, model: string = 'gpt-4', tokenEstimators: { [key: string]: number } = {}): number {
+/** Shape of a single delta event line in a JSONL session file. */
+interface DeltaEvent {
+	kind?: number;
+	/** Key path (array of path segments). */
+	k?: unknown;
+	/** Value to set or append. */
+	v?: unknown;
+}
+
+/** Per-model metrics from a session.shutdown event. */
+interface ShutdownModelMetrics {
+	usage?: {
+		inputTokens?: number;
+		outputTokens?: number;
+		cacheReadTokens?: number;
+		cacheWriteTokens?: number;
+	};
+}
+
+/** Shape of a `toolInvocationSerialized` response item. */
+interface ToolInvocationSerializedItem {
+	kind: 'toolInvocationSerialized';
+	toolSpecificData?: unknown;
+}
+
+/** Shape of the `toolSpecificData` object for sub-agent invocations. */
+interface SubAgentToolSpecificData {
+	kind: 'subagent';
+	prompt?: unknown;
+	result?: unknown;
+	modelName?: unknown;
+}
+
+/** Type guard: narrows an unknown value to a ToolInvocationSerializedItem. */
+function isToolInvocationSerialized(obj: unknown): obj is ToolInvocationSerializedItem {
+	if (typeof obj !== 'object' || obj === null) { return false; }
+	return (obj as ToolInvocationSerializedItem).kind === 'toolInvocationSerialized';
+}
+
+/** Type guard: narrows an unknown value to a SubAgentToolSpecificData. */
+function isSubAgentToolSpecificData(obj: unknown): obj is SubAgentToolSpecificData {
+	if (typeof obj !== 'object' || obj === null) { return false; }
+	return (obj as SubAgentToolSpecificData).kind === 'subagent';
+}
+
+// --- Token estimation ratio constants ---
+// Thresholds for classifying agent sessions by tool-call volume
+const TOOL_CALLS_HIGH_THRESHOLD = 20;
+const TOOL_CALLS_MED_THRESHOLD = 5;
+
+// Empirical input:output token ratios per tool-call tier.
+// Heavy agent sessions (many tool calls) show ~130x input:output ratio;
+// medium sessions ~50x; low/chat sessions ~10x.
+const TOKEN_RATIO_HIGH_TOOLS = 130;
+const TOKEN_RATIO_MED_TOOLS = 50;
+const TOKEN_RATIO_LOW_TOOLS = 10;
+
+export function estimateTokensFromText(text: string, model: string = 'gpt-4', tokenEstimators: Record<string, TokenEstimator> = {}): number {
 	// Token estimation based on character count and model
 	let tokensPerChar = 0.25; // default
 
@@ -39,31 +104,57 @@ export function normalizeDisplayModelName(displayName: string): string {
  *   - a streaming-char object: { "0": "H", "1": "i", ... }
  */
 export function extractSubAgentData(item: unknown): { prompt: string; result: string; modelName: string } | null {
-	if (!item || typeof item !== 'object') { return null; }
-	const i = item as Record<string, unknown>;
-	if (i['kind'] !== 'toolInvocationSerialized') { return null; }
-	const tsd = i['toolSpecificData'];
-	if (!tsd || typeof tsd !== 'object') { return null; }
-	const t = tsd as Record<string, unknown>;
-	if (t['kind'] !== 'subagent') { return null; }
+	if (!isToolInvocationSerialized(item)) { return null; }
+	const tsd = item.toolSpecificData;
+	if (!isSubAgentToolSpecificData(tsd)) { return null; }
 
-	const prompt = typeof t['prompt'] === 'string' ? t['prompt'] : '';
+	const prompt = typeof tsd.prompt === 'string' ? tsd.prompt : '';
 
 	let result = '';
-	const rawResult = t['result'];
-	if (typeof rawResult === 'string') {
-		result = rawResult;
-	} else if (rawResult && typeof rawResult === 'object') {
+	if (typeof tsd.result === 'string') {
+		result = tsd.result;
+	} else if (tsd.result !== null && typeof tsd.result === 'object') {
 		// Streaming char format: {"0":"H","1":"i",...} — sort by numeric key then join
-		const entries = Object.entries(rawResult as Record<string, unknown>);
+		const entries = Object.entries(tsd.result as Record<string, unknown>);
 		entries.sort(([a], [b]) => Number(a) - Number(b));
 		result = entries.map(([, v]) => (typeof v === 'string' ? v : '')).join('');
 	}
 
-	const rawModel = typeof t['modelName'] === 'string' ? t['modelName'] : '';
+	const rawModel = typeof tsd.modelName === 'string' ? tsd.modelName : '';
 	const modelName = rawModel ? normalizeDisplayModelName(rawModel) : '';
 
 	return (prompt || result) ? { prompt, result, modelName } : null;
+}
+
+/**
+ * Extract text content from a single response item, separating thinking from regular response text.
+ * Prefers content.value over value to avoid double-counting when both are present.
+ *
+ * @returns text - the extracted text, or empty string if none
+ * @returns isThinking - true if this is a thinking (extended reasoning) item
+ */
+export function extractResponseItemText(item: unknown): { text: string; isThinking: boolean } {
+	if (typeof item !== 'object' || item === null) {
+		return { text: '', isThinking: false };
+	}
+	const obj = item as Record<string, unknown>;
+	if (obj['kind'] === 'thinking') {
+		const value = obj['value'];
+		return { text: typeof value === 'string' ? value : '', isThinking: true };
+	}
+	// Prefer content.value when present to avoid double-counting wrapper text.
+	const content = obj['content'];
+	if (typeof content === 'object' && content !== null) {
+		const contentValue = (content as Record<string, unknown>)['value'];
+		if (typeof contentValue === 'string' && contentValue) {
+			return { text: contentValue, isThinking: false };
+		}
+	}
+	const value = obj['value'];
+	if (typeof value === 'string' && value) {
+		return { text: value, isThinking: false };
+	}
+	return { text: '', isThinking: false };
 }
 
 /** Return type for all token estimation strategies. */
@@ -97,15 +188,14 @@ export class DeltaTokenStrategy implements TokenEstimationStrategy {
 	estimate(lines: string[]): TokenEstimationResult {
 		let totalTokens = 0;
 		let totalThinkingTokens = 0;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
-		let sessionState: any = {};
+		let sessionState: Record<string, unknown> = {};
 		let parseFailedLines = 0;
 
 		for (const line of lines) {
 			if (!line.trim()) { continue; }
 			try {
 				const event = JSON.parse(line);
-				sessionState = applyDelta(sessionState, event);
+				sessionState = applyDelta(sessionState, event) as Record<string, unknown>;
 
 				// Incremental request messages (kind:2 append to requests array)
 				if (event.kind === 2 && event.k?.[0] === 'requests' && Array.isArray(event.v)) {
@@ -119,16 +209,12 @@ export class DeltaTokenStrategy implements TokenEstimationStrategy {
 				// Incremental response items (kind:2 append to response array)
 				if (event.kind === 2 && event.k?.includes('response') && Array.isArray(event.v)) {
 					for (const responseItem of event.v) {
-						if (responseItem.kind === 'thinking' && responseItem.value) {
-							totalThinkingTokens += estimateTokensFromText(responseItem.value);
-							continue;
-						}
 						// Sub-agent results are incomplete mid-stream; count from reconstructed state below.
 						if (extractSubAgentData(responseItem)) { continue; }
-						if (responseItem.value) {
-							totalTokens += estimateTokensFromText(responseItem.value);
-						} else if (responseItem.kind === 'markdownContent' && responseItem.content?.value) {
-							totalTokens += estimateTokensFromText(responseItem.content.value);
+						const { text, isThinking } = extractResponseItemText(responseItem);
+						if (text) {
+							if (isThinking) { totalThinkingTokens += estimateTokensFromText(text); }
+							else { totalTokens += estimateTokensFromText(text); }
 						}
 					}
 				}
@@ -143,14 +229,15 @@ export class DeltaTokenStrategy implements TokenEstimationStrategy {
 		const rawUsageFallback = parseFailedLines > 0
 			? extractPerRequestUsageFromRawLines(lines)
 			: new Map<number, { promptTokens: number; outputTokens: number }>();
-		const requests: any[] = Array.isArray(sessionState.requests) ? sessionState.requests : [];
+		const rawRequests = sessionState['requests'];
+		const requests = (Array.isArray(rawRequests) ? rawRequests : []) as unknown[];
 		let maxIndex = requests.length;
 		for (const idx of rawUsageFallback.keys()) {
 			if (idx + 1 > maxIndex) { maxIndex = idx + 1; }
 		}
 		let totalActualTokens = 0;
 		for (let i = 0; i < maxIndex; i++) {
-			const request = requests[i];
+			const request = requests[i] as { result?: { promptTokens?: number; outputTokens?: number; metadata?: { promptTokens?: number; outputTokens?: number }; usage?: { promptTokens?: number; completionTokens?: number } } } | undefined;
 			let found = false;
 			if (request?.result) {
 				const result = request.result;
@@ -180,8 +267,9 @@ export class DeltaTokenStrategy implements TokenEstimationStrategy {
 		// Sub-agent results are built up char-by-char via delta events and are only
 		// complete in the fully reconstructed state — count them here.
 		for (const request of requests) {
-			if (!request?.response || !Array.isArray(request.response)) { continue; }
-			for (const responseItem of request.response) {
+			const req = request as { response?: unknown[] } | undefined;
+			if (!req?.response || !Array.isArray(req.response)) { continue; }
+			for (const responseItem of req.response) {
 				const subAgent = extractSubAgentData(responseItem);
 				if (subAgent) {
 					if (subAgent.prompt) { totalTokens += estimateTokensFromText(subAgent.prompt); }
@@ -231,7 +319,7 @@ export class EventJsonlTokenStrategy implements TokenEstimationStrategy {
 				if (event.type === 'session.shutdown' && event.data?.modelMetrics) {
 					if (!cliShutdownModelUsage) { cliShutdownModelUsage = {}; }
 					let shutdownTotal = 0;
-					for (const [modelName, metrics] of Object.entries(event.data.modelMetrics) as [string, any][]) {
+					for (const [modelName, metrics] of Object.entries(event.data.modelMetrics) as [string, ShutdownModelMetrics][]) {
 						const usage = metrics?.usage;
 						if (usage) {
 							const input = typeof usage.inputTokens === 'number' ? usage.inputTokens : 0;
@@ -316,7 +404,9 @@ export class EventJsonlTokenStrategy implements TokenEstimationStrategy {
 		// No session.shutdown: use real outputTokens from assistant.message + observed input:output ratios.
 		// Heavy agent sessions show ~130x ratio; cache reads ≈ input (50% of total from completed sessions).
 		if (!cliActualTokens && cliRealOutputByModel) {
-			const inputOutputRatio = totalEstToolCalls > 20 ? 130 : totalEstToolCalls > 5 ? 50 : 10;
+			const inputOutputRatio = totalEstToolCalls > TOOL_CALLS_HIGH_THRESHOLD ? TOKEN_RATIO_HIGH_TOOLS
+			: totalEstToolCalls > TOOL_CALLS_MED_THRESHOLD ? TOKEN_RATIO_MED_TOOLS
+			: TOKEN_RATIO_LOW_TOOLS;
 			for (const realOutput of Object.values(cliRealOutputByModel)) {
 				const estimatedInput = Math.round(realOutput * inputOutputRatio);
 				cliActualTokens += estimatedInput + realOutput;  // input + output (cache is a subset of input)
@@ -371,7 +461,7 @@ export function estimateTokensFromJsonlSession(fileContent: string): TokenEstima
  * extension host's single-threaded event loop on large files.
  */
 export async function reconstructJsonlStateAsync(lines: string[], yieldInterval = 500): Promise<{ sessionState: any; isDeltaBased: boolean }> {
-	let sessionState: any = {};
+	let sessionState: Record<string, unknown> = {};
 	let isDeltaBased = false;
 	for (let i = 0; i < lines.length; i++) {
 		const line = lines[i];
@@ -380,7 +470,7 @@ export async function reconstructJsonlStateAsync(lines: string[], yieldInterval 
 			const delta = JSON.parse(line);
 			if (typeof delta.kind === 'number') {
 				isDeltaBased = true;
-				sessionState = applyDelta(sessionState, delta);
+				sessionState = applyDelta(sessionState, delta) as Record<string, unknown>;
 			}
 		} catch {
 			// Skip invalid lines
@@ -455,13 +545,15 @@ export function buildReasoningEffortTimeline(lines: string[]): {
 
   for (const line of lines) {
     if (!line.trim()) { continue; }
-    let delta: any;
-    try { delta = JSON.parse(line); } catch { continue; }
+    let delta: DeltaEvent;
+    try { delta = JSON.parse(line) as DeltaEvent; } catch { continue; }
     if (typeof delta.kind !== 'number') { continue; }
 
     if (delta.kind === 0) {
       // Initial state: extract model from inputState.selectedModel
-      const model = delta.v?.inputState?.selectedModel;
+      const v = delta.v as Record<string, unknown> | undefined;
+      const inputState = v?.['inputState'] as Record<string, unknown> | undefined;
+      const model = inputState?.['selectedModel'];
       const effort = extractEffortFromModel(model);
       if (effort !== null) {
         currentEffort = effort;
@@ -521,7 +613,7 @@ export function extractPerRequestUsageFromRawLines(lines: string[]): Map<number,
 	return usage;
 }
 
-export function getModelFromRequest(request: any, modelPricing: { [key: string]: ModelPricing } = {}): string {
+export function getModelFromRequest(request: ModelRequestSource, modelPricing: { [key: string]: ModelPricing } = {}): string {
 	// Try to determine model from request metadata (most reliable source)
 	// First check the top-level modelId field (VS Code format)
 	if (request.modelId) {
@@ -599,12 +691,13 @@ export function isUuidPointerFile(content: string): boolean {
  * - k = key path (array of strings)
  * - v = value
  */
-export function applyDelta(state: any, delta: any): any {
+export function applyDelta(state: unknown, delta: unknown): unknown {
 	if (typeof delta !== 'object' || delta === null) {
 		return state;
 	}
 
-	const { kind, k, v } = delta;
+	const d = delta as Record<string, unknown>;
+	const { kind, k, v } = d;
 
 	if (kind === 0) {
 		// Initial state - full replacement
@@ -616,8 +709,8 @@ export function applyDelta(state: any, delta: any): any {
 	}
 
 	const pathArr = k.map(String);
-	let root = typeof state === 'object' && state !== null ? state : {};
-	let current: any = root;
+	let root: Record<string, unknown> | unknown[] = typeof state === 'object' && state !== null ? state as Record<string, unknown> | unknown[] : {};
+	let current: Record<string, unknown> | unknown[] = root;
 
 	// Traverse to the parent of the target location
 	for (let i = 0; i < pathArr.length - 1; i++) {
@@ -630,12 +723,12 @@ export function applyDelta(state: any, delta: any): any {
 			if (!current[idx] || typeof current[idx] !== 'object') {
 				current[idx] = wantsArray ? [] : {};
 			}
-			current = current[idx];
+			current = current[idx] as Record<string, unknown> | unknown[];
 		} else {
 			if (!current[seg] || typeof current[seg] !== 'object') {
 				current[seg] = wantsArray ? [] : {};
 			}
-			current = current[seg];
+			current = current[seg] as Record<string, unknown> | unknown[];
 		}
 	}
 
@@ -653,22 +746,22 @@ export function applyDelta(state: any, delta: any): any {
 
 	if (kind === 2) {
 		// Append value(s) to array at key path
-		let target: any[];
+		let target: unknown[];
 		if (Array.isArray(current)) {
 			const idx = Number(lastSeg);
 			if (!Array.isArray(current[idx])) {
 				current[idx] = [];
 			}
-			target = current[idx];
+			target = current[idx] as unknown[];
 		} else {
 			if (!Array.isArray(current[lastSeg])) {
 				current[lastSeg] = [];
 			}
-			target = current[lastSeg];
+			target = current[lastSeg] as unknown[];
 		}
 
 		if (Array.isArray(v)) {
-			target.push(...v);
+			target.push(...(v as unknown[]));
 		} else {
 			target.push(v);
 		}

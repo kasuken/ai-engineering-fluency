@@ -2,25 +2,38 @@
  * OpenCode data access layer.
  * Handles reading session data from OpenCode's JSON files and SQLite database.
  */
+/// <reference types="sql.js" />
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
-import * as vscode from 'vscode';
 import initSqlJs from 'sql.js';
 import type { ModelUsage } from './types';
+import { normalizePathForComparison } from './workspaceHelpers';
 
-type OpenCodeDbCache = { db: any; mtimeMs: number; size: number; path: string };
+// Access SqlJsStatic and Database via the globally declared initSqlJs namespace.
+type SqlJsStatic = initSqlJs.SqlJsStatic;
+type SqlDatabase = initSqlJs.Database;
+
+/** Minimal URI interface required by OpenCodeDataAccess (subset of vscode.Uri). */
+export interface UriLike {
+	readonly fsPath: string;
+	readonly path: string;
+	readonly scheme: string;
+}
+
+type OpenCodeDbCache = { db: SqlDatabase; mtimeMs: number; size: number; path: string };
 type OpenCodeModelUsageWithInteractions = {
 	[modelName: string]: ModelUsage[string] & { interactions?: number };
 };
 
 export class OpenCodeDataAccess {
-	private _sqlJsModule: any = null;
+	private _sqlJsModule: SqlJsStatic | null = null;
+	private _sqlJsInitPromise: Promise<SqlJsStatic> | null = null;
 	private _dbCache: OpenCodeDbCache | null = null;
-	private _dbCacheInflight: Map<string, Promise<any | null>> = new Map();
-	private readonly extensionUri: vscode.Uri;
+	private _dbCacheInflight: Map<string, Promise<SqlDatabase | null>> = new Map();
+	private readonly extensionUri: UriLike;
 
-	constructor(extensionUri: vscode.Uri) {
+	constructor(extensionUri: UriLike) {
 		this.extensionUri = extensionUri;
 	}
 
@@ -46,7 +59,7 @@ export class OpenCodeDataAccess {
 	 * or referenced via virtual paths like opencode.db#ses_<id> (SQLite).
 	 */
 	isOpenCodeSessionFile(filePath: string): boolean {
-		const normalized = filePath.toLowerCase().replace(/\\/g, '/');
+		const normalized = normalizePathForComparison(filePath);
 		return normalized.includes('/opencode/storage/session/') || normalized.includes('/opencode/opencode.db#ses_');
 	}
 
@@ -60,24 +73,38 @@ export class OpenCodeDataAccess {
 
 	/**
 	 * Lazily initialize and return the sql.js SQL module.
+	 *
+	 * Promise-caches the in-flight load so concurrent callers share a single
+	 * WASM initialization rather than each starting an independent load.
+	 * The cache is reset on failure so a transient error is retryable.
 	 */
-	async initSqlJs(): Promise<any> {
+	async initSqlJs(): Promise<SqlJsStatic> {
 		if (this._sqlJsModule) { return this._sqlJsModule; }
-		const wasmPath = path.join(__dirname, 'sql-wasm.wasm');
-		let wasmBinary: Uint8Array | undefined;
-		if (fs.existsSync(wasmPath)) {
-			wasmBinary = fs.readFileSync(wasmPath);
+		if (!this._sqlJsInitPromise) {
+			this._sqlJsInitPromise = (async () => {
+				const wasmPath = path.join(__dirname, 'sql-wasm.wasm');
+				let wasmBinary: Uint8Array | undefined;
+				if (fs.existsSync(wasmPath)) {
+					wasmBinary = fs.readFileSync(wasmPath);
+				}
+				const module = await initSqlJs(wasmBinary ? { wasmBinary } : undefined);
+				this._sqlJsModule = module;
+				return module;
+			})().catch(err => {
+				this._sqlJsInitPromise = null;
+				throw err;
+			});
 		}
-		this._sqlJsModule = await initSqlJs(wasmBinary ? { wasmBinary } : undefined);
-		return this._sqlJsModule;
+		return this._sqlJsInitPromise;
 	}
 
 	dispose(): void {
 		this.closeDbCache();
 		this._dbCacheInflight.clear();
+		this._sqlJsInitPromise = null;
 	}
 
-	private closeDb(db: any): void {
+	private closeDb(db: SqlDatabase): void {
 		try { db.close(); } catch { /* ignore */ }
 	}
 
@@ -88,7 +115,7 @@ export class OpenCodeDataAccess {
 		}
 	}
 
-	private getCachedDbForPath(dbPath: string): any | null {
+	private getCachedDbForPath(dbPath: string): SqlDatabase | null {
 		return this._dbCache?.path === dbPath ? this._dbCache.db : null;
 	}
 
@@ -122,8 +149,8 @@ export class OpenCodeDataAccess {
 		return left.mtimeMs === right.mtimeMs && left.size === right.size;
 	}
 
-	private async refreshOpenCodeDb(dbPath: string, stats: fs.Stats): Promise<any | null> {
-		let db: any;
+	private async refreshOpenCodeDb(dbPath: string, stats: fs.Stats): Promise<SqlDatabase | null> {
+		let db: SqlDatabase;
 		try {
 			const SQL = await this.initSqlJs();
 			const buffer = fs.readFileSync(dbPath);
@@ -154,7 +181,7 @@ export class OpenCodeDataAccess {
 	 * Uses single-flight deduplication to prevent concurrent calls from each re-reading
 	 * the DB file and leaving instances unclosed.
 	 */
-	private async getOpenCodeDb(): Promise<any | null> {
+	private async getOpenCodeDb(): Promise<SqlDatabase | null> {
 		const dbPath = path.join(this.getOpenCodeDataDir(), 'opencode.db');
 		const stats = this.statOpenCodeDb(dbPath);
 		if (!stats) { return this.getCachedDbForPath(dbPath); }

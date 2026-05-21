@@ -129,34 +129,82 @@ function _addCount(existing: number | undefined, delta: number): number {
 	return (existing || 0) + delta;
 }
 
-function _mergeNumericFluencyMetrics(
-	ex: NonNullable<DailyRollupValue['fluencyMetrics']>,
-	val: NonNullable<DailyRollupValue['fluencyMetrics']>
-): void {
-	if (val.askModeCount !== undefined) { ex.askModeCount = _addCount(ex.askModeCount, val.askModeCount); }
-	if (val.editModeCount !== undefined) { ex.editModeCount = _addCount(ex.editModeCount, val.editModeCount); }
-	if (val.agentModeCount !== undefined) { ex.agentModeCount = _addCount(ex.agentModeCount, val.agentModeCount); }
-	if (val.planModeCount !== undefined) { ex.planModeCount = _addCount(ex.planModeCount, val.planModeCount); }
-	if (val.customAgentModeCount !== undefined) { ex.customAgentModeCount = _addCount(ex.customAgentModeCount, val.customAgentModeCount); }
-	if (val.cliModeCount !== undefined) { ex.cliModeCount = _addCount(ex.cliModeCount, val.cliModeCount); }
-	if (val.multiTurnSessions !== undefined) { ex.multiTurnSessions = _addCount(ex.multiTurnSessions, val.multiTurnSessions); }
-	if (val.multiFileEdits !== undefined) { ex.multiFileEdits = _addCount(ex.multiFileEdits, val.multiFileEdits); }
-	if (val.sessionCount !== undefined) { ex.sessionCount = _addCount(ex.sessionCount, val.sessionCount); }
+type FluencyMetrics = NonNullable<DailyRollupValue['fluencyMetrics']>;
+
+/** Fluency metric keys representing simple counts that are summed during rollup merge. */
+const NUMERIC_FLUENCY_FIELDS = [
+	'askModeCount', 'editModeCount', 'agentModeCount', 'planModeCount',
+	'customAgentModeCount', 'cliModeCount', 'multiTurnSessions', 'multiFileEdits', 'sessionCount'
+] as const satisfies ReadonlyArray<keyof FluencyMetrics>;
+
+type NumericFluencyMetricKey = typeof NUMERIC_FLUENCY_FIELDS[number];
+
+/** Fluency metric keys that are JSON-serialized objects, paired with their merge strategy. */
+const JSON_FLUENCY_FIELD_MERGERS = [
+	{ key: 'toolCallsJson', merge: mergeJsonMetrics },
+	{ key: 'contextRefsJson', merge: mergeJsonMetrics },
+	{ key: 'mcpToolsJson', merge: mergeJsonMetrics },
+	{ key: 'modelSwitchingJson', merge: mergeJsonMetrics },
+	{ key: 'editScopeJson', merge: mergeJsonMetrics },
+	{ key: 'agentTypesJson', merge: mergeJsonMetrics },
+	{ key: 'repositoriesJson', merge: mergeRepositoriesJson },
+	{ key: 'applyUsageJson', merge: mergeJsonMetrics },
+	{ key: 'sessionDurationJson', merge: mergeJsonMetrics },
+] as const satisfies ReadonlyArray<{
+	key: keyof FluencyMetrics;
+	merge: (existing: string | undefined, incoming: string) => string;
+}>;
+
+function _mergeNumericFluencyMetrics(ex: FluencyMetrics, val: FluencyMetrics): void {
+	for (const field of NUMERIC_FLUENCY_FIELDS) {
+		const incoming = val[field as NumericFluencyMetricKey];
+		if (incoming !== undefined) {
+			ex[field as NumericFluencyMetricKey] = _addCount(ex[field as NumericFluencyMetricKey], incoming);
+		}
+	}
 }
 
-function _mergeJsonFluencyMetrics(
-	ex: NonNullable<DailyRollupValue['fluencyMetrics']>,
-	val: NonNullable<DailyRollupValue['fluencyMetrics']>
-): void {
-	if (val.toolCallsJson) { ex.toolCallsJson = mergeJsonMetrics(ex.toolCallsJson, val.toolCallsJson); }
-	if (val.contextRefsJson) { ex.contextRefsJson = mergeJsonMetrics(ex.contextRefsJson, val.contextRefsJson); }
-	if (val.mcpToolsJson) { ex.mcpToolsJson = mergeJsonMetrics(ex.mcpToolsJson, val.mcpToolsJson); }
-	if (val.modelSwitchingJson) { ex.modelSwitchingJson = mergeJsonMetrics(ex.modelSwitchingJson, val.modelSwitchingJson); }
-	if (val.editScopeJson) { ex.editScopeJson = mergeJsonMetrics(ex.editScopeJson, val.editScopeJson); }
-	if (val.agentTypesJson) { ex.agentTypesJson = mergeJsonMetrics(ex.agentTypesJson, val.agentTypesJson); }
-	if (val.repositoriesJson) { ex.repositoriesJson = mergeRepositoriesJson(ex.repositoriesJson, val.repositoriesJson); }
-	if (val.applyUsageJson) { ex.applyUsageJson = mergeJsonMetrics(ex.applyUsageJson, val.applyUsageJson); }
-	if (val.sessionDurationJson) { ex.sessionDurationJson = mergeJsonMetrics(ex.sessionDurationJson, val.sessionDurationJson); }
+function _mergeJsonFluencyMetrics(ex: FluencyMetrics, val: FluencyMetrics): void {
+	const exR = ex as Record<string, string | undefined>;
+	const valR = val as Record<string, string | undefined>;
+	for (const { key, merge } of JSON_FLUENCY_FIELD_MERGERS) {
+		const incoming = valR[key];
+		if (incoming) {
+			exR[key] = merge(exR[key], incoming);
+		}
+	}
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null;
+}
+
+function mergeNumericValues(existing: unknown, delta: number): number {
+	return (typeof existing === 'number' ? existing : 0) + delta;
+}
+
+function mergeNestedObject(
+	existing: Record<string, unknown>,
+	incoming: Record<string, unknown>
+): Record<string, unknown> {
+	const merged = { ...existing };
+	for (const key in incoming) {
+		const incomingVal = incoming[key];
+		merged[key] = typeof incomingVal === 'number'
+			? mergeNumericValues(existing[key], incomingVal)
+			: incomingVal;
+	}
+	return merged;
+}
+
+function mergeMetricEntry(existing: unknown, incoming: unknown): unknown {
+	if (typeof incoming === 'number') {
+		return mergeNumericValues(existing, incoming);
+	}
+	if (isPlainObject(incoming) && isPlainObject(existing)) {
+		return mergeNestedObject(existing, incoming);
+	}
+	return incoming;
 }
 
 /**
@@ -165,35 +213,14 @@ function _mergeJsonFluencyMetrics(
  */
 function mergeJsonMetrics(existing: string | undefined, incoming: string): string {
 	try {
-		const existingObj = existing ? JSON.parse(existing) : {};
-		const incomingObj = JSON.parse(incoming);
-		
-		// Merge objects by adding numeric values
-		const merged: any = { ...existingObj };
+		const existingObj: Record<string, unknown> = existing ? JSON.parse(existing) : {};
+		const incomingObj: Record<string, unknown> = JSON.parse(incoming);
+
+		const merged: Record<string, unknown> = { ...existingObj };
 		for (const key in incomingObj) {
-			if (typeof incomingObj[key] === 'number') {
-				merged[key] = (merged[key] || 0) + incomingObj[key];
-			} else if (typeof incomingObj[key] === 'object' && incomingObj[key] !== null) {
-				// Recursively merge nested objects
-				if (typeof merged[key] === 'object' && merged[key] !== null) {
-					for (const subKey in incomingObj[key]) {
-						if (typeof incomingObj[key][subKey] === 'number') {
-							if (typeof merged[key][subKey] !== 'number') {
-								merged[key][subKey] = 0;
-							}
-							merged[key][subKey] += incomingObj[key][subKey];
-						} else {
-							merged[key][subKey] = incomingObj[key][subKey];
-						}
-					}
-				} else {
-					merged[key] = incomingObj[key];
-				}
-			} else {
-				merged[key] = incomingObj[key];
-			}
+			merged[key] = mergeMetricEntry(merged[key], incomingObj[key]);
 		}
-		
+
 		return JSON.stringify(merged);
 	} catch {
 		// If parsing fails, return the incoming value

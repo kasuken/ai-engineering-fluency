@@ -7,14 +7,13 @@ import type { TokenCredential } from "@azure/core-auth";
 import { AzureNamedKeyCredential } from "@azure/core-auth";
 import { TableClient, TableServiceClient } from "@azure/data-tables";
 import * as vscode from "vscode";
-import { withErrorHandling } from "../../utils/errors";
+import { withErrorHandling, getErrorStatusCode, getErrorCode } from "../../utils/errors";
 import { AZURE_SDK_QUERY_TIMEOUT_MS } from "../constants";
 import type { BackendSettings } from "../settings";
 import type {
   BackendAggDailyEntityLike,
   TableClientLike,
-} from "../storageTables";
-import {
+} from "../storageTables";import {
   buildAggPartitionKey,
   listAggDailyEntitiesFromTableClient,
 } from "../storageTables";
@@ -110,10 +109,10 @@ export class DataPlaneService {
         try {
           await serviceClient.createTable(settings.aggTable);
           this.log(`Backend sync: created table ${settings.aggTable}`);
-        } catch (e: any) {
+        } catch (e: unknown) {
           // 409 = already exists
-          const status = e?.statusCode ?? e?.code;
-          if (status === 409 || e?.code === "TableAlreadyExists") {
+          const status = getErrorStatusCode(e) ?? getErrorCode(e);
+          if (status === 409 || getErrorCode(e) === "TableAlreadyExists") {
             this.log(
               `Backend sync: table ${settings.aggTable} already exists (OK)`,
             );
@@ -161,8 +160,8 @@ export class DataPlaneService {
         AZURE_SDK_QUERY_TIMEOUT_MS,
         "Table entity delete",
       );
-    } catch (e: any) {
-      const status = e?.statusCode;
+    } catch (e: unknown) {
+      const status = getErrorStatusCode(e);
       if (status === 403) {
         throw new Error(
           `Missing Azure RBAC data-plane permissions for Tables. Assign 'Storage Table Data Contributor' (read/write) or 'Storage Table Data Reader' (read-only) on the Storage account or table service.`,
@@ -353,7 +352,7 @@ export class DataPlaneService {
           "Table entity delete",
         );
         deletedCount++;
-      } catch (error: any) {
+      } catch (error: unknown) {
         const err = error instanceof Error ? error : new Error(String(error));
         errors.push({ partitionKey, rowKey, error: err });
         this.log(
@@ -377,16 +376,16 @@ export class DataPlaneService {
    */
   async upsertEntitiesBatch(
     tableClient: TableClientLike,
-    entities: any[],
+    entities: BackendAggDailyEntityLike[],
   ): Promise<{
     successCount: number;
-    errors: Array<{ entity: any; error: Error }>;
+    errors: Array<{ entity: BackendAggDailyEntityLike; error: Error }>;
   }> {
     let successCount = 0;
-    const errors: Array<{ entity: any; error: Error }> = [];
+    const errors: Array<{ entity: BackendAggDailyEntityLike; error: Error }> = [];
 
     // Group entities by partition key for potential future batch optimization
-    const byPartition = new Map<string, any[]>();
+    const byPartition = new Map<string, BackendAggDailyEntityLike[]>();
     for (const entity of entities) {
       const pk = entity.partitionKey;
       if (!byPartition.has(pk)) {
@@ -425,7 +424,7 @@ export class DataPlaneService {
    */
   private async upsertEntityWithRetry(
     tableClient: TableClientLike,
-    entity: any,
+    entity: BackendAggDailyEntityLike,
     maxRetries: number = 3,
   ): Promise<void> {
     let lastError: Error | undefined;
@@ -438,11 +437,11 @@ export class DataPlaneService {
           "Table entity upsert",
         );
         return; // Success
-      } catch (error: any) {
+      } catch (error: unknown) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
         // Check if error is retryable (429 throttling, 503 unavailable)
-        const statusCode = error?.statusCode ?? error?.code;
+        const statusCode = getErrorStatusCode(error) ?? getErrorCode(error);
         const isRetryable =
           statusCode === 429 ||
           statusCode === 503 ||
