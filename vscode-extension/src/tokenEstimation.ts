@@ -2,7 +2,7 @@
  * Token estimation and model-related utility functions.
  * Pure or near-pure functions extracted from CopilotTokenTracker for reusability.
  */
-import type { ModelUsage, ModelPricing, ContextReferenceUsage } from './types';
+import type { ModelUsage, ModelPricing, ContextReferenceUsage, TokenEstimator } from './types';
 
 /** Minimum request shape needed by getModelFromRequest. */
 interface ModelRequestSource {
@@ -70,7 +70,7 @@ const TOKEN_RATIO_HIGH_TOOLS = 130;
 const TOKEN_RATIO_MED_TOOLS = 50;
 const TOKEN_RATIO_LOW_TOOLS = 10;
 
-export function estimateTokensFromText(text: string, model: string = 'gpt-4', tokenEstimators: { [key: string]: number } = {}): number {
+export function estimateTokensFromText(text: string, model: string = 'gpt-4', tokenEstimators: Record<string, TokenEstimator> = {}): number {
 	// Token estimation based on character count and model
 	let tokensPerChar = 0.25; // default
 
