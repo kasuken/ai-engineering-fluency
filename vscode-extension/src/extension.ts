@@ -216,7 +216,7 @@ type StatusBarDisplaySetting = 'none' | 'today' | 'last30days' | 'currentMonth' 
 
 class CopilotTokenTracker implements vscode.Disposable {
 	// Cache version - increment this when making changes that require cache invalidation
-	private static readonly CACHE_VERSION = 52; // Added LOC (linesAdded/linesRemoved/languageUsage)
+	private static readonly CACHE_VERSION = 53; // Add Antigravity ecosystem adapter + LOC support
 	// Maximum length for displaying workspace IDs in diagnostics/customization matrix
 	private static readonly WORKSPACE_ID_DISPLAY_LENGTH = 8;
 
@@ -967,6 +967,19 @@ class CopilotTokenTracker implements vscode.Disposable {
 		// CRITICAL: Add output channel to context.subscriptions so VS Code doesn't dispose it
 		context.subscriptions.push(this.outputChannel);
 		this.log('Constructor called');
+		const version = context.extension.packageJSON?.version ?? 'unknown';
+		const mode = context.extensionMode === vscode.ExtensionMode.Development ? 'Development'
+			: context.extensionMode === vscode.ExtensionMode.Test ? 'Test' : 'Production';
+		let startupInfo = `🚀 AI Engineering Fluency v${version} [${mode}] (cache v${CopilotTokenTracker.CACHE_VERSION})`;
+		if (context.extensionMode === vscode.ExtensionMode.Development) {
+			try {
+				const sha = childProcess.execSync('git rev-parse --short HEAD', {
+					cwd: context.extensionUri.fsPath, encoding: 'utf8', timeout: 3000, stdio: ['pipe', 'pipe', 'pipe']
+				}).trim();
+				startupInfo += ` branch=${this._devBranch ?? 'unknown'} sha=${sha}`;
+			} catch { /* git unavailable */ }
+		}
+		this.log(startupInfo);
 
 		// Load persisted cache from storage
 		this.cacheManager.loadCacheFromStorage();
