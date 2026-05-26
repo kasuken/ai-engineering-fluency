@@ -1721,6 +1721,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 			this.setStatusBarText(this.buildStatusBarText(detailedStats));
 		}
 		this.statusBarItem.tooltip = this.buildTooltipMarkdown(detailedStats);
+		this.updateStatusBarBackgroundColor(detailedStats);
 	}
 
 	private buildLoadingTooltipMarkdown(step: 'discovering' | 'parsing' | 'computing', percentage?: number): vscode.MarkdownString {
@@ -1875,8 +1876,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 		tooltip.appendMarkdown(`| Average interactions/session :      | ${detailedStats.last30Days.avgInteractionsPerSession} |\n`);
 		tooltip.appendMarkdown(`| Average tokens/session :            | ${detailedStats.last30Days.avgTokensPerSession.toLocaleString()} |\n`);
 		tooltip.appendMarkdown('\n---\n');
-		tooltip.appendMarkdown('*(UBB) = Copilot AI Credit rates — what Copilot will bill you under Usage Based Billing.*  \n');
-		tooltip.appendMarkdown('*Updates automatically every 5 minutes.*');
+		const budget = this.getMonthlyBudgetSetting();
+		if (budget > 0) {
+			const monthCost = detailedStats.month.estimatedCostCopilot ?? detailedStats.month.estimatedCost ?? 0;
+			const pct = Math.round((monthCost / budget) * 100);
+			tooltip.appendMarkdown(`\n---\n💰 Monthly budget: $${budget.toFixed(2)} — this month: $${monthCost.toFixed(2)} (${pct}%)`);
+		}
 		return tooltip;
 	}
 
@@ -1901,7 +1906,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		if (!this.chartPanel || (!this.lastFullDailyStats && !this.lastDailyStats)) { return; }
 		const chartStats = this.lastFullDailyStats ?? this.lastDailyStats!;
 		if (silent) {
-			void this.chartPanel.webview.postMessage({ command: 'updateChartData', data: { ...this.buildChartData(chartStats), compactNumbers: this.getCompactNumbersSetting() } });
+			void this.chartPanel.webview.postMessage({ command: 'updateChartData', data: { ...this.buildChartData(chartStats), compactNumbers: this.getCompactNumbersSetting(), monthlyBudget: this.getMonthlyBudgetSetting() } });
 		} else {
 			this.chartPanel.webview.html = this.getChartHtml(this.chartPanel.webview, chartStats);
 		}
@@ -2195,6 +2200,30 @@ class CopilotTokenTracker implements vscode.Disposable {
 		return vscode.workspace.getConfiguration('aiEngineeringFluency.display.statusBar').get<StatusBarDisplaySetting>('showCost', 'none');
 	}
 
+	private getMonthlyBudgetSetting(): number {
+		return vscode.workspace.getConfiguration('aiEngineeringFluency.display.statusBar').get<number>('monthlyBudget', 0);
+	}
+
+	/** Updates the status bar background color based on current-month spend vs. the configured budget.
+	 *  Uses VS Code's built-in theme colors: warning (yellow) at ≥75%, error (red/orange) at ≥90%.
+	 *  Clears the background when no budget is configured or spend is below 75%. */
+	private updateStatusBarBackgroundColor(stats: DetailedStats): void {
+		const budget = this.getMonthlyBudgetSetting();
+		if (budget <= 0) {
+			this.statusBarItem.backgroundColor = undefined;
+			return;
+		}
+		const monthCost = stats.month.estimatedCostCopilot ?? stats.month.estimatedCost ?? 0;
+		const ratio = monthCost / budget;
+		if (ratio >= 0.90) {
+			this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+		} else if (ratio >= 0.75) {
+			this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+		} else {
+			this.statusBarItem.backgroundColor = undefined;
+		}
+	}
+
 	private buildTokenParts(show: StatusBarDisplaySetting, stats: DetailedStats): string[] {
 		const parts: string[] = [];
 		if (show === 'today' || show === 'both' || show === 'todayAndCurrentMonth') {
@@ -2242,8 +2271,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private refreshOpenPanelsForSettingChange(): void {
 		const stats = this.lastDetailedStats;
 		if (!stats) { return; }
-		// Refresh status bar text (respects new display settings)
+		// Refresh status bar text and background color (respects new display settings)
 		this.setStatusBarText(this.buildStatusBarText(stats));
+		this.updateStatusBarBackgroundColor(stats);
 		if (this.detailsPanel) {
 			this.detailsPanel.webview.html = this.getDetailsHtml(this.detailsPanel.webview, stats);
 		}
@@ -6645,9 +6675,16 @@ ${this.getLoadingHtmlScript()}
     const fullKeyMap: Record<string, string> = {
       'display.statusBar.showTokens': 'aiEngineeringFluency.display.statusBar.showTokens',
       'display.statusBar.showCost': 'aiEngineeringFluency.display.statusBar.showCost',
+      'display.statusBar.monthlyBudget': 'aiEngineeringFluency.display.statusBar.monthlyBudget',
     };
     const fullKey = fullKeyMap[key];
-    if (fullKey) { await vscode.workspace.getConfiguration().update(fullKey, value, vscode.ConfigurationTarget.Global); }
+    if (!fullKey) { return; }
+    let sanitised: any = value;
+    if (key === 'display.statusBar.monthlyBudget') {
+      const n = typeof value === 'number' ? value : parseFloat(value);
+      sanitised = isNaN(n) ? 0 : Math.min(99999, Math.max(0, Math.round(n * 100) / 100));
+    }
+    await vscode.workspace.getConfiguration().update(fullKey, sanitised, vscode.ConfigurationTarget.Global);
   }
 
   private async diagHandleResetDebugCounters(): Promise<void> {
@@ -7010,7 +7047,7 @@ ${this.getLoadingHtmlScript()}
       report, sessionFiles, detailedSessionFiles, sessionFolders,
       cacheInfo, backendStorageInfo,
       backendConfigured: this.isBackendConfigured(), isDebugMode, globalStateCounters,
-      displaySettings: { showTokens: this.getStatusBarShowTokensSetting(), showCost: this.getStatusBarShowCostSetting() },
+      displaySettings: { showTokens: this.getStatusBarShowTokensSetting(), showCost: this.getStatusBarShowCostSetting(), monthlyBudget: this.getMonthlyBudgetSetting() },
     }).replace(/</g, "\\u003c");
 
     return `<!DOCTYPE html>
@@ -7098,7 +7135,7 @@ ${this.getLoadingHtmlScript()}
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "chart.js"),
     );
 
-    const chartData = { ...this.buildChartData(dailyStats), periodsReady, initialPeriod: this.lastChartPeriod, initialView: this.lastChartView, initialMetric: this.lastChartMetric, initialSplit: this.lastChartSplit };
+    const chartData = { ...this.buildChartData(dailyStats), periodsReady, initialPeriod: this.lastChartPeriod, initialView: this.lastChartView, initialMetric: this.lastChartMetric, initialSplit: this.lastChartSplit, monthlyBudget: this.getMonthlyBudgetSetting() };
 
     const initialData = JSON.stringify(chartData).replace(/</g, "\\u003c");
 
