@@ -99,6 +99,92 @@ export function fetchCopilotPlanInfo(
 	return fetcher(token);
 }
 
+// ---------------------------------------------------------------------------
+// Copilot v2 token endpoint info
+// ---------------------------------------------------------------------------
+
+/** Endpoint URLs returned by the copilot_internal/v2/token endpoint. */
+export type CopilotTokenEndpoints = {
+	api?: string;
+	'origin-tracker'?: string;
+	telemetry?: string;
+	proxy?: string;
+	[key: string]: string | undefined;
+};
+
+/** Non-sensitive metadata from the copilot_internal/v2/token response (token string excluded). */
+export type CopilotTokenEndpointInfo = {
+	endpoints?: CopilotTokenEndpoints;
+	/** Unix timestamp (seconds) when the token expires. */
+	expires_at?: number;
+	/** How many seconds until the token should be refreshed. */
+	refresh_in?: number;
+	/** Subscription SKU embedded in the token header (e.g. "copilot_individual"). */
+	sku?: string;
+	[key: string]: unknown;
+};
+
+export type CopilotTokenEndpointResult = { info?: CopilotTokenEndpointInfo; statusCode?: number; error?: string };
+
+/** Internal low-level fetcher for the copilot_internal/v2/token endpoint. */
+function fetchCopilotTokenEndpointInfoPage(token: string): Promise<CopilotTokenEndpointResult> {
+	return new Promise((resolve) => {
+		const req = https.request(
+			{
+				hostname: GITHUB_API_HOSTNAME,
+				path: '/copilot_internal/v2/token',
+				headers: {
+					Authorization: `Bearer ${token}`,
+					'User-Agent': GITHUB_API_USER_AGENT,
+					Accept: 'application/json',
+				},
+			},
+			(res) => {
+				let data = '';
+				res.on('data', (chunk) => (data += chunk));
+				res.on('end', () => {
+					const statusCode = res.statusCode ?? 0;
+					if (statusCode < 200 || statusCode >= 300) {
+						resolve({ statusCode, error: `HTTP ${statusCode}` });
+						return;
+					}
+					try {
+						const parsed = JSON.parse(data);
+						if (typeof parsed !== 'object' || parsed === null) {
+							resolve({ statusCode, error: 'Unexpected response format' });
+							return;
+						}
+						// Exclude the short-lived token string — we only care about the metadata.
+						const { token: _token, ...rest } = parsed as { token?: string } & CopilotTokenEndpointInfo;
+						resolve({ info: rest as CopilotTokenEndpointInfo, statusCode });
+					} catch (e) {
+						resolve({ statusCode, error: String(e) });
+					}
+				});
+			},
+		);
+		req.on('error', (e) => resolve({ error: e.message }));
+		req.setTimeout(15000, () => {
+			req.destroy(new Error('Request timed out after 15 s'));
+		});
+		req.end();
+	});
+}
+
+/**
+ * Fetch Copilot token endpoint metadata for the authenticated user.
+ * Uses the VS Code-only internal endpoint `https://api.github.com/copilot_internal/v2/token`.
+ * Returns metadata (endpoints, expiry) but never the token string itself.
+ * Treat as best-effort — this endpoint may not be available for all accounts.
+ * @param fetcher Injectable fetcher for testing; defaults to the real HTTPS implementation.
+ */
+export function fetchCopilotTokenEndpointInfo(
+	token: string,
+	fetcher: (token: string) => Promise<CopilotTokenEndpointResult> = fetchCopilotTokenEndpointInfoPage,
+): Promise<CopilotTokenEndpointResult> {
+	return fetcher(token);
+}
+
 /** Detect which AI system a GitHub login belongs to, or null if not an AI bot. */
 export function detectAiType(login: string): RepoPrDetail['aiType'] | null {
 	const l = login.toLowerCase();

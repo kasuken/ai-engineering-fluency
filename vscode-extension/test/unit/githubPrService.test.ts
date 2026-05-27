@@ -1,6 +1,6 @@
 import test from 'node:test';
 import * as assert from 'node:assert/strict';
-import { detectAiType, fetchRepoPrs, fetchCopilotPlanInfo, type CopilotPlanInfo } from '../../src/githubPrService';
+import { detectAiType, fetchRepoPrs, fetchCopilotPlanInfo, fetchCopilotTokenEndpointInfo, type CopilotPlanInfo, type CopilotTokenEndpointInfo } from '../../src/githubPrService';
 
 // ---------------------------------------------------------------------------
 // detectAiType — pure function, no I/O
@@ -201,4 +201,53 @@ test('fetchCopilotPlanInfo: handles partial plan data gracefully', async () => {
 	assert.equal(error, undefined);
 	assert.equal(planInfo?.copilot_plan, 'copilot_free');
 	assert.equal(planInfo?.ide_chat, undefined);
+});
+
+// ---------------------------------------------------------------------------
+// fetchCopilotTokenEndpointInfo — uses injectable fetcher
+// ---------------------------------------------------------------------------
+
+test('fetchCopilotTokenEndpointInfo: returns endpoint info on success', async () => {
+	const endpointData: CopilotTokenEndpointInfo = {
+		endpoints: { api: 'https://api.individual.githubcopilot.com' },
+		expires_at: 1730000000,
+		refresh_in: 1500,
+		sku: 'copilot_individual',
+	};
+	const mockFetcher = async () => ({ info: endpointData, statusCode: 200 });
+	const { info, statusCode, error } = await fetchCopilotTokenEndpointInfo('token', mockFetcher);
+	assert.equal(error, undefined);
+	assert.equal(statusCode, 200);
+	assert.deepEqual(info, endpointData);
+});
+
+test('fetchCopilotTokenEndpointInfo: returns error on non-2xx response', async () => {
+	const mockFetcher = async () => ({ statusCode: 401, error: 'HTTP 401' });
+	const { info, statusCode, error } = await fetchCopilotTokenEndpointInfo('token', mockFetcher);
+	assert.equal(info, undefined);
+	assert.equal(statusCode, 401);
+	assert.equal(error, 'HTTP 401');
+});
+
+test('fetchCopilotTokenEndpointInfo: returns error on network failure', async () => {
+	const mockFetcher = async () => ({ error: 'socket hang up' });
+	const { info, error } = await fetchCopilotTokenEndpointInfo('token', mockFetcher);
+	assert.equal(info, undefined);
+	assert.equal(error, 'socket hang up');
+});
+
+test('fetchCopilotTokenEndpointInfo: handles partial response gracefully', async () => {
+	// Only endpoints returned, no expiry info
+	const mockFetcher = async () => ({ info: { endpoints: { api: 'https://api.business.githubcopilot.com' } } as CopilotTokenEndpointInfo, statusCode: 200 });
+	const { info, error } = await fetchCopilotTokenEndpointInfo('token', mockFetcher);
+	assert.equal(error, undefined);
+	assert.equal(info?.endpoints?.api, 'https://api.business.githubcopilot.com');
+	assert.equal(info?.expires_at, undefined);
+});
+
+test('fetchCopilotTokenEndpointInfo: handles empty info object gracefully', async () => {
+	const mockFetcher = async () => ({ info: {} as CopilotTokenEndpointInfo, statusCode: 200 });
+	const { info, error } = await fetchCopilotTokenEndpointInfo('token', mockFetcher);
+	assert.equal(error, undefined);
+	assert.deepEqual(info, {});
 });

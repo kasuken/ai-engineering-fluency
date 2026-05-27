@@ -167,6 +167,7 @@ import {
 	discoverGitHubRepos,
 	fetchRepoPrs,
 	fetchCopilotPlanInfo,
+	fetchCopilotTokenEndpointInfo,
 	type CopilotPlanInfo,
 	type RepoPrDetail,
 	type RepoPrInfo,
@@ -1565,6 +1566,35 @@ class CopilotTokenTracker implements vscode.Disposable {
 			this.logCopilotPlanDetails(planId, knownPlan, planInfo);
 		} catch (err) {
 			this.warn('Failed to load Copilot plan info: ' + String(err));
+		}
+		await this.loadAndLogCopilotTokenEndpointInfo();
+	}
+
+	/**
+	 * Fetch and log Copilot token endpoint metadata from copilot_internal/v2/token.
+	 * Logs the API endpoint URL (shows individual/business/enterprise tier) and token expiry.
+	 * Best-effort: silently skips on any failure.
+	 */
+	private async loadAndLogCopilotTokenEndpointInfo(): Promise<void> {
+		if (!this.githubSession) { return; }
+		try {
+			const { info, statusCode, error } = await fetchCopilotTokenEndpointInfo(this.githubSession.accessToken);
+			if (error || !info) {
+				this.warn(`Copilot token endpoint info unavailable (HTTP ${statusCode ?? 'n/a'}): ${error ?? 'no data'}`);
+				return;
+			}
+			if (info.endpoints?.api) {
+				this.log(`  Copilot API endpoint: ${info.endpoints.api}`);
+			}
+			if (info.expires_at !== undefined) {
+				const expiresDate = new Date(info.expires_at * 1000);
+				this.log(`  Copilot token valid until: ${expiresDate.toISOString()}`);
+			}
+			if (info.sku) {
+				this.log(`  Copilot SKU: ${info.sku}`);
+			}
+		} catch (err) {
+			this.warn('Failed to load Copilot token endpoint info: ' + String(err));
 		}
 	}
 
