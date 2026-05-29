@@ -2482,6 +2482,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 			this.aggregateUsageFileResults(usageResults, periods, wsMaps, todaySessionsList, totalFiles);
 			this.deduplicateWorkspacePaths(workspaceSessionCounts, workspaceInteractionCounts);
 			this.buildUsageCustomizationMatrix(workspaceSessionCounts, workspaceInteractionCounts, unresolvedWorkspaceIds, unresolvedWorkspaceInteractionCounts);
+			await this.enrichMultiAgentParentCount(usageResults, last30DaysStats, last30DaysUtcStartKey);
 		} catch (error) {
 			this.error('Error calculating usage analysis stats:', error);
 		}
@@ -2526,6 +2527,36 @@ class CopilotTokenTracker implements vscode.Disposable {
 			conversationPatterns: { multiTurnSessions: 0, singleTurnSessions: 0, avgTurnsPerSession: 0, maxTurnsInSession: 0 },
 			agentTypes: { editsAgent: 0, defaultAgent: 0, workspaceAgent: 0, other: 0 }
 		};
+	}
+
+	/**
+	 * Query data.db for multi-agent parent count and set it on the period.
+	 * A session counts as a "multi-agent parent" when it has 2+ direct child workspaces.
+	 * Errors are swallowed — this is optional enrichment only.
+	 */
+	private async enrichMultiAgentParentCount(
+		usageResults: ({ sessionFile: string; sessionData: SessionFileCache; mtime: number } | null | undefined)[],
+		last30DaysStats: UsageAnalysisPeriod,
+		last30DaysUtcStartKey: string,
+	): Promise<void> {
+		const uuids: string[] = [];
+		for (const r of usageResults) {
+			if (!r) { continue; }
+			const lastActivityKey = this.computeLastActivityKey(r.sessionData, r.mtime);
+			if (lastActivityKey < last30DaysUtcStartKey) { continue; }
+			const uuid = this.extractCopilotCliUuid(r.sessionFile);
+			if (uuid) { uuids.push(uuid); }
+		}
+		if (uuids.length === 0) { return; }
+		try {
+			const hierarchy = await this.copilotAppData.getSessionHierarchy(uuids);
+			let count = 0;
+			for (const uuid of uuids) {
+				const node = hierarchy.get(uuid);
+				if (node && node.totalChildCount >= 2) { count++; }
+			}
+			if (count > 0) { last30DaysStats.multiAgentParentSessions = count; }
+		} catch { /* optional enrichment — suppress */ }
 	}
 
 	private buildDefaultSessionAnalysis(): SessionUsageAnalysis {

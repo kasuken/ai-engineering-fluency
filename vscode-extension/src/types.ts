@@ -440,6 +440,12 @@ export interface UsageAnalysisPeriod {
     sessionCount: number; // sessions with effort data
     switchCount: number;  // total effort switches across all sessions
   };
+  /**
+   * Number of sessions in this period that are parents of 2+ child workspaces,
+   * indicating multi-agent orchestration. Populated from ~/.copilot/data.db;
+   * absent (undefined) when data.db is not available.
+   */
+  multiAgentParentSessions?: number;
 }
 
 /** Parent/child session reference used in hierarchy info (Copilot CLI sessions). */
