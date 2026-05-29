@@ -374,6 +374,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 	// Editor list captured during the last (or current) log analysis, used to render the loading tooltip SVG
 	private _loadingEditors: { icon: string; name: string }[] = [];
+	// Previous progress percentage used to animate the progress bar smoothly between tooltip updates
+	private _prevLoadingPercentage = 0;
 
 	// Cache mapping workspaceStorageId -> resolved workspace folder path (or undefined if not resolvable)
 	private _workspaceIdToFolderCache: Map<string, string | undefined> = new Map();
@@ -1672,7 +1674,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		if (silent) { return undefined; }
 		let parsingStepNotified = false;
 		let lastProgressSentMs = 0;
-		let lastTooltipPctBucket = -1;
+		let lastTooltipUpdatedMs = 0;
 		return (completed: number, total: number) => {
 			const percentage = Math.round((completed / total) * 100);
 			this.setStatusBarText(`$(loading~spin) Analyzing Logs: ${percentage}%`);
@@ -1685,18 +1687,19 @@ class CopilotTokenTracker implements vscode.Disposable {
 				// Update tooltip once when parsing starts (editors are now known).
 				// Skip entirely when the loading panel is already open — no need to double up.
 				if (!this._detailsPanelIsLoading) {
+					this._prevLoadingPercentage = 0;
 					this.statusBarItem.tooltip = this.buildLoadingTooltipMarkdown('parsing', percentage > 0 ? percentage : undefined);
+					lastTooltipUpdatedMs = Date.now();
 				}
 			}
-			// Update tooltip at each 10% boundary to show real progress.
-			// Using buckets (not raw %) prevents multiple updates at the same threshold.
+			// Time-based throttle: update tooltip at most once every 500 ms.
+			// This prevents jarring jumps at 10% boundaries and reduces tooltip flicker.
 			// Skip when the loading panel is open — the panel already shows progress.
-			const pctBucket = Math.floor(percentage / 10);
-			if (!this._detailsPanelIsLoading && pctBucket > lastTooltipPctBucket && percentage > 0) {
-				lastTooltipPctBucket = pctBucket;
+			const now = Date.now();
+			if (!this._detailsPanelIsLoading && percentage > 0 && (now - lastTooltipUpdatedMs) >= 500) {
+				lastTooltipUpdatedMs = now;
 				this.statusBarItem.tooltip = this.buildLoadingTooltipMarkdown('parsing', percentage);
 			}
-			const now = Date.now();
 			if (now - lastProgressSentMs >= 500 || completed === total) {
 				lastProgressSentMs = now;
 				this.sendLoadingPanelMessage({ command: 'loadingProgress', completed, total, percentage });
@@ -1734,7 +1737,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private buildLoadingTooltipMarkdown(step: 'discovering' | 'parsing' | 'computing', percentage?: number): vscode.MarkdownString {
-		const svg = this.generateLoadingSvg(step, this._loadingEditors, percentage);
+		const svg = this.generateLoadingSvg(step, this._loadingEditors, percentage, this._prevLoadingPercentage);
+		this._prevLoadingPercentage = percentage ?? this._prevLoadingPercentage;
 		const tooltip = new vscode.MarkdownString(`![Loading](data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)})`);
 		tooltip.isTrusted = true;
 		tooltip.supportThemeIcons = false;
@@ -1745,10 +1749,11 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private generateLoadingSvg(
 		step: 'discovering' | 'parsing' | 'computing',
 		editors: { icon: string; name: string }[],
-		percentage?: number
+		percentage?: number,
+		prevPercentage?: number
 	): string {
-		const W = 440, P = 16;
-		const BG   = '#181825', CARD  = '#24273a', FG  = '#cdd6f4';
+		const W = 440, P = 12;
+		const CARD  = '#24273a', FG  = '#cdd6f4';
 		const MUT  = '#9399b2', ACC   = '#89b4fa', OK  = '#a6e3a1';
 		const BRD  = '#313244';
 		const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";
@@ -1790,9 +1795,6 @@ class CopilotTokenTracker implements vscode.Disposable {
   <clipPath id="pclip"><rect x="${P}" y="${PRY}" width="${PW}" height="${PRH}" rx="2.5"/></clipPath>
 </defs>`);
 
-		// Card background
-		o.push(`<rect width="${W}" height="${H}" rx="10" fill="${BG}" stroke="${BRD}"/>`);
-
 		// Badge
 		o.push(`<text x="${P}" y="${BY}" font-family="${FONT}" font-size="10" font-weight="700" letter-spacing="1.5" fill="${ACC}">🤖 ANALYZING YOUR AI ACTIVITY</text>`);
 
@@ -1806,7 +1808,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		// Progress track
 		o.push(`<rect x="${P}" y="${PRY}" width="${PW}" height="${PRH}" rx="2.5" fill="${BRD}"/>`);
 
-		// Progress fill — shimmer (indeterminate) during discovering/early parsing, solid fill when progress is known
+		// Progress fill — shimmer (indeterminate) during discovering/early parsing, animated fill when progress is known
 		if (step !== 'computing' && pct === 0) {
 			const sw = Math.round(PW * 0.25);
 			o.push(`<rect y="${PRY}" width="${sw}" height="${PRH}" rx="2.5" fill="url(#pg)" clip-path="url(#pclip)">
@@ -1814,7 +1816,15 @@ class CopilotTokenTracker implements vscode.Disposable {
 </rect>`);
 		} else {
 			const fw = Math.max(8, Math.round((pct / 100) * PW));
-			o.push(`<rect x="${P}" y="${PRY}" width="${fw}" height="${PRH}" rx="2.5" fill="url(#pg)"/>`);
+			const prevFw = Math.max(8, Math.round(((prevPercentage ?? 0) / 100) * PW));
+			if (prevFw < fw) {
+				// Animate from previous width to current width so the bar grows smoothly
+				o.push(`<rect x="${P}" y="${PRY}" height="${PRH}" rx="2.5" fill="url(#pg)" width="${prevFw}">
+  <animate attributeName="width" from="${prevFw}" to="${fw}" dur="0.5s" fill="freeze" calcMode="spline" keySplines="0.25 0.46 0.45 0.94" keyTimes="0;1"/>
+</rect>`);
+			} else {
+				o.push(`<rect x="${P}" y="${PRY}" width="${fw}" height="${PRH}" rx="2.5" fill="url(#pg)"/>`);
+			}
 		}
 
 		// Editor pills
