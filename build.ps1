@@ -54,7 +54,7 @@ function Build-VsCode {
         switch ($Target) {
             'build'   { npm ci; npm run compile }
             'package' { npm ci; npm run package; npx vsce package }
-            'test'    { npm ci; npm run compile-tests; npm test }
+            'test'    { npm ci; npm run test:node }
             'clean'   { Remove-Item -Recurse -Force dist, out -ErrorAction SilentlyContinue }
         }
         Write-Ok "vscode-extension done."
