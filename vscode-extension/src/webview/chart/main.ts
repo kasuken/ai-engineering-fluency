@@ -787,12 +787,22 @@ function buildOutputViewConfig(view: string, period: ChartPeriodData, baseOption
 
 function getHeatmapColor(value: number, maxValue: number): string {
 	if (maxValue === 0 || value === 0) { return 'rgba(128, 128, 128, 0.06)'; }
-	const f = Math.min(value / maxValue, 1);
-	const r = Math.round(54 + (75 - 54) * f);
-	const g = Math.round(162 + (192 - 162) * f);
-	const b = Math.round(235 + (192 - 235) * f);
-	const a = (0.15 + 0.85 * f).toFixed(2);
+	// Log scale so small-but-non-zero values still get a visible colour (avoids
+	// everything looking the same when one spike dominates the linear range).
+	const f = Math.log1p(value) / Math.log1p(maxValue);
+	const r = Math.round(28 - 28 * f);
+	const g = Math.round(120 + (220 - 120) * f);
+	const b = Math.round(200 + (180 - 200) * f);
+	const a = (0.55 + 0.45 * f).toFixed(2);
 	return `rgba(${r}, ${g}, ${b}, ${a})`;
+}
+
+const HEATMAP_TOP_LANGUAGES = 10;
+
+function shortenDateLabel(label: string): string {
+	const m = /^\d{4}-(\d{2})-(\d{2})$/.exec(label);
+	if (m) { return `${parseInt(m[1])}/${parseInt(m[2])}`; }
+	return label;
 }
 
 function buildLanguageHeatmap(period: ChartPeriodData): HTMLElement {
@@ -800,15 +810,22 @@ function buildLanguageHeatmap(period: ChartPeriodData): HTMLElement {
 	const withTotals = datasets
 		.map(ds => ({ label: ds.label, data: ds.data as number[], total: (ds.data as number[]).reduce((a, b) => a + b, 0) }))
 		.filter(ds => ds.total > 0)
-		.sort((a, b) => b.total - a.total)
-		.slice(0, 20);
+		.sort((a, b) => b.total - a.total);
+	const topLangs = withTotals.slice(0, HEATMAP_TOP_LANGUAGES);
+	const otherLangs = withTotals.slice(HEATMAP_TOP_LANGUAGES);
+	if (otherLangs.length > 0) {
+		const otherData = otherLangs[0].data.map((_, i) => otherLangs.reduce((sum, ds) => sum + ds.data[i], 0));
+		const otherTotal = otherData.reduce((a, b) => a + b, 0);
+		if (otherTotal > 0) { topLangs.push({ label: 'Other', data: otherData, total: otherTotal }); }
+	}
 	const labels = period.labels;
+	const shortLabels = labels.map(shortenDateLabel);
 	const wrap = el('div', 'heatmap-wrap');
-	if (!withTotals.length) {
+	if (!topLangs.length) {
 		wrap.append(el('div', 'heatmap-empty', 'No language data for this period.'));
 		return wrap;
 	}
-	const maxValue = Math.max(...withTotals.flatMap(ds => ds.data));
+	const maxValue = Math.max(...topLangs.flatMap(ds => ds.data));
 	const table = document.createElement('table');
 	table.className = 'heatmap-table';
 	const thead = document.createElement('thead');
@@ -816,18 +833,19 @@ function buildLanguageHeatmap(period: ChartPeriodData): HTMLElement {
 	const cornerTh = document.createElement('th');
 	cornerTh.className = 'heatmap-lang-header';
 	headerRow.append(cornerTh);
-	labels.forEach(label => {
+	labels.forEach((label, i) => {
 		const th = document.createElement('th');
 		th.className = 'heatmap-date-header';
 		const span = document.createElement('span');
-		span.textContent = label;
+		span.textContent = shortLabels[i];
+		th.title = label;
 		th.append(span);
 		headerRow.append(th);
 	});
 	thead.append(headerRow);
 	table.append(thead);
 	const tbody = document.createElement('tbody');
-	withTotals.forEach(ds => {
+	topLangs.forEach(ds => {
 		const tr = document.createElement('tr');
 		const langTd = document.createElement('td');
 		langTd.className = 'heatmap-lang-label';
