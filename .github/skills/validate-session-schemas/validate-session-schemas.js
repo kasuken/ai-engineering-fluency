@@ -169,6 +169,12 @@ const HOME = os.homedir();
 function discoverCopilotChat() {
   const files = [];
   const isSession = (n) => n.endsWith('.json') || n.endsWith('.jsonl');
+  // Real VS Code Copilot Chat sessions are UUID-named (e.g.
+  // bd774e5f-e027-....json). Used to filter the noisy github.copilot-chat
+  // globalStorage walk so embeddings/cache/CLI-metadata files don't crowd out
+  // genuine sessions in the recency window.
+  const isUuidSession = (n) =>
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.(json|jsonl)$/i.test(n);
   for (const userPath of getVSCodeUserPaths()) {
     if (!existsDir(userPath)) { continue; }
     const wsStorage = path.join(userPath, 'workspaceStorage');
@@ -183,8 +189,14 @@ function discoverCopilotChat() {
     for (const f of safeReaddir(legacy)) {
       if (!f.isDirectory() && isSession(f.name)) { files.push(path.join(legacy, f.name)); }
     }
+    // The github.copilot-chat globalStorage folder mixes real chat sessions
+    // with non-session artifacts (commandEmbeddings.json, settingEmbeddings.json,
+    // api.json, copilotCli/*.json). Those caches are rewritten constantly, so an
+    // unfiltered walk lets them dominate the most-recent window and silently
+    // crowd out the real requests[] sessions (which are UUID-named). Restrict
+    // this broad walk to UUID-named session files only.
     const copilotChat = path.join(userPath, 'globalStorage', 'github.copilot-chat');
-    walkFiles(copilotChat, isSession, files, 4);
+    walkFiles(copilotChat, isUuidSession, files, 4);
   }
   return files;
 }
