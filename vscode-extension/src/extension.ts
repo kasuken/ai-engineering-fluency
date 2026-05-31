@@ -1022,7 +1022,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private initializeStatusBar(): void {
-		this.statusBarItem = vscode.window.createStatusBarItem('ai-engineering-fluency', vscode.StatusBarAlignment.Right, 100);
+		this.statusBarItem = vscode.window.createStatusBarItem('ai-engineering-fluency', vscode.StatusBarAlignment.Right, 102);
 		this.statusBarItem.name = "AI Engineering Fluency";
 		this.setStatusBarText("$(loading~spin) AI Fluency: Loading...");
 		this.statusBarItem.tooltip = "AI Engineering Fluency — daily and 30-day token usage - Click to open details";
@@ -1030,7 +1030,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this.statusBarItem.show();
 
 		// Separate insights badge — hidden until there are new insights
-		this.insightsStatusBarItem = vscode.window.createStatusBarItem('ai-engineering-fluency-insights', vscode.StatusBarAlignment.Right, 99);
+		this.insightsStatusBarItem = vscode.window.createStatusBarItem('ai-engineering-fluency-insights', vscode.StatusBarAlignment.Right, 101);
 		this.insightsStatusBarItem.name = "AI Engineering Fluency — Insights";
 		this.insightsStatusBarItem.command = 'aiEngineeringFluency.openInsightsTab';
 		// starts hidden; shown in refreshStatusBarInsightBadge when count > 0
