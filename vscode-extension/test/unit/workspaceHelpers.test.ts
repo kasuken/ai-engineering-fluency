@@ -996,9 +996,9 @@ test('getRepositoryUrl: returns a non-empty URL string', () => {
     assert.ok(typeof url === 'string' && url.length > 0);
 });
 
-test('getRepositoryUrl: returned URL contains github.com', () => {
+test('getRepositoryUrl: returned URL hostname is github.com', () => {
     const url = getRepositoryUrl();
-    assert.ok(url.includes('github.com'));
+    assert.equal(new URL(url).hostname, 'github.com');
 });
 
 test('getRepositoryUrl: returned URL does not contain .git suffix', () => {
