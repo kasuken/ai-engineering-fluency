@@ -1241,7 +1241,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 		if (count > 0) {
 			const label = count === 1 ? '1 insight' : `${count} insights`;
-			this.insightsStatusBarItem.text = `💡 ${label}`;
+			this.insightsStatusBarItem.text = `💡 AI Fluency Insights: ${label}`;
 			const tooltip = new vscode.MarkdownString();
 			tooltip.isTrusted = false;
 			tooltip.appendMarkdown(`**💡 ${label} waiting for you**\n\n`);
