@@ -1021,6 +1021,15 @@ function _avdProcessVariable(variable: VariableItemRaw, refs: ContextReferenceUs
 	if (typeof kind === 'string') {
 		refs.byKind[kind] = (refs.byKind[kind] || 0) + 1;
 	}
+	// VS Code stores images with kind='image' in variableData; map to 'copilot.image' so
+	// maturity scoring (which checks byKind['copilot.image']) detects them correctly.
+	if (kind === 'image') {
+		refs.byKind['copilot.image'] = (refs.byKind['copilot.image'] || 0) + 1;
+	}
+	// Explicit file variable attachments count the same as #file: text references.
+	if (kind === 'file') {
+		refs.file++;
+	}
 	if (kind === 'generic' && typeof variable.name === 'string' && variable.name.startsWith('sym:')) {
 		refs.symbol++;
 		const symbolKey = `#${variable.name}`;
@@ -1609,6 +1618,28 @@ function _asuHandleUserMessageMode(jetBrainsMode: JetBrainsMode | null, analysis
 	else { analysis.modeUsage.cli++; }
 }
 
+/**
+ * Analyze CLI user.message attachments (images pasted from clipboard and @file references).
+ * Images arrive with a displayName ending in '-clipboard.png'.
+ * File/code references attached via @filename arrive with displayName '<N> lines' (for code)
+ * or as the bare filename (for non-image files like markdown docs).
+ */
+export function analyzeCliAttachments(attachments: unknown, refs: ContextReferenceUsage): void {
+	if (!Array.isArray(attachments)) { return; }
+	for (const att of attachments) {
+		if (!att || typeof att !== 'object') { continue; }
+		const displayName: unknown = (att as Record<string, unknown>)['displayName'];
+		if (typeof displayName !== 'string') { continue; }
+		if (/clipboard\.png$/i.test(displayName)) {
+			// Clipboard image pasted into the CLI chat
+			refs.byKind['copilot.image'] = (refs.byKind['copilot.image'] || 0) + 1;
+		} else if (/^\d+ lines$/.test(displayName) || /\.[a-z0-9]+$/i.test(displayName)) {
+			// @file reference: either 'N lines' (code file) or 'filename.ext' (doc/text file)
+			refs.file++;
+		}
+	}
+}
+
 /** Handle Copilot CLI events (session.start, session.model_change, user.message). */
  
 function _asuProcessCliEvents(event: any, cliState: AsuCliState, analysis: SessionUsageAnalysis, jetBrainsMode: JetBrainsMode | null): void {
@@ -1618,6 +1649,7 @@ function _asuProcessCliEvents(event: any, cliState: AsuCliState, analysis: Sessi
 		cliState.requestCount++;
 		const effort = typeof event.data?.reasoningEffort === 'string' ? event.data.reasoningEffort : cliState.defaultEffort;
 		if (effort) { cliState.effortByRequest[effort] = (cliState.effortByRequest[effort] || 0) + 1; }
+		analyzeCliAttachments(event.data?.attachments, analysis.contextReferences);
 		_asuHandleUserMessageMode(jetBrainsMode, analysis);
 	}
 }

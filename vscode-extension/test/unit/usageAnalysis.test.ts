@@ -6,6 +6,7 @@ import {
     analyzeContentReferences,
     analyzeVariableData,
     analyzeRequestContext,
+    analyzeCliAttachments,
     calculateModelSwitching,
     trackEnhancedMetrics,
     analyzeSessionUsage,
@@ -476,6 +477,29 @@ test('analyzeVariableData: tracks byKind for each variable', () => {
     assert.equal(refs.byKind['file'], 2);
 });
 
+test('analyzeVariableData: file variables also increment refs.file', () => {
+    const refs = emptyRefs();
+    analyzeVariableData({
+        variables: [
+            { kind: 'file', name: 'foo.ts' },
+            { kind: 'file', name: 'bar.ts' },
+        ]
+    }, refs);
+    assert.equal(refs.file, 2);
+});
+
+test('analyzeVariableData: image variables increment byKind[image] and byKind[copilot.image]', () => {
+    const refs = emptyRefs();
+    analyzeVariableData({
+        variables: [
+            { kind: 'image' },
+            { kind: 'image' },
+        ]
+    }, refs);
+    assert.equal(refs.byKind['image'], 2);
+    assert.equal(refs.byKind['copilot.image'], 2);
+});
+
 test('analyzeVariableData: increments symbol for generic sym: variables', () => {
     const refs = emptyRefs();
     analyzeVariableData({
@@ -495,6 +519,64 @@ test('analyzeVariableData: does not increment symbol for generic without sym: pr
         ]
     }, refs);
     assert.equal(refs.symbol, 0);
+});
+
+// ---------------------------------------------------------------------------
+// analyzeCliAttachments
+// ---------------------------------------------------------------------------
+
+test('analyzeCliAttachments: null/missing input is ignored', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments(null, refs);
+    analyzeCliAttachments(undefined, refs);
+    assert.equal(refs.file, 0);
+    assert.deepEqual(refs.byKind, {});
+});
+
+test('analyzeCliAttachments: clipboard PNG increments copilot.image', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([
+        { displayName: 'bce9bcb7-35f8-49ba-a49d-a8114dd26214-clipboard.png', type: 'file' },
+        { displayName: '3a695656-0157-4e9d-8613-781da1b54ee7-clipboard.png', type: 'file' },
+    ], refs);
+    assert.equal(refs.byKind['copilot.image'], 2);
+    assert.equal(refs.file, 0);
+});
+
+test('analyzeCliAttachments: "N lines" displayName increments refs.file', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([
+        { displayName: '210 lines', type: 'file' },
+        { displayName: '46 lines', type: 'file' },
+    ], refs);
+    assert.equal(refs.file, 2);
+    assert.equal(refs.byKind['copilot.image'], undefined);
+});
+
+test('analyzeCliAttachments: named file (e.g. refactor.agent.md) increments refs.file', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([
+        { displayName: 'refactor.agent.md', type: 'file' },
+    ], refs);
+    assert.equal(refs.file, 1);
+});
+
+test('analyzeCliAttachments: mixed attachments (images + file refs) split correctly', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([
+        { displayName: 'abc-clipboard.png', type: 'file' },
+        { displayName: '285 lines', type: 'file' },
+        { displayName: 'AGENTS.md', type: 'file' },
+    ], refs);
+    assert.equal(refs.byKind['copilot.image'], 1);
+    assert.equal(refs.file, 2);
+});
+
+test('analyzeCliAttachments: entry without displayName is skipped', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([{ type: 'file' }, null, 42], refs);
+    assert.equal(refs.file, 0);
+    assert.deepEqual(refs.byKind, {});
 });
 
 // ---------------------------------------------------------------------------
