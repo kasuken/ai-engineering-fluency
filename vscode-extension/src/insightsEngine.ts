@@ -640,16 +640,133 @@ export const INSIGHT_CATALOG: InsightDefinition[] = [
 	{
 		id: 'frequent-manual-compaction',
 		category: 'consistency',
-		severity: 'tip',
-		title: '🗜️ You compact your sessions often',
+		severity: 'celebration',
+		title: '🎉 You\'re managing context like a pro',
 		buildBody: (ctx) => {
 			const n = manualCompactCount(ctx.last30Days);
-			return `You've used \`/compact\` ${n} times in the last 30 days. That's a great way to keep going when a single task's chat gets long. ` +
-				`But if you're starting a *new* subtask, a fresh chat (\`/new\`) usually preserves intent better than compacting — compaction works by summarizing, so earlier detail is already condensed away. ` +
-				`Rule of thumb: \`/compact\` to keep going on one task, \`/new\` when the goal changes.`;
+			return `You've used \`/compact\` ${n} times in the last 30 days — that shows deliberate context management, which is a real power-user habit. ` +
+				`One refinement: \`/compact\` is best for continuing the *same task* when a chat gets long. ` +
+				`When you're switching to a *new subtask*, a fresh chat (\`/new\`) with a short handoff summary usually produces sharper answers, since compaction already condenses earlier detail. ` +
+				`Rule of thumb: \`/compact\` = same task, \`/new\` = new goal.`;
 		},
 		appliesTo: (ctx) => manualCompactCount(ctx.last30Days) >= 5,
 		weight: 50,
+		allowToast: true,
+	},
+
+	// ── Model cost & efficiency ───────────────────────────────────────────────
+	{
+		id: 'high-cost-model-usage',
+		category: 'agentic',
+		severity: 'tip',
+		title: '💰 Most of your requests use cost-intensive models',
+		buildBody: (ctx) => {
+			const ms = ctx.last30Days.modelSwitching;
+			const pct = ms.totalRequests > 0 ? Math.round((ms.premiumRequests / ms.totalRequests) * 100) : 0;
+			const models = ms.premiumModels.slice(0, 3).join(', ');
+			return `${pct}% of your ${ms.totalRequests.toLocaleString()} requests over the last 30 days used higher-cost models${models ? ` (${models})` : ''}. ` +
+				`For routine tasks like quick questions, summaries, or boilerplate, lighter models often perform just as well at a fraction of the cost. ` +
+				`Reserve the heavier models for complex multi-step reasoning, architecture decisions, or subtle bugs.`;
+		},
+		appliesTo: (ctx) => {
+			const ms = ctx.last30Days.modelSwitching;
+			return ms.totalRequests >= 20
+				&& (ms.premiumRequests / ms.totalRequests) > 0.70;
+		},
+		weight: 45,
+	},
+
+	// ── Code application habits ───────────────────────────────────────────────
+	{
+		id: 'low-apply-rate',
+		category: 'agentic',
+		severity: 'opportunity',
+		title: '📋 You\'re not applying many suggested code blocks',
+		buildBody: (ctx) => {
+			const a = ctx.last30Days.applyUsage;
+			const pct = Math.round(a.applyRate);
+			return `You've applied ${pct}% of the ${a.totalCodeBlocks} code blocks Copilot suggested over the last 30 days. ` +
+				`A low apply rate often means the suggestions are off-target. Try: ` +
+				`attaching the specific file or selection (#file / select-then-ask), being more precise about what you need changed, or asking Copilot to explain its approach first so you can redirect it early.`;
+		},
+		appliesTo: (ctx) => {
+			const a = ctx.last30Days.applyUsage;
+			return a.totalCodeBlocks >= 20 && a.applyRate < 40;
+		},
+		weight: 52,
+	},
+
+	// ── Reasoning effort ─────────────────────────────────────────────────────
+	{
+		id: 'reasoning-effort-never-tuned',
+		category: 'agentic',
+		severity: 'tip',
+		title: '🧠 Try tuning reasoning effort for complex tasks',
+		buildBody: (ctx) => {
+			const eu = ctx.last30Days.thinkingEffortUsage;
+			const sessions = eu?.sessionCount ?? 0;
+			return `You've had ${sessions} sessions where reasoning effort data was tracked, but you haven't switched effort levels yet. ` +
+				`Raising effort to "high" gives the model more thinking budget for complex problems like architecture decisions, tricky bugs, or multi-step refactors — and you can keep it on "low" for quick questions to stay responsive.`;
+		},
+		appliesTo: (ctx) => {
+			const eu = ctx.last30Days.thinkingEffortUsage;
+			if (!eu) { return false; }
+			return eu.sessionCount >= 5 && eu.switchCount === 0;
+		},
+		weight: 40,
+	},
+	{
+		id: 'reasoning-effort-switcher',
+		category: 'agentic',
+		severity: 'celebration',
+		title: '🎯 You\'re tuning reasoning effort — nice!',
+		buildBody: (ctx) => {
+			const eu = ctx.last30Days.thinkingEffortUsage!;
+			return `You switched reasoning effort ${eu.switchCount} times across ${eu.sessionCount} sessions. ` +
+				`Adapting effort to task complexity is one of the clearest signs of AI-engineering fluency — you're getting more out of Copilot without wasting compute on simple asks.`;
+		},
+		appliesTo: (ctx) => {
+			const eu = ctx.last30Days.thinkingEffortUsage;
+			return !!eu && eu.sessionCount >= 3 && eu.switchCount >= 3;
+		},
+		weight: 30,
+		allowToast: false,
+	},
+
+	// ── Multi-agent orchestration ─────────────────────────────────────────────
+	{
+		id: 'multi-agent-orchestration',
+		category: 'agentic',
+		severity: 'celebration',
+		title: '🤖 You\'re orchestrating multi-agent sessions!',
+		buildBody: (ctx) => {
+			const n = ctx.last30Days.multiAgentParentSessions!;
+			return `You've run ${n} sessions that spawned parallel sub-agents over the last 30 days. ` +
+				`Multi-agent orchestration is advanced AI engineering — you're splitting complex tasks across focused agents running in parallel, which significantly increases throughput for large changes.`;
+		},
+		appliesTo: (ctx) => (ctx.last30Days.multiAgentParentSessions ?? 0) >= 3,
+		weight: 35,
+		allowToast: true,
+	},
+
+	// ── Edit scope ───────────────────────────────────────────────────────────
+	{
+		id: 'single-file-edits-only',
+		category: 'agentic',
+		severity: 'tip',
+		title: '📁 Try multi-file edits for larger refactors',
+		buildBody: (ctx) => {
+			const es = ctx.last30Days.editScope;
+			return `You've made ${es.singleFileEdits} edit-mode sessions over the last 30 days, all touching a single file. ` +
+				`For refactors that span multiple files — renaming a type, extracting a module, updating API contracts — switch to Agent mode (or Edit mode with multiple files selected). ` +
+				`It can make changes consistently across your whole codebase without you opening each file manually.`;
+		},
+		appliesTo: (ctx) => {
+			const es = ctx.last30Days.editScope;
+			return es.singleFileEdits >= 10
+				&& es.multiFileEdits === 0;
+		},
+		weight: 42,
 	},
 ];
 
