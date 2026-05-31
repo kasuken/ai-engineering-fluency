@@ -46,13 +46,13 @@ Measures how you provide context to Copilot using explicit references.
 | 3 | 3+ different reference types **and** 10+ total references |
 | 4 | 5+ different reference types **and** 30+ total references |
 
-**Tracked reference types:** `#file`, `#selection`, `#symbol`, `#codebase`, `@workspace`, `@terminal`, `@vscode`, `#clipboard`, `#changes`, `#problemsPanel`, `#outputPanel`, `#terminalLastCommand`, `#terminalSelection`
+**Tracked reference types:** `#file`, `#selection`, `#symbol`, `#codebase`, `@workspace`, `@terminal`, `@vscode`, `#clipboard`, `#changes`, `#problemsPanel`, `#outputPanel`, `#terminalLastCommand`, `#terminalSelection`, image attachments (`copilot.image`), prompt files (`promptFile`), custom prompt commands (`prompt`)
 
-**Evidence:** All tracked reference types are shown in the evidence panel when used (not just the basic ones).
+**Evidence:** All tracked reference types are shown in the evidence panel when used (not just the basic ones). The panel also shows the total lines of code referenced through `#file:` range selections.
 
-**Booster:** Using image references (`copilot.image`) → at least Stage 3
+**Boosters:** Using image references (`copilot.image`) → at least Stage 3; using prompt files (`promptFile`) → at least Stage 3
 
-**Stage 3 hint behaviour:** The "try specialized context variables" tip is dynamic — it only lists the specific variables the user hasn't tried yet. If the user has already used 2 or more of the specialized set (`image attachments`, `#changes`, `#problemsPanel`, `#outputPanel`, `#terminalLastCommand`, `#terminalSelection`, `#clipboard`, `@vscode`), the hint is suppressed entirely.
+**Stage 3 hint behaviour:** The "try specialized context variables" tip is dynamic — it only lists the specific variables the user hasn't tried yet. If the user has already used 2 or more of the specialized set (`image attachments`, `prompt files`, `custom prompt commands`, `#changes`, `#problemsPanel`, `#outputPanel`, `#terminalLastCommand`, `#terminalSelection`, `#clipboard`, `@vscode`), the hint is suppressed entirely.
 
 ---
 

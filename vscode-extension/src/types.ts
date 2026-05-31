@@ -297,7 +297,8 @@ export interface ContextReferenceUsage {
   outputPanel: number; // #outputPanel references
   problemsPanel: number; // #problemsPanel references
   pullRequest: number; // #pr / #pullRequest references (Copilot PR chat, April 2026)
-// contentReferences tracking from session logs
+  codeContextLines?: number; // Total lines of code referenced via #file: range selections
+  // contentReferences tracking from session logs
   byKind: { [kind: string]: number }; // Count by reference kind
   copilotInstructions: number; // .github/copilot-instructions.md
   agentsMd: number; // agents.md in repo root

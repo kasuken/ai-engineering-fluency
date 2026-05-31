@@ -30,7 +30,7 @@ function emptyRefs(): ContextReferenceUsage {
         file: 0, selection: 0, implicitSelection: 0, symbol: 0, codebase: 0,
         workspace: 0, terminal: 0, vscode: 0, terminalLastCommand: 0,
         terminalSelection: 0, clipboard: 0, changes: 0, outputPanel: 0,
-        problemsPanel: 0, pullRequest: 0, byKind: {}, byPath: {}, copilotInstructions: 0, agentsMd: 0,
+        problemsPanel: 0, pullRequest: 0, codeContextLines: 0, byKind: {}, byPath: {}, copilotInstructions: 0, agentsMd: 0,
     };
 }
 
@@ -157,6 +157,19 @@ test('mergeUsageAnalysis: accumulates context reference counts', () => {
     assert.equal(period.contextReferences.file, 6);
     assert.equal(period.contextReferences.workspace, 4);
     assert.equal(period.contextReferences.codebase, 2);
+});
+
+test('mergeUsageAnalysis: accumulates code context line counts', () => {
+    const period = emptyPeriod();
+    const a1 = emptyAnalysis();
+    a1.contextReferences.codeContextLines = 12;
+    const a2 = emptyAnalysis();
+    a2.contextReferences.codeContextLines = 8;
+
+    mergeUsageAnalysis(period, a1);
+    mergeUsageAnalysis(period, a2);
+
+    assert.equal(period.contextReferences.codeContextLines, 20);
 });
 
 test('mergeUsageAnalysis: accumulates MCP tool counts by server and tool', () => {
@@ -596,6 +609,32 @@ test('analyzeRequestContext: processes message.parts for context refs', () => {
     }, refs);
     assert.equal(refs.codebase, 1);
     assert.equal(refs.file, 1);
+});
+
+test('analyzeRequestContext: extracts code context lines from dynamic parts', () => {
+    const refs = emptyRefs();
+    analyzeRequestContext({
+        message: {
+            parts: [{
+                kind: 'dynamic',
+                data: { range: { startLineNumber: 10, endLineNumber: 24 } },
+            }]
+        }
+    }, refs);
+    assert.equal(refs.codeContextLines, 15);
+});
+
+test('analyzeRequestContext: counts custom prompt parts in byKind', () => {
+    const refs = emptyRefs();
+    analyzeRequestContext({
+        message: {
+            parts: [{
+                kind: 'prompt',
+                slashPromptCommand: { command: 'galery' },
+            }]
+        }
+    }, refs);
+    assert.equal(refs.byKind['prompt'], 1);
 });
 
 test('analyzeRequestContext: processes contentReferences array', () => {

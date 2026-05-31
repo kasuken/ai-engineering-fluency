@@ -806,32 +806,27 @@ function _muaMergeThinkingEffort(period: UsageAnalysisPeriod, analysis: SessionU
 	}
 }
 
+const CONTEXT_REF_NUMERIC_KEYS = [
+	'file', 'selection', 'implicitSelection', 'symbol', 'codebase', 'workspace',
+	'terminal', 'vscode', 'terminalLastCommand', 'terminalSelection', 'clipboard',
+	'changes', 'outputPanel', 'problemsPanel', 'pullRequest', 'copilotInstructions', 'agentsMd',
+] as const;
+
+function _muaMergeCountMap(target: Record<string, number>, source: Record<string, number>): void {
+	for (const [key, count] of Object.entries(source)) {
+		target[key] = (target[key] || 0) + count;
+	}
+}
+
 function _muaMergeContextRefs(period: UsageAnalysisPeriod, analysis: SessionUsageAnalysis): void {
 	const c = period.contextReferences;
 	const a = analysis.contextReferences;
-	c.file += a.file;
-	c.selection += a.selection;
-	c.implicitSelection += a.implicitSelection || 0;
-	c.symbol += a.symbol;
-	c.codebase += a.codebase;
-	c.workspace += a.workspace;
-	c.terminal += a.terminal;
-	c.vscode += a.vscode;
-	c.terminalLastCommand += a.terminalLastCommand || 0;
-	c.terminalSelection += a.terminalSelection || 0;
-	c.clipboard += a.clipboard || 0;
-	c.changes += a.changes || 0;
-	c.outputPanel += a.outputPanel || 0;
-	c.problemsPanel += a.problemsPanel || 0;
-	c.pullRequest += a.pullRequest || 0;
-	c.copilotInstructions += a.copilotInstructions || 0;
-	c.agentsMd += a.agentsMd || 0;
-	for (const [kind, count] of Object.entries(a.byKind)) {
-		c.byKind[kind] = (c.byKind[kind] || 0) + count;
+	for (const key of CONTEXT_REF_NUMERIC_KEYS) {
+		c[key] += a[key] || 0;
 	}
-	for (const [path, count] of Object.entries(a.byPath)) {
-		c.byPath[path] = (c.byPath[path] || 0) + count;
-	}
+	c.codeContextLines = (c.codeContextLines || 0) + (a.codeContextLines || 0);
+	_muaMergeCountMap(c.byKind, a.byKind);
+	_muaMergeCountMap(c.byPath, a.byPath);
 }
 
 function _muaAccumulateTierModels(
@@ -1070,15 +1065,38 @@ export function deriveConversationPatterns(analysis: SessionUsageAnalysis): void
 	};
 }
 
+function _arcProcessDynamicPart(part: Record<string, unknown>, refs: ContextReferenceUsage): void {
+	if (part['kind'] !== 'dynamic') { return; }
+	const range = (part['data'] as Record<string, unknown> | undefined)?.['range'] as Record<string, unknown> | undefined;
+	const start = typeof range?.['startLineNumber'] === 'number' ? range['startLineNumber'] : 0;
+	const end = typeof range?.['endLineNumber'] === 'number' ? range['endLineNumber'] : 0;
+	if (end >= start && end > 0) {
+		refs.codeContextLines = (refs.codeContextLines || 0) + (end - start + 1);
+	}
+}
+
+function _arcProcessPromptPart(part: Record<string, unknown>, refs: ContextReferenceUsage): void {
+	if (part['kind'] !== 'prompt') { return; }
+	const cmd = (part['slashPromptCommand'] as Record<string, unknown> | undefined)?.['command'];
+	if (typeof cmd === 'string') {
+		refs.byKind['prompt'] = (refs.byKind['prompt'] || 0) + 1;
+	}
+}
+
+function _arcProcessPart(part: unknown, refs: ContextReferenceUsage): void {
+	if (!part || typeof part !== 'object') { return; }
+	const p = part as Record<string, unknown>;
+	if (typeof p['text'] === 'string') { analyzeContextReferences(p['text'], refs); }
+	_arcProcessDynamicPart(p, refs);
+	_arcProcessPromptPart(p, refs);
+}
+
 function _arcProcessMessage(msg: Record<string, unknown>, refs: ContextReferenceUsage): void {
 	if (typeof msg['text'] === 'string') { analyzeContextReferences(msg['text'], refs); }
 	const parts = msg['parts'];
 	if (!Array.isArray(parts)) { return; }
 	for (const part of parts) {
-		if (part && typeof part === 'object') {
-			const p = part as Record<string, unknown>;
-			if (typeof p['text'] === 'string') { analyzeContextReferences(p['text'], refs); }
-		}
+		_arcProcessPart(part, refs);
 	}
 }
 
