@@ -54,7 +54,17 @@ import type {
   AgentSessionsResult,
   TokenEstimator,
   SessionRelationRef,
+  EvaluatedInsight,
+  InsightStateBag,
 } from './types';
+
+// --- Insights engine ---
+import {
+  evaluateInsights as _evaluateInsights,
+  mergeInsightStates as _mergeInsightStates,
+  countNewInsights as _countNewInsights,
+  isToastAllowed as _isToastAllowed,
+} from './insightsEngine';
 
 // --- Ecosystem adapter types & helpers ---
 import type { OpenCodeDataAccess } from './opencode';
@@ -359,6 +369,14 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private lastChartSplit: string = 'total';
 	private lastUsageAnalysisStats: UsageAnalysisStats | undefined;
 	private lastDashboardData: any | undefined;
+	/** Insight engine: persisted state for all surfaced insights. */
+	private _insightStateBag: InsightStateBag = {};
+	/** ISO timestamp of the last time an insight toast was shown. */
+	private _lastInsightNudgeAt: string | null = null;
+	/** Count of insights currently in 'new' status (drives the status-bar badge). */
+	private _newInsightCount = 0;
+	/** The last non-badge status bar text (so badge can be appended/removed). */
+	private _statusBarBaseText = '';
 	private tokenEstimators: Record<string, TokenEstimator> = tokenEstimatorsData.estimators;
 	private co2Per1kTokens = 0.2; // gCO2e per 1000 tokens, a rough estimate
 	private co2AbsorptionPerTreePerYear = 21000; // grams of CO2 per tree per year
@@ -910,6 +928,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this.sessionDiscovery.checkCopilotExtension();
 		this.initializeStatusBar();
 		this.setupConfigurationListener(context);
+		this.loadInsightState();
 		this.scheduleInitialUpdate();
 		this.updateInterval = setInterval(() => {
 			this.updateTokenStats(true, true);
@@ -942,6 +961,11 @@ class CopilotTokenTracker implements vscode.Disposable {
 			windsurf: this.windsurf,
 			sampleDataDirectoryOverride: () => this.localRegressionSampleDataDir,
 		});
+	}
+
+	private loadInsightState(): void {
+		this._insightStateBag = this.context.globalState.get<InsightStateBag>('insights.state', {});
+		this._lastInsightNudgeAt = this.context.globalState.get<string>('insights.lastNudgeAt', '') || null;
 	}
 
 	private initializeOutputChannel(context: vscode.ExtensionContext): void {
@@ -1192,7 +1216,14 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private setStatusBarText(text: string): void {
-		this.statusBarItem.text = this._devBranch ? `${text} [${this._devBranch}]` : text;
+		this._statusBarBaseText = text;
+		const badge = this._newInsightCount > 0 ? ' 💡' : '';
+		this.statusBarItem.text = this._devBranch ? `${text}${badge} [${this._devBranch}]` : `${text}${badge}`;
+	}
+
+	private refreshStatusBarInsightBadge(count: number): void {
+		this._newInsightCount = count;
+		this.setStatusBarText(this._statusBarBaseText);
 	}
 
 	private sendLoadingPanelMessage(msg: object): void {
@@ -1749,6 +1780,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		await this.updateAnalysisPanelIfOpen(silent, preloaded);
 		await this.computeAndUploadFluencyScore(silent, preloaded);
 		this.updateEnvironmentalPanelIfOpen(detailedStats, silent);
+		await this.evaluateAndSurfaceInsights();
 
 		this.log(`Updated stats - Today: ${detailedStats.today.tokens}, Last 30 Days: ${detailedStats.last30Days.tokens}`);
 		this.lastDetailedStats = detailedStats;
@@ -2100,6 +2132,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 					missedPotential: analysisStats.missedPotential || [],
 					lastUpdated: analysisStats.lastUpdated.toISOString(), backendConfigured: this.isBackendConfigured(),
 					currentWorkspacePaths: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
+					insights: this.buildCurrentInsights(analysisStats),
 				},
 			});
 		} else {
@@ -2148,8 +2181,83 @@ class CopilotTokenTracker implements vscode.Disposable {
 		}
 	}
 
-	private async calculateTokenUsage(): Promise<Pick<TokenUsageStats, 'todayTokens' | 'monthTokens'>> {
-		const now = new Date();
+	private async evaluateAndSurfaceInsights(): Promise<void> {
+		const stats = this.lastUsageAnalysisStats;
+		if (!stats) { return; }
+
+		const insightsEnabled = vscode.workspace.getConfiguration('aiEngineeringFluency').get<boolean>('insights.enabled', true);
+		if (!insightsEnabled) { return; }
+
+		const cadenceDays = vscode.workspace.getConfiguration('aiEngineeringFluency').get<number>('insights.cadenceDays', 2);
+		const now = new Date().toISOString();
+
+		const ctx = {
+			today: stats.today,
+			last30Days: stats.last30Days,
+			missedPotential: stats.missedPotential ?? [],
+			customizationMatrix: stats.customizationMatrix,
+		};
+
+		const evaluated = _evaluateInsights(ctx, this._insightStateBag, cadenceDays, this._lastInsightNudgeAt);
+		_mergeInsightStates(evaluated, this._insightStateBag, now);
+
+		const newCount = _countNewInsights(this._insightStateBag, now);
+		this.refreshStatusBarInsightBadge(newCount);
+
+		await this.context.globalState.update('insights.state', this._insightStateBag);
+
+		// Push updated insights to the analysis panel if it is open
+		if (this.analysisPanel) {
+			void this.analysisPanel.webview.postMessage({
+				command: 'updateInsights',
+				insights: evaluated,
+			});
+		}
+
+		// Surface a toast for the highest-weight 'new' allowToast insight (rate-limited)
+		const toastsEnabled = vscode.workspace.getConfiguration('aiEngineeringFluency').get<boolean>('insights.toastsEnabled', true);
+		if (!toastsEnabled) { return; }
+		if (!_isToastAllowed(cadenceDays, this._lastInsightNudgeAt, now)) { return; }
+
+		const toastCandidate = evaluated.find(i => i.allowToast && i.status === 'new');
+		if (!toastCandidate) { return; }
+
+		this._lastInsightNudgeAt = now;
+		await this.context.globalState.update('insights.lastNudgeAt', now);
+
+		const view = 'View Insights';
+		const dismiss = 'Dismiss';
+		const choice = await vscode.window.showInformationMessage(
+			`💡 ${toastCandidate.title}`,
+			view,
+			dismiss,
+		);
+		if (choice === view) {
+			await this.showUsageAnalysis();
+		} else if (choice === dismiss) {
+			this._insightStateBag[toastCandidate.id] = {
+				...(this._insightStateBag[toastCandidate.id] ?? { firstSurfacedAt: now }),
+				status: 'dismissed',
+				lastSurfacedAt: now,
+			};
+			await this.context.globalState.update('insights.state', this._insightStateBag);
+			this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+		}
+	}
+
+	/** Builds the current evaluated insight list from cached state + latest stats. */
+	private buildCurrentInsights(stats: UsageAnalysisStats): EvaluatedInsight[] {
+		const cadenceDays = vscode.workspace.getConfiguration('aiEngineeringFluency').get<number>('insights.cadenceDays', 2);
+		const ctx = {
+			today: stats.today,
+			last30Days: stats.last30Days,
+			missedPotential: stats.missedPotential ?? [],
+			customizationMatrix: stats.customizationMatrix,
+		};
+		return _evaluateInsights(ctx, this._insightStateBag, cadenceDays, this._lastInsightNudgeAt);
+	}
+
+	private async calculateTokenUsage(): Promise<Pick<TokenUsageStats, 'todayTokens' | 'monthTokens'>> {		const now = new Date();
 		const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 		const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
@@ -4925,6 +5033,52 @@ class CopilotTokenTracker implements vscode.Disposable {
 					});
 				}
 				break;
+			case 'insightAction':
+					await this.dispatch('insightAction', () => this.handleInsightAction(message));
+					break;
+		}
+	}
+
+	private async handleInsightAction(message: any): Promise<void> {
+		const id = typeof message.id === 'string' ? message.id : '';
+		const action = typeof message.action === 'string' ? message.action : '';
+		if (!id || !action) { return; }
+		const now = new Date().toISOString();
+		const existing = this._insightStateBag[id] ?? { status: 'new', firstSurfacedAt: now, lastSurfacedAt: now };
+		switch (action) {
+			case 'seen':
+				if (existing.status === 'new') {
+					this._insightStateBag[id] = { ...existing, status: 'seen', lastSurfacedAt: now };
+					this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+				}
+				break;
+			case 'dismiss':
+				this._insightStateBag[id] = { ...existing, status: 'dismissed', lastSurfacedAt: now };
+				this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+				break;
+			case 'snooze': {
+				const snoozeUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+				this._insightStateBag[id] = { ...existing, status: 'snoozed', lastSurfacedAt: now, snoozeUntil };
+				this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+				break;
+			}
+			case 'done':
+				this._insightStateBag[id] = { ...existing, status: 'done', lastSurfacedAt: now };
+				this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+				break;
+		}
+		await this.context.globalState.update('insights.state', this._insightStateBag);
+		// Push refreshed state back to the webview
+		if (this.analysisPanel && this.lastUsageAnalysisStats) {
+			const cadenceDays = vscode.workspace.getConfiguration('aiEngineeringFluency').get<number>('insights.cadenceDays', 2);
+			const ctx = {
+				today: this.lastUsageAnalysisStats.today,
+				last30Days: this.lastUsageAnalysisStats.last30Days,
+				missedPotential: this.lastUsageAnalysisStats.missedPotential ?? [],
+				customizationMatrix: this.lastUsageAnalysisStats.customizationMatrix,
+			};
+			const evaluated = _evaluateInsights(ctx, this._insightStateBag, cadenceDays, this._lastInsightNudgeAt);
+			void this.analysisPanel.webview.postMessage({ command: 'updateInsights', insights: evaluated });
 		}
 	}
 
@@ -4940,6 +5094,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 					missedPotential: analysisStats.missedPotential || [], lastUpdated: analysisStats.lastUpdated.toISOString(),
 					backendConfigured: this.isBackendConfigured(),
 					currentWorkspacePaths: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
+					insights: this.buildCurrentInsights(analysisStats),
 				},
 			});
 		} catch (err) {
@@ -7631,6 +7786,7 @@ ${this.getLoadingHtmlScript()}
       suppressedUnknownTools,
       todaySessions: stats.todaySessions || [],
       use24HourTime: this.getUse24HourTimeSetting(),
+      insights: this.buildCurrentInsights(stats),
     }).replace(/</g, "\\u003c") : 'null';
 
     return `<!DOCTYPE html>

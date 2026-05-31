@@ -50,6 +50,21 @@ type TodaySessionSummary = {
 	lastActivity: string;
 };
 
+type InsightSeverity = 'tip' | 'opportunity' | 'celebration';
+type InsightStatus = 'new' | 'seen' | 'dismissed' | 'snoozed' | 'done';
+
+type EvaluatedInsight = {
+	id: string;
+	category: string;
+	severity: InsightSeverity;
+	title: string;
+	body: string;
+	actionLabel?: string;
+	actionCommand?: string;
+	status: InsightStatus;
+	allowToast?: boolean;
+};
+
 type UsageAnalysisStats = {
 	today: UsageAnalysisPeriod;
 	last30Days: UsageAnalysisPeriod;
@@ -63,6 +78,7 @@ type UsageAnalysisStats = {
 	suppressedUnknownTools?: string[];
 	todaySessions?: TodaySessionSummary[];
 	use24HourTime?: boolean;
+	insights?: EvaluatedInsight[];
 };
 
 declare function acquireVsCodeApi<TState = unknown>(): {
@@ -173,6 +189,7 @@ let isBatchAnalysisInProgress = false;
 let currentWorkspacePaths: string[] = [];
 let activeTab = 'activity';
 let loadingTimeoutId: ReturnType<typeof setTimeout> | null = null;
+let currentInsights: EvaluatedInsight[] = [];
 
 function clearLoadingTimeout(): void {
 	if (loadingTimeoutId !== null) {
@@ -803,6 +820,22 @@ function sanitizePeriod(period: any): UsageAnalysisPeriod {
 	};
 }
 
+function sanitizeInsights(rawInsights: any[]): EvaluatedInsight[] {
+	return rawInsights
+		.filter((i: any) => i && typeof i === 'object' && typeof i.id === 'string')
+		.map((i: any): EvaluatedInsight => ({
+			id: String(i.id),
+			category: typeof i.category === 'string' ? i.category : 'general',
+			severity: (['tip', 'opportunity', 'celebration'].includes(i.severity) ? i.severity : 'tip') as InsightSeverity,
+			title: typeof i.title === 'string' ? i.title : '',
+			body: typeof i.body === 'string' ? i.body : '',
+			actionLabel: typeof i.actionLabel === 'string' ? i.actionLabel : undefined,
+			actionCommand: typeof i.actionCommand === 'string' ? i.actionCommand : undefined,
+			status: (['new', 'seen', 'dismissed', 'snoozed', 'done'].includes(i.status) ? i.status : 'new') as InsightStatus,
+			allowToast: !!i.allowToast,
+		}));
+}
+
 function sanitizeStats(raw: any): UsageAnalysisStats | null {
 	if (!raw || typeof raw !== 'object') {
 		return null;
@@ -868,6 +901,11 @@ function sanitizeStats(raw: any): UsageAnalysisStats | null {
 			) as TodaySessionSummary[];
 		}
 
+		// Sanitize insights
+		if (Array.isArray(raw.insights)) {
+			sanitized.insights = sanitizeInsights(raw.insights);
+		}
+
 		return sanitized;
 	} catch {
 		return null;
@@ -896,6 +934,12 @@ function setupTabs(): void {
 			if (tab === 'agent' && !agentSessionsLoaded) {
 				agentSessionsLoaded = true;
 				vscode.postMessage({ command: 'loadAgentSessions' });
+			}
+			// Mark new insights as seen when visiting the Insights tab
+			if (tab === 'insights') {
+				currentInsights
+					.filter(i => i.status === 'new')
+					.forEach(i => vscode.postMessage({ command: 'insightAction', id: i.id, action: 'seen' }));
 			}
 		});
 	});
@@ -1460,6 +1504,157 @@ function buildReposAndAgentTabPanelsHtml(): string {
 		</div>`;
 }
 
+function buildInsightCardHtml(insight: EvaluatedInsight): string {
+	const severityColors: Record<InsightSeverity, string> = {
+		tip: 'rgba(96,165,250,0.15)',
+		opportunity: 'rgba(251,191,36,0.15)',
+		celebration: 'rgba(74,222,128,0.15)',
+	};
+	const severityBorder: Record<InsightSeverity, string> = {
+		tip: 'rgba(96,165,250,0.4)',
+		opportunity: 'rgba(251,191,36,0.4)',
+		celebration: 'rgba(74,222,128,0.4)',
+	};
+	const bg = severityColors[insight.severity] ?? severityColors.tip;
+	const border = severityBorder[insight.severity] ?? severityBorder.tip;
+	const isNew = insight.status === 'new';
+	const isDone = insight.status === 'done';
+
+	const actionBtn = insight.actionLabel
+		? `<button class="insight-action-btn" data-insight-id="${escapeHtml(insight.id)}" data-action="execute" data-command="${escapeHtml(insight.actionCommand ?? '')}"
+				style="padding:4px 12px; font-size:12px; cursor:pointer; border:1px solid var(--border-color); border-radius:4px;
+				background:var(--bg-tertiary); color:var(--text-primary);">${escapeHtml(insight.actionLabel)}</button>`
+		: '';
+
+	const doneBtn = !isDone
+		? `<button class="insight-action-btn" data-insight-id="${escapeHtml(insight.id)}" data-action="done"
+				title="Mark as done"
+				style="padding:4px 10px; font-size:11px; cursor:pointer; border:1px solid var(--border-color); border-radius:4px;
+				background:transparent; color:var(--text-secondary);">✓ Done</button>`
+		: `<span style="font-size:11px; color:var(--text-secondary); opacity:0.6;">✓ Done</span>`;
+
+	const snoozeBtn = !isDone
+		? `<button class="insight-action-btn" data-insight-id="${escapeHtml(insight.id)}" data-action="snooze"
+				title="Snooze for 7 days"
+				style="padding:4px 10px; font-size:11px; cursor:pointer; border:1px solid var(--border-color); border-radius:4px;
+				background:transparent; color:var(--text-secondary);">⏸ Snooze</button>`
+		: '';
+
+	const dismissBtn = !isDone
+		? `<button class="insight-action-btn" data-insight-id="${escapeHtml(insight.id)}" data-action="dismiss"
+				title="Dismiss permanently"
+				style="padding:4px 10px; font-size:11px; cursor:pointer; border:none; border-radius:4px;
+				background:transparent; color:var(--text-secondary); opacity:0.6;">✕</button>`
+		: '';
+
+	return `
+		<div class="insight-card" data-insight-id="${escapeHtml(insight.id)}"
+			style="margin-bottom:12px; padding:14px 16px; border-radius:8px;
+			background:${bg}; border:1px solid ${border};
+			${isNew ? 'box-shadow:0 0 0 1px ' + border + ';' : ''}
+			${isDone ? 'opacity:0.55;' : ''}">
+			<div style="display:flex; align-items:flex-start; gap:10px;">
+				<div style="flex:1;">
+					<div style="font-size:13px; font-weight:600; color:var(--text-primary); margin-bottom:6px;">
+						${isNew ? '<span style="font-size:10px; padding:2px 6px; border-radius:10px; background:rgba(96,165,250,0.3); color:#60a5fa; vertical-align:middle; margin-right:6px;">NEW</span>' : ''}
+						${escapeHtml(insight.title)}
+					</div>
+					<div style="font-size:12px; color:var(--text-secondary); line-height:1.5; white-space:pre-wrap;">${escapeHtml(insight.body)}</div>
+					${actionBtn ? `<div style="margin-top:10px;">${actionBtn}</div>` : ''}
+				</div>
+				<div style="display:flex; flex-direction:column; align-items:flex-end; gap:4px; flex-shrink:0;">
+					${dismissBtn}
+				</div>
+			</div>
+			<div style="display:flex; gap:6px; margin-top:10px; justify-content:flex-end;">
+				${doneBtn}
+				${snoozeBtn}
+			</div>
+		</div>`;
+}
+
+function buildInsightsTabPanelHtml(insights: EvaluatedInsight[]): string {
+	const applicable = insights.filter(i => i.status !== 'dismissed');
+	const newInsights = applicable.filter(i => i.status === 'new');
+	const otherInsights = applicable.filter(i => i.status !== 'new');
+
+	const forYouSection = newInsights.length > 0
+		? `<div style="margin-bottom:20px;">
+			<div style="font-size:12px; font-weight:600; text-transform:uppercase; color:var(--text-secondary); letter-spacing:0.05em; margin-bottom:10px;">✨ For You</div>
+			${newInsights.map(buildInsightCardHtml).join('')}
+		</div>`
+		: `<div style="margin-bottom:20px; padding:16px; background:var(--bg-tertiary); border-radius:8px; font-size:12px; color:var(--text-secondary); text-align:center;">
+			🎉 No new insights right now — keep using Copilot and check back later!
+		</div>`;
+
+	const allSection = otherInsights.length > 0
+		? `<div>
+			<div style="font-size:12px; font-weight:600; text-transform:uppercase; color:var(--text-secondary); letter-spacing:0.05em; margin-bottom:10px;">All Tips</div>
+			${otherInsights.map(buildInsightCardHtml).join('')}
+		</div>`
+		: '';
+
+	return `
+		<div id="tab-panel-insights" class="tab-panel"${activeTab !== 'insights' ? ' style="display:none"' : ''}>
+			<div class="section">
+				<div class="section-title"><span>💡</span><span>Insights</span></div>
+				<div class="section-subtitle">
+					Personalized tips based on your usage patterns. Tips are data-driven — they only appear when relevant to how you code with AI.
+				</div>
+				<div id="insights-container" style="margin-top:16px;">
+					${forYouSection}
+					${allSection}
+				</div>
+			</div>
+		</div>`;
+}
+
+function refreshInsightsPanel(insights: EvaluatedInsight[]): void {
+	const container = document.getElementById('insights-container');
+	if (!container) { return; }
+	currentInsights = insights;
+	const forYou = insights.filter(i => i.status === 'new');
+	const other = insights.filter(i => i.status !== 'new' && i.status !== 'dismissed');
+
+	const forYouSection = forYou.length > 0
+		? `<div style="margin-bottom:20px;">
+			<div style="font-size:12px; font-weight:600; text-transform:uppercase; color:var(--text-secondary); letter-spacing:0.05em; margin-bottom:10px;">✨ For You</div>
+			${forYou.map(buildInsightCardHtml).join('')}
+		</div>`
+		: `<div style="margin-bottom:20px; padding:16px; background:var(--bg-tertiary); border-radius:8px; font-size:12px; color:var(--text-secondary); text-align:center;">
+			🎉 No new insights right now — keep using Copilot and check back later!
+		</div>`;
+
+	const allSection = other.length > 0
+		? `<div>
+			<div style="font-size:12px; font-weight:600; text-transform:uppercase; color:var(--text-secondary); letter-spacing:0.05em; margin-bottom:10px;">All Tips</div>
+			${other.map(buildInsightCardHtml).join('')}
+		</div>`
+		: '';
+
+	container.innerHTML = forYouSection + allSection;
+	wireInsightCardButtons();
+}
+
+function wireInsightCardButtons(): void {
+	const container = document.getElementById('insights-container');
+	if (!container) { return; }
+	container.querySelectorAll<HTMLButtonElement>('.insight-action-btn').forEach(btn => {
+		btn.addEventListener('click', () => {
+			const id = btn.getAttribute('data-insight-id');
+			const action = btn.getAttribute('data-action');
+			if (!id || !action) { return; }
+			if (action === 'execute') {
+				const command = btn.getAttribute('data-command');
+				if (command) { vscode.postMessage({ command }); }
+			} else {
+				vscode.postMessage({ command: 'insightAction', id, action });
+			}
+		});
+	});
+}
+
+
 function buildUsageRootHtml(
 	stats: UsageAnalysisStats,
 	customizationHtml: string,
@@ -1511,6 +1706,7 @@ function buildUsageRootHtml(
 				<button class="tab-button ${activeTab === 'health' ? 'active' : ''}" data-tab="health">🏗️ Workspace Health</button>
 				<button class="tab-button ${activeTab === 'repos' ? 'active' : ''}" data-tab="repos">🤖 Repository PRs</button>
 				<button class="tab-button ${activeTab === 'agent' ? 'active' : ''}" data-tab="agent">🤖 Cloud Agent</button>
+				<button class="tab-button ${activeTab === 'insights' ? 'active' : ''}" data-tab="insights">💡 Insights${(stats.insights ?? []).filter(i => i.status === 'new').length > 0 ? ` <span style="background:rgba(96,165,250,0.4);border-radius:10px;padding:1px 6px;font-size:11px;">${(stats.insights ?? []).filter(i => i.status === 'new').length}</span>` : ''}</button>
 			</div>
 
 			${buildSessionsTabPanelHtml(stats)}
@@ -1518,11 +1714,12 @@ function buildUsageRootHtml(
 			${buildToolsTabPanelHtml(stats, allToolKeys, allMcpToolKeys, allMcpServerKeys, allStandardModels, allPremiumModels, allUnknownModels)}
 			${buildHealthTabPanelHtml(customizationHtml, stats)}
 			${buildReposAndAgentTabPanelsHtml()}
+			${buildInsightsTabPanelHtml(stats.insights ?? [])}
 			<div class="footer">
 				Last updated: ${escapeHtml(new Date(stats.lastUpdated).toLocaleString())} · Updates every 5 minutes
 			</div>
 		</div>
-	`;
+`;
 }
 
 function buildSessionsTabPanelHtml(stats: UsageAnalysisStats): string {
@@ -1766,6 +1963,9 @@ function renderLayout(stats: UsageAnalysisStats): void {
 	renderRepositoryHygienePanels();
 	setupTabs();
 	wireCopyButtons();
+	// Initialize currentInsights from the stats and wire card buttons
+	currentInsights = stats.insights ?? [];
+	wireInsightCardButtons();
 }
 
 /** Wires up top-level navigation toolbar buttons (refresh, details, chart, etc.). */
@@ -1932,6 +2132,12 @@ function handleAgentSessionsLoaded(data: any): void {
 	updateAgentSessionsPanel(agentSessionsData);
 }
 
+function handleUpdateInsights(rawInsights: unknown): void {
+	if (!Array.isArray(rawInsights)) { return; }
+	const sanitized = sanitizeInsights(rawInsights);
+	refreshInsightsPanel(sanitized);
+}
+
 // Listen for messages from the extension
 registerMessageHandler<any>((message) => {
 	switch (message.command) {
@@ -1961,6 +2167,8 @@ registerMessageHandler<any>((message) => {
 		case 'agentSessionsProgress':
 			updateProgressPanel('#agent-sessions-content', 'agent-sessions-progress', 'Fetching agent sessions…', message.done as number, message.total as number);
 			break;
+		case 'updateInsights':
+			handleUpdateInsights(message.insights); break;
 	}
 });
 
