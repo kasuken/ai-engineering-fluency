@@ -1569,7 +1569,7 @@ function buildInsightCardHtml(insight: EvaluatedInsight): string {
 						${isNew ? `<span style="font-size:10px; padding:2px 7px; border-radius:10px; background:${accent}; color:#0d1117; font-weight:700; letter-spacing:0.04em;">NEW</span>` : ''}
 						${escapeHtml(insight.title)}
 					</div>
-					<div style="font-size:13px; color:var(--text-primary); line-height:1.6; opacity:0.85; white-space:pre-wrap;">${escapeHtml(insight.body)}</div>
+					<div style="font-size:12px; color:var(--text-primary); line-height:1.5; opacity:0.85; white-space:pre-wrap;">${escapeHtml(insight.body)}</div>
 					${actionBtn ? `<div style="margin-top:12px;">${actionBtn}</div>` : ''}
 				</div>
 				<div style="flex-shrink:0; margin-top:-4px;">
