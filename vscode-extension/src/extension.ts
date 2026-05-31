@@ -1827,35 +1827,39 @@ class CopilotTokenTracker implements vscode.Disposable {
 		if (silent) { return undefined; }
 		let parsingStepNotified = false;
 		let lastProgressSentMs = 0;
-		let lastTooltipUpdatedMs = 0;
+		let lastPercentage = -1;
 		return (completed: number, total: number) => {
 			const percentage = Math.round((completed / total) * 100);
-			this.setStatusBarText(`$(loading~spin) Analyzing Logs: ${percentage}%`);
+			// Only touch the status bar text when the rounded percentage actually changes,
+			// to avoid needless status-bar relayout on every callback.
+			if (percentage !== lastPercentage) {
+				lastPercentage = percentage;
+				this.setStatusBarText(`$(loading~spin) Analyzing Logs: ${percentage}%`);
+			}
 			if (!parsingStepNotified) {
 				parsingStepNotified = true;
 				const editors = getEditors?.() ?? [];
 				this._loadingEditors = editors;
 				const msg: Record<string, unknown> = { command: 'loadingStep', step: 'parsing', total, editors };
 				this.sendLoadingPanelMessage(msg);
-				// Update tooltip once when parsing starts (editors are now known).
-				// Skip entirely when the loading panel is already open — no need to double up.
+				// Set the hover tooltip exactly once when parsing starts, using the
+				// indeterminate (self-animating SMIL) variant. The tooltip is never
+				// reassigned during parsing, so the hover popup no longer flickers on
+				// every progress redraw — the previous per-500ms reassignment forced
+				// VS Code to rebuild the hover and reload the data-URI <img>. The live
+				// climbing percentage stays visible in the status bar text instead.
+				// Skip entirely when the loading panel is already open — it shows progress itself.
 				if (!this._detailsPanelIsLoading) {
-					this._prevLoadingPercentage = 0;
-					this.statusBarItem.tooltip = this.buildLoadingTooltipMarkdown('parsing', percentage > 0 ? percentage : undefined);
-					lastTooltipUpdatedMs = Date.now();
+					this.statusBarItem.tooltip = this.buildLoadingTooltipMarkdown('parsing');
 				}
 			}
-			// Time-based throttle: update tooltip at most once every 500 ms.
-			// This prevents jarring jumps at 10% boundaries and reduces tooltip flicker.
-			// Skip when the loading panel is open — the panel already shows progress.
+			// The hover popup intentionally stays put during parsing; only the live
+			// webview panel (if open) receives incremental progress updates.
 			const now = Date.now();
-			if (!this._detailsPanelIsLoading && percentage > 0 && (now - lastTooltipUpdatedMs) >= 500) {
-				lastTooltipUpdatedMs = now;
-				this.statusBarItem.tooltip = this.buildLoadingTooltipMarkdown('parsing', percentage);
-			}
 			if (now - lastProgressSentMs >= 500 || completed === total) {
 				lastProgressSentMs = now;
-				this.sendLoadingPanelMessage({ command: 'loadingProgress', completed, total, percentage });
+				const editors = getEditors?.() ?? [];
+				this.sendLoadingPanelMessage({ command: 'loadingProgress', completed, total, percentage, editors });
 			}
 		};
 	}
@@ -1912,11 +1916,11 @@ class CopilotTokenTracker implements vscode.Disposable {
 		const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";
 		const esc  = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
-		const doneUntil  = step === 'discovering' ? 0 : step === 'parsing' ? 2 : 3;
-		const activeStep = step === 'discovering' ? 0 : step === 'parsing' ? 2 : 3;
+		const doneUntil  = step === 'discovering' ? 0 : step === 'parsing' ? 1 : 2;
+		const activeStep = step === 'discovering' ? 0 : step === 'parsing' ? 1 : 2;
 		const STEPS = [
-			'Discovering session files', 'Checking cache',
-			'Parsing session logs',      'Computing statistics', 'Ready!',
+			'Discovering session files',
+			'Parsing session logs', 'Computing statistics', 'Ready!',
 		];
 		const pct     = step === 'computing' ? 96 : (percentage ?? 0);
 		const pctTxt  = step === 'computing' ? '96%' : (percentage !== undefined && percentage > 0 ? `${percentage}%` : '–');
@@ -6600,7 +6604,7 @@ body {
     <div id="editors-row" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;"></div>
     <div class="steps-box">
         <div class="step step-active" id="s-discover"><i class="step-ico"><span class="spin-ico">↻</span></i><span class="step-lbl">Discovering session files</span><span class="step-cnt" id="sc-discover"></span></div>
-        <div class="step" id="s-cache"><i class="step-ico">○</i><span class="step-lbl">Checking cache</span><span class="step-cnt"></span></div>
+
         <div class="step" id="s-parse"><i class="step-ico">○</i><span class="step-lbl">Parsing session logs</span><span class="step-cnt" id="sc-parse"></span></div>
         <div class="step" id="s-compute"><i class="step-ico">○</i><span class="step-lbl">Computing statistics</span><span class="step-cnt"></span></div>
         <div class="step" id="s-ready"><i class="step-ico">○</i><span class="step-lbl">Ready!</span><span class="step-cnt"></span></div>
@@ -6634,26 +6638,43 @@ ${this.getLoadingHtmlScript()}
         el.classList.remove('step-done'); el.classList.add('step-active');
         var ico = el.querySelector('.step-ico'); if (ico) { ico.className = 'step-ico'; ico.innerHTML = '<span class="spin-ico">↻</span>'; }
     }
+    // Advance the checklist into the parsing phase. Idempotent: the step transition runs
+    // once even if it is triggered by a loadingProgress message because the one-time
+    // loadingStep 'parsing' was posted before this webview's listener was attached.
+    var parsingShown = false;
+    function enterParsing(total) {
+        if (!parsingShown) {
+            parsingShown = true;
+            setDone('s-discover'); setActive('s-parse');
+            var chips = document.getElementById('chips'); if (chips) chips.style.display = 'flex';
+        }
+        if (total) { var sc = document.getElementById('sc-discover'); if (sc) sc.textContent = '(' + total + ' found)'; }
+    }
     window.addEventListener('message', function (ev) {
         var m = ev.data; if (!m) return;
         if (m.command === 'loadingStep') {
             if (m.step === 'discovering') { setActive('s-discover');
             } else if (m.step === 'parsing') {
-                var total = m.total || 0; setDone('s-discover');
+                var total = m.total || 0;
                 if (m.editors !== undefined) { EDITORS = m.editors; editorsSeen = 0; }
-                var sc = document.getElementById('sc-discover'); if (sc) sc.textContent = '(' + total + ' found)';
-                setDone('s-cache'); setActive('s-parse');
+                enterParsing(total);
                 var sub = document.getElementById('subtitle'); if (sub) sub.textContent = 'Parsing ' + total + ' session files...';
                 var bf = document.getElementById('badge-files'); if (bf) bf.textContent = total + ' files';
-                var chips = document.getElementById('chips'); if (chips) chips.style.display = 'flex';
                 var ct = document.getElementById('chip-total'); if (ct) ct.textContent = total.toLocaleString();
             } else if (m.step === 'computing') {
+                enterParsing(0);
                 setDone('s-parse'); setActive('s-compute');
                 var fill = document.getElementById('prog-fill'); if (fill) { fill.classList.remove('indeterminate'); fill.style.width = '96%'; }
                 var pct = document.getElementById('pct'); if (pct) pct.textContent = '96%';
                 var sub2 = document.getElementById('subtitle'); if (sub2) sub2.textContent = 'Computing statistics...';
             }
         } else if (m.command === 'loadingProgress') {
+            // Receiving progress means parsing is underway — reconcile the checklist in case
+            // the loadingStep 'parsing' transition was missed during webview startup.
+            enterParsing(m.total);
+            // Editors are included in every progress tick so pills appear even when the
+            // one-time loadingStep 'parsing' message was dropped before the listener attached.
+            if (m.editors && m.editors.length > EDITORS.length) { EDITORS = m.editors; }
             var pct2 = document.getElementById('pct'); if (pct2) pct2.textContent = m.percentage + '%';
             var fill2 = document.getElementById('prog-fill'); if (fill2) { fill2.classList.remove('indeterminate'); fill2.style.width = (m.percentage < 3 ? 3 : m.percentage) + '%'; }
             var cd = document.getElementById('chip-done'); if (cd) cd.textContent = m.completed.toLocaleString();
