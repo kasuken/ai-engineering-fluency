@@ -2179,6 +2179,11 @@ registerMessageHandler<any>((message) => {
 			break;
 		case 'updateInsights':
 			handleUpdateInsights(message.insights); break;
+		case 'switchTab': {
+			const btn = document.querySelector<HTMLButtonElement>(`.tab-button[data-tab="${String(message.tab)}"]`);
+			btn?.click();
+			break;
+		}
 	}
 });
 

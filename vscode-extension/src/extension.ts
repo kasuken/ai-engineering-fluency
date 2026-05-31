@@ -377,6 +377,10 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private _newInsightCount = 0;
 	/** The last non-badge status bar text (so badge can be appended/removed). */
 	private _statusBarBaseText = '';
+	/** Cached top new insight title for tooltip display. */
+	private _topInsightTitle: string | null = null;
+	/** Cached last detailed stats for tooltip rebuilding. */
+	private _lastDetailedStats: DetailedStats | undefined;
 	private tokenEstimators: Record<string, TokenEstimator> = tokenEstimatorsData.estimators;
 	private co2Per1kTokens = 0.2; // gCO2e per 1000 tokens, a rough estimate
 	private co2AbsorptionPerTreePerYear = 21000; // grams of CO2 per tree per year
@@ -1221,9 +1225,31 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this.statusBarItem.text = this._devBranch ? `${text}${badge} [${this._devBranch}]` : `${text}${badge}`;
 	}
 
-	private refreshStatusBarInsightBadge(count: number): void {
+	private refreshStatusBarInsightBadge(count: number, topInsightTitle?: string): void {
 		this._newInsightCount = count;
+		this._topInsightTitle = topInsightTitle ?? this._topInsightTitle;
 		this.setStatusBarText(this._statusBarBaseText);
+
+		if (count > 0) {
+			// Point the status bar click directly at the Insights tab
+			this.statusBarItem.command = 'aiEngineeringFluency.openInsightsTab';
+			// Rebuild tooltip with insight hint appended
+			if (this._lastDetailedStats) {
+				const tooltip = this.buildTooltipMarkdown(this._lastDetailedStats);
+				tooltip.appendMarkdown('\n---\n');
+				tooltip.appendMarkdown(`💡 **${count} new insight${count > 1 ? 's' : ''}** — click to open the Insights tab\n\n`);
+				if (this._topInsightTitle) {
+					tooltip.appendMarkdown(`> ${this._topInsightTitle}`);
+				}
+				this.statusBarItem.tooltip = tooltip;
+			}
+		} else {
+			this.statusBarItem.command = 'aiEngineeringFluency.showDetails';
+			// Restore plain tooltip
+			if (this._lastDetailedStats) {
+				this.statusBarItem.tooltip = this.buildTooltipMarkdown(this._lastDetailedStats);
+			}
+		}
 	}
 
 	private sendLoadingPanelMessage(msg: object): void {
@@ -1916,6 +1942,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private updateStatusBarAndTooltip(detailedStats: DetailedStats): void {
+		this._lastDetailedStats = detailedStats;
 		if (detailedStats.today.sessions === 0 && detailedStats.last30Days.sessions === 0) {
 			this.setStatusBarText('$(symbol-numeric) No session data yet');
 		} else {
@@ -2202,7 +2229,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 		_mergeInsightStates(evaluated, this._insightStateBag, now);
 
 		const newCount = _countNewInsights(this._insightStateBag, now);
-		this.refreshStatusBarInsightBadge(newCount);
+		const topNew = evaluated.find(i => i.status === 'new');
+		this.refreshStatusBarInsightBadge(newCount, topNew?.title);
 
 		await this.context.globalState.update('insights.state', this._insightStateBag);
 
@@ -2225,7 +2253,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this._lastInsightNudgeAt = now;
 		await this.context.globalState.update('insights.lastNudgeAt', now);
 
-		const view = 'View Insights';
+		const view = 'Open Insights tab';
 		const dismiss = 'Dismiss';
 		const choice = await vscode.window.showInformationMessage(
 			`💡 ${toastCandidate.title}`,
@@ -2233,7 +2261,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 			dismiss,
 		);
 		if (choice === view) {
-			await this.showUsageAnalysis();
+			await this.showUsageAnalysisOnInsightsTab();
 		} else if (choice === dismiss) {
 			this._insightStateBag[toastCandidate.id] = {
 				...(this._insightStateBag[toastCandidate.id] ?? { firstSurfacedAt: now }),
@@ -4988,6 +5016,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this.analysisPanel.webview.html = this.getUsageAnalysisHtml(this.analysisPanel.webview, this.lastUsageAnalysisStats ?? null);
 		if (!this.lastUsageAnalysisStats) { void this.loadAnalysisStatsInBackground(this.analysisPanel); }
 		this.analysisPanel.onDidDispose(() => { this.log('📊 Usage Analysis dashboard closed'); this.analysisPanel = undefined; });
+	}
+
+	/** Opens the Usage Analysis panel and immediately activates the Insights tab. */
+	public async showUsageAnalysisOnInsightsTab(): Promise<void> {
+		await this.showUsageAnalysis();
+		void this.analysisPanel?.webview.postMessage({ command: 'switchTab', tab: 'insights' });
 	}
 
 	private async handleAnalysisMessage(message: any): Promise<void> {
@@ -8104,6 +8138,14 @@ function registerViewCommands(context: vscode.ExtensionContext, tokenTracker: Co
     },
   );
 
+  const openInsightsTabCommand = vscode.commands.registerCommand(
+    "aiEngineeringFluency.openInsightsTab",
+    async () => {
+      tokenTracker.log("Open Insights tab command called");
+      await tokenTracker.showUsageAnalysisOnInsightsTab();
+    },
+  );
+
   const showMaturityCommand = vscode.commands.registerCommand(
     "aiEngineeringFluency.showMaturity",
     async () => {
@@ -8133,6 +8175,7 @@ function registerViewCommands(context: vscode.ExtensionContext, tokenTracker: Co
     showDetailsCommand,
     showChartCommand,
     showUsageAnalysisCommand,
+    openInsightsTabCommand,
     showMaturityCommand,
     showDashboardCommand,
     showEnvironmentalCommand,
