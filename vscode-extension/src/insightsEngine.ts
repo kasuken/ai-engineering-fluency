@@ -48,6 +48,39 @@ function totalContextRefs(p: UsageAnalysisPeriod): number {
 		+ (r.pullRequest ?? 0);
 }
 
+// ── Session-hygiene helpers ────────────────────────────────────────────────
+/** A single today-session is considered a "marathon" once it grows this long. */
+const MARATHON_TURNS = 50;
+/** ...or once it has processed this many cumulative tokens. */
+const MARATHON_TOKENS = 750_000;
+
+function isMarathonSession(s: TodaySessionSummary): boolean {
+	return s.interactions >= MARATHON_TURNS || s.totalTokens >= MARATHON_TOKENS;
+}
+
+function hasMarathonSessionToday(ctx: InsightContext): boolean {
+	return (ctx.todaySessions ?? []).some(isMarathonSession);
+}
+
+/** The largest today-session by turns, tie-broken by tokens. */
+function biggestSessionToday(ctx: InsightContext): TodaySessionSummary | undefined {
+	return (ctx.todaySessions ?? [])
+		.slice()
+		.sort((a, b) => (b.interactions - a.interactions) || (b.totalTokens - a.totalTokens))[0];
+}
+
+/** Short human-readable token count, e.g. 1_200_000 → "1.2M", 750_000 → "750K". */
+function formatTokensShort(n: number): string {
+	if (n >= 1_000_000) { return `${(n / 1_000_000).toFixed(1)}M`; }
+	if (n >= 1_000) { return `${Math.round(n / 1_000)}K`; }
+	return String(n);
+}
+
+/** Count of manual /compact commands in a period (Claude Code / Desktop only). */
+function manualCompactCount(p: UsageAnalysisPeriod): number {
+	return p.toolCalls.byTool['__slash__compact'] ?? 0;
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -561,6 +594,62 @@ export const INSIGHT_CATALOG: InsightDefinition[] = [
 			return avg < 5;
 		},
 		weight: 55,
+	},
+
+	// ── Session hygiene & compaction ─────────────────────────────────────────
+	{
+		id: 'marathon-session-today',
+		category: 'consistency',
+		severity: 'opportunity',
+		title: '🧵 A very long chat session today',
+		buildBody: (ctx) => {
+			const s = biggestSessionToday(ctx);
+			if (!s) { return ''; }
+			const where = s.editor ? ` in ${s.editor}` : '';
+			const turns = `${s.interactions} turn${s.interactions === 1 ? '' : 's'}`;
+			const tokens = s.totalTokens > 0 ? ` (~${formatTokensShort(s.totalTokens)} tokens)` : '';
+			return `Your longest chat today${where} reached ${turns}${tokens}. Deep work in one chat is great — but once a session gets this long, earlier context is more likely to be summarized, compressed, or dropped, so replies can drift and slow down. ` +
+				`When the goal changes, start a fresh chat (New Chat / \`/new\`) and paste a short handoff summary. A handy rule: one chat per bug, feature, or refactor.`;
+		},
+		appliesTo: (ctx) => hasMarathonSessionToday(ctx),
+		weight: 58,
+		allowToast: true,
+	},
+	{
+		id: 'very-long-sessions-pattern',
+		category: 'consistency',
+		severity: 'tip',
+		title: '📏 Your chats tend to run long',
+		buildBody: (ctx) => {
+			const maxTurns = ctx.last30Days.conversationPatterns.maxTurnsInSession;
+			const avg = ctx.last30Days.conversationPatterns.avgTurnsPerSession.toFixed(1);
+			return `Over the last 30 days your longest conversation reached ${maxTurns} prompts, and your sessions average ${avg} prompts each. ` +
+				`Very long chats make earlier context less reliable — the assistant may compress or ignore it as the window fills. ` +
+				`Keeping one focused chat per task (and starting fresh when the topic shifts) usually produces sharper, faster answers.`;
+		},
+		appliesTo: (ctx) => {
+			// Pattern-level insight: don't double up with the "today" marathon nudge.
+			if (hasMarathonSessionToday(ctx)) { return false; }
+			const cp = ctx.last30Days.conversationPatterns;
+			return ctx.last30Days.sessions >= 10
+				&& cp.maxTurnsInSession >= 80
+				&& cp.avgTurnsPerSession >= 12;
+		},
+		weight: 45,
+	},
+	{
+		id: 'frequent-manual-compaction',
+		category: 'consistency',
+		severity: 'tip',
+		title: '🗜️ You compact your sessions often',
+		buildBody: (ctx) => {
+			const n = manualCompactCount(ctx.last30Days);
+			return `You've used \`/compact\` ${n} times in the last 30 days. That's a great way to keep going when a single task's chat gets long. ` +
+				`But if you're starting a *new* subtask, a fresh chat (\`/new\`) usually preserves intent better than compacting — compaction works by summarizing, so earlier detail is already condensed away. ` +
+				`Rule of thumb: \`/compact\` to keep going on one task, \`/new\` when the goal changes.`;
+		},
+		appliesTo: (ctx) => manualCompactCount(ctx.last30Days) >= 5,
+		weight: 50,
 	},
 ];
 
