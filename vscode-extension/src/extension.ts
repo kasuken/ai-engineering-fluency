@@ -310,6 +310,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 	public sessionDiscovery!: SessionDiscovery;
 	private statusBarItem!: vscode.StatusBarItem;
+	/** Dedicated status bar item for insights — shown only when new insights exist. */
+	private insightsStatusBarItem!: vscode.StatusBarItem;
 	private readonly extensionUri: vscode.Uri;
 	private readonly context: vscode.ExtensionContext;
 	private _devBranch: string | undefined;
@@ -1026,6 +1028,13 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this.statusBarItem.tooltip = "AI Engineering Fluency — daily and 30-day token usage - Click to open details";
 		this.statusBarItem.command = 'aiEngineeringFluency.showDetails';
 		this.statusBarItem.show();
+
+		// Separate insights badge — hidden until there are new insights
+		this.insightsStatusBarItem = vscode.window.createStatusBarItem('ai-engineering-fluency-insights', vscode.StatusBarAlignment.Right, 99);
+		this.insightsStatusBarItem.name = "AI Engineering Fluency — Insights";
+		this.insightsStatusBarItem.command = 'aiEngineeringFluency.openInsightsTab';
+		// starts hidden; shown in refreshStatusBarInsightBadge when count > 0
+
 		this.log('Status bar item created and shown');
 	}
 
@@ -1221,34 +1230,29 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 	private setStatusBarText(text: string): void {
 		this._statusBarBaseText = text;
-		const badge = this._newInsightCount > 0 ? ' 💡' : '';
-		this.statusBarItem.text = this._devBranch ? `${text}${badge} [${this._devBranch}]` : `${text}${badge}`;
+		this.statusBarItem.text = this._devBranch ? `${text} [${this._devBranch}]` : text;
 	}
 
 	private refreshStatusBarInsightBadge(count: number, topInsightTitle?: string): void {
 		this._newInsightCount = count;
 		this._topInsightTitle = topInsightTitle ?? this._topInsightTitle;
+		// Main status bar: remove the 💡 badge — it now lives in its own item
 		this.setStatusBarText(this._statusBarBaseText);
 
 		if (count > 0) {
-			// Point the status bar click directly at the Insights tab
-			this.statusBarItem.command = 'aiEngineeringFluency.openInsightsTab';
-			// Rebuild tooltip with insight hint appended
-			if (this._lastDetailedStats) {
-				const tooltip = this.buildTooltipMarkdown(this._lastDetailedStats);
-				tooltip.appendMarkdown('\n---\n');
-				tooltip.appendMarkdown(`💡 **${count} new insight${count > 1 ? 's' : ''}** — click to open the Insights tab\n\n`);
-				if (this._topInsightTitle) {
-					tooltip.appendMarkdown(`> ${this._topInsightTitle}`);
-				}
-				this.statusBarItem.tooltip = tooltip;
+			const label = count === 1 ? '1 insight' : `${count} insights`;
+			this.insightsStatusBarItem.text = `💡 ${label}`;
+			const tooltip = new vscode.MarkdownString();
+			tooltip.isTrusted = false;
+			tooltip.appendMarkdown(`**💡 ${label} waiting for you**\n\n`);
+			if (this._topInsightTitle) {
+				tooltip.appendMarkdown(`${this._topInsightTitle}\n\n`);
 			}
+			tooltip.appendMarkdown('Click to open the Insights tab');
+			this.insightsStatusBarItem.tooltip = tooltip;
+			this.insightsStatusBarItem.show();
 		} else {
-			this.statusBarItem.command = 'aiEngineeringFluency.showDetails';
-			// Restore plain tooltip
-			if (this._lastDetailedStats) {
-				this.statusBarItem.tooltip = this.buildTooltipMarkdown(this._lastDetailedStats);
-			}
+			this.insightsStatusBarItem.hide();
 		}
 	}
 
@@ -7885,6 +7889,7 @@ ${this.getLoadingHtmlScript()}
     }
     this.openCode.dispose();
     this.statusBarItem.dispose();
+    this.insightsStatusBarItem.dispose();
     this._disposed = true;
     this.outputChannel.dispose();
   }
