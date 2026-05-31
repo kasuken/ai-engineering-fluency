@@ -1586,7 +1586,7 @@ function buildInsightCardHtml(insight: EvaluatedInsight): string {
 function buildInsightsTabPanelHtml(insights: EvaluatedInsight[]): string {
 	const applicable = insights.filter(i => i.status !== 'dismissed');
 	const newInsights = applicable.filter(i => i.status === 'new');
-	const otherInsights = applicable.filter(i => i.status !== 'new');
+	const otherInsights = applicable.filter(i => i.status !== 'new' && i.status !== 'done');
 
 	const forYouSection = newInsights.length > 0
 		? `<div style="margin-bottom:20px;">
@@ -1624,7 +1624,7 @@ function refreshInsightsPanel(insights: EvaluatedInsight[]): void {
 	if (!container) { return; }
 	currentInsights = insights;
 	const forYou = insights.filter(i => i.status === 'new');
-	const other = insights.filter(i => i.status !== 'new' && i.status !== 'dismissed');
+	const other = insights.filter(i => i.status !== 'new' && i.status !== 'dismissed' && i.status !== 'done');
 
 	const forYouSection = forYou.length > 0
 		? `<div style="margin-bottom:20px;">
