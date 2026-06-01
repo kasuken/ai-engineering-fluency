@@ -63,21 +63,26 @@ class TokenTrackerPanel(
      * background thread, then reloads [view] with the data pre-embedded.
      * Subsequent navigations use the warm cache — no spinner needed.
      *
-     * [onComplete] is invoked on the EDT after the fetch finishes (success or
-     * failure), before the result is applied. Use it for cleanup such as
-     * resetting a timeout override.
+     * [onSuccess] is invoked on the EDT after a successful fetch, before loading the view.
+     * [onFailure] is invoked on the EDT after a failed fetch, before showing the error.
+     * Use these for cleanup such as persisting or resetting a timeout override.
      */
-    private fun prefetchAndLoadView(view: String, onComplete: (() -> Unit)? = null) {
+    private fun prefetchAndLoadView(
+        view: String,
+        onSuccess: (() -> Unit)? = null,
+        onFailure: (() -> Unit)? = null,
+    ) {
         ApplicationManager.getApplication().executeOnPooledThread {
             val result = runCatching { CliBridge.prefetchAll() }
             ApplicationManager.getApplication().invokeLater {
-                onComplete?.invoke()
                 result.fold(
                     onSuccess = {
+                        onSuccess?.invoke()
                         // Cache is now warm — load the current view with data embedded
                         loadViewFromCache(currentView)
                     },
                     onFailure = { err ->
+                        onFailure?.invoke()
                         log.warn("CLI prefetch failed", err)
                         showError(err.message ?: "Unknown error fetching stats")
                     },
@@ -264,11 +269,15 @@ class TokenTrackerPanel(
                 }
 
                 "retryWithExtendedTimeout" -> {
-                    // Use a 5-minute timeout for the next fetch, then reset to default.
+                    // Use a 5-minute timeout for the next fetch. If it succeeds, persist it as the new default.
                     CliBridge.timeoutSeconds = 300L
                     CliBridge.invalidateCache()
                     browser.loadHTML(WebviewResources.buildHtml(currentView, hostBridgeInjectFunction = hostBridge.inject("payload")))
-                    prefetchAndLoadView(currentView, onComplete = { CliBridge.resetTimeout() })
+                    prefetchAndLoadView(
+                        currentView,
+                        onSuccess = { CliBridge.setPersistentTimeout(300L) },
+                        onFailure = { CliBridge.resetTimeout() }
+                    )
                 }
 
                 "showDetails" -> navigateToView("details")
