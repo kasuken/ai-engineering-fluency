@@ -280,7 +280,7 @@ function _scdlDistributeToDays(
 
 class CopilotTokenTracker implements vscode.Disposable {
 	// Cache version - increment this when making changes that require cache invalidation
-	private static readonly CACHE_VERSION = 55; // Fix LOC extraction for Copilot CLI coding agent sessions (edit/create tools)
+	private static readonly CACHE_VERSION = 56; // Track tool output tokens per tool call (outputTokensByTool)
 	// Maximum length for displaying workspace IDs in diagnostics/customization matrix
 	private static readonly WORKSPACE_ID_DISPLAY_LENGTH = 8;
 
@@ -7355,6 +7355,7 @@ ${this.getLoadingHtmlScript()}
         candidatePaths,
         backendStorageInfo,
         githubAuth: githubAuthStatus,
+        toolCallStats: this.lastUsageAnalysisStats?.last30Days?.toolCalls ?? null,
       });
 
       this.log("✅ Diagnostic data loaded and sent to webview");
@@ -7672,6 +7673,7 @@ ${this.getLoadingHtmlScript()}
       cacheInfo, backendStorageInfo,
       backendConfigured: this.isBackendConfigured(), isDebugMode, globalStateCounters,
       displaySettings: { showTokens: this.getStatusBarShowTokensSetting(), showCost: this.getStatusBarShowCostSetting(), monthlyBudget: this.getMonthlyBudgetSetting() },
+      toolCallStats: this.lastUsageAnalysisStats?.last30Days?.toolCalls ?? null,
     }).replace(/</g, "\\u003c");
 
     return `<!DOCTYPE html>

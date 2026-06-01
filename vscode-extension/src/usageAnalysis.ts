@@ -908,6 +908,12 @@ export function mergeUsageAnalysis(period: UsageAnalysisPeriod, analysis: Sessio
 	for (const [tool, count] of Object.entries(analysis.toolCalls.byTool)) {
 		period.toolCalls.byTool[tool] = (period.toolCalls.byTool[tool] || 0) + count;
 	}
+	if (analysis.toolCalls.outputTokensByTool) {
+		if (!period.toolCalls.outputTokensByTool) { period.toolCalls.outputTokensByTool = {}; }
+		for (const [tool, tokens] of Object.entries(analysis.toolCalls.outputTokensByTool)) {
+			period.toolCalls.outputTokensByTool[tool] = (period.toolCalls.outputTokensByTool[tool] || 0) + tokens;
+		}
+	}
 	period.modeUsage.ask += analysis.modeUsage.ask;
 	period.modeUsage.edit += analysis.modeUsage.edit;
 	period.modeUsage.agent += analysis.modeUsage.agent;
@@ -1674,10 +1680,32 @@ function _asuProcessCliEvents(event: any, cliState: AsuCliState, analysis: Sessi
 
 /** Handle tool.call / tool.result / tool.execution_start events. */
  
+/** Extract plain text from a CLI tool.result event's content (string or content-block array). */
+function _asuExtractToolResultText(event: any): string {
+	const content = event.data?.result?.content;
+	if (!content) { return ''; }
+	if (typeof content === 'string') { return content; }
+	if (Array.isArray(content)) {
+		return content
+			.filter((block: any) => block?.type === 'text' && typeof block.text === 'string')
+			.map((block: any) => block.text as string)
+			.join('');
+	}
+	return '';
+}
+
 function _asuHandleToolCallEvent(event: any, analysis: SessionUsageAnalysis, toolNameMap: { [key: string]: string }): void {
 	if (event.type !== 'tool.call' && event.type !== 'tool.result' && event.type !== 'tool.execution_start') { return; }
 	const toolName = event.data?.toolName || event.toolName || 'unknown';
 	recordToolOrMcpInvocation(toolName, analysis, toolNameMap);
+	if (event.type === 'tool.result' && !isMcpTool(toolName)) {
+		const resultText = _asuExtractToolResultText(event);
+		if (resultText) {
+			const tokens = estimateTokensFromText(resultText);
+			if (!analysis.toolCalls.outputTokensByTool) { analysis.toolCalls.outputTokensByTool = {}; }
+			analysis.toolCalls.outputTokensByTool[toolName] = (analysis.toolCalls.outputTokensByTool[toolName] || 0) + tokens;
+		}
+	}
 }
 
 /** Handle mcp.tool.call events and events with data.mcpServer set. */

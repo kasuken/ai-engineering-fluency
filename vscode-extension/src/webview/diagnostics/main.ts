@@ -118,6 +118,7 @@ type DiagnosticsData = {
   githubAuth?: GitHubAuthStatus;
   sessionFolders?: SessionFolder[];
   displaySettings?: DisplaySettings;
+  toolCallStats?: { total: number; byTool: { [key: string]: number }; outputTokensByTool?: { [key: string]: number } } | null;
 };
 
 type DiagnosticsViewState = {
@@ -1560,6 +1561,16 @@ function handleDiagnosticDataLoaded(message: DiagMessage): void {
       setupGitHubAuthHandlers();
     }
   }
+  if (message.toolCallStats !== undefined) {
+    const toolAnalysisTab = document.getElementById("tab-tool-analysis");
+    if (toolAnalysisTab) {
+      const newContent = renderToolAnalysisTab(message.toolCallStats as DiagnosticsData['toolCallStats']);
+      const temp = document.createElement('div');
+      temp.innerHTML = newContent;
+      const newTab = temp.firstElementChild;
+      if (newTab) { toolAnalysisTab.replaceWith(newTab); }
+    }
+  }
 }
 
 function handleGithubAuthUpdated(message: DiagMessage): void {
@@ -1845,6 +1856,56 @@ for quick scanning, or as full numbers (e.g. <strong>1,500</strong>, <strong>1,2
 </div>`;
 }
 
+function renderToolAnalysisTab(toolCallStats: DiagnosticsData['toolCallStats']): string {
+  if (!toolCallStats || !toolCallStats.outputTokensByTool || Object.keys(toolCallStats.outputTokensByTool).length === 0) {
+    return `<div id="tab-tool-analysis" class="tab-content">
+<div class="info-box">
+<div class="info-box-title">🔧 Tool Output Token Analysis</div>
+<div>Track how many tokens each tool produces as output over the last 30 days. Data is collected as you use the extension — no output token data has been recorded yet.</div>
+</div>
+</div>`;
+  }
+  const outputTokensByTool = toolCallStats.outputTokensByTool;
+  const byTool = toolCallStats.byTool;
+  const rows = Object.entries(outputTokensByTool)
+    .map(([tool, totalTokens]) => ({ tool, totalTokens, calls: byTool[tool] || 0 }))
+    .filter(r => r.calls > 0)
+    .sort((a, b) => (b.totalTokens / b.calls) - (a.totalTokens / a.calls));
+  const tableRows = rows.map(r => {
+    const avg = Math.round(r.totalTokens / r.calls);
+    return `<tr><td>${escapeHtml(r.tool)}</td><td>${escapeHtml(String(r.calls))}</td><td>${formatTokenCount(r.totalTokens)}</td><td>${formatTokenCount(avg)}</td></tr>`;
+  }).join('');
+  return `<div id="tab-tool-analysis" class="tab-content">
+<div class="info-box">
+<div class="info-box-title">🔧 Tool Output Token Analysis</div>
+<div>Tokens produced by each tool's output over the last 30 days, sorted by average tokens per call (descending). Comparing tools with high vs. low output token counts can help identify efficiency opportunities.</div>
+</div>
+<table class="session-table">
+<thead><tr><th>Tool</th><th>Calls</th><th>Total Output Tokens</th><th>Avg Tokens / Call</th></tr></thead>
+<tbody>${tableRows}</tbody>
+</table>
+</div>`;
+}
+
+function buildDiagReportTabHtml(escapedReport: string): string {
+  return `<div id="tab-report" class="tab-content active">
+<div class="info-box">
+<div class="info-box-title">📋 About This Report</div>
+<div>
+This diagnostic report contains information about your AI Engineering Fluency extension
+extension setup and usage statistics. </br> It does <strong>not</strong> include any of your
+code or conversation content. You can safely share this report when reporting issues.
+</div>
+</div>
+<div class="button-group" style="margin-bottom: 12px;">
+<button class="button" id="btn-copy"><span>📋</span><span>Copy to Clipboard</span></button>
+<button class="button secondary" id="btn-issue"><span>🐛</span><span>Open GitHub Issue</span></button>
+<button class="button secondary" id="btn-clear-cache"><span>🗑️</span><span>Clear Cache</span></button>
+</div>
+<div class="report-content">${escapedReport}</div>
+</div>`;
+}
+
 function buildDiagRootHtml(
   data: DiagnosticsData,
   detailedFiles: SessionFileDetails[],
@@ -1878,25 +1939,11 @@ ${data?.backendConfigured ? buttonHtml("btn-dashboard") : ""}
 <button class="tab" data-tab="github">🔑 GitHub Auth</button>
 <button class="tab" data-tab="display">⚙️ Settings</button>
 <button class="tab" data-tab="path-analyzer">🔬 Path Analyzer</button>
+<button class="tab" data-tab="tool-analysis">🔧 Tool Analysis</button>
 ${data.isDebugMode ? '<button class="tab" data-tab="debug">🐛 Debug</button>' : ''}
 </div>
 
-<div id="tab-report" class="tab-content active">
-<div class="info-box">
-<div class="info-box-title">📋 About This Report</div>
-<div>
-This diagnostic report contains information about your AI Engineering Fluency extension
-extension setup and usage statistics. </br> It does <strong>not</strong> include any of your
-code or conversation content. You can safely share this report when reporting issues.
-</div>
-</div>
-<div class="button-group" style="margin-bottom: 12px;">
-<button class="button" id="btn-copy"><span>📋</span><span>Copy to Clipboard</span></button>
-<button class="button secondary" id="btn-issue"><span>🐛</span><span>Open GitHub Issue</span></button>
-<button class="button secondary" id="btn-clear-cache"><span>🗑️</span><span>Clear Cache</span></button>
-</div>
-<div class="report-content">${escapedReport}</div>
-</div>
+${buildDiagReportTabHtml(escapedReport)}
 
 <div id="tab-sessions" class="tab-content">
 <div class="info-box">
@@ -1922,6 +1969,7 @@ ${data.isDebugMode ? renderDebugTab(data.globalStateCounters) : ''}
 <div id="tab-path-analyzer" class="tab-content">
 ${renderFolderAnalyzerTab()}
 </div>
+${renderToolAnalysisTab(data.toolCallStats)}
 </div>
 `;
 }
