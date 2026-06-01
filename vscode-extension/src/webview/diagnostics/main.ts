@@ -37,6 +37,9 @@ type SessionFileDetails = {
   editorName?: string;
   title?: string;
   repository?: string;
+  parentInfo?: { uuid: string; name: string; sessionFile?: string } | null;
+  childInfo?: Array<{ uuid: string; name: string; sessionFile?: string }>;
+  totalChildCount?: number;
 };
 
 type CacheInfo = {
@@ -100,6 +103,7 @@ type StatusBarShowOption = 'none' | 'today' | 'last30days' | 'currentMonth' | 'b
 type DisplaySettings = {
   showTokens: StatusBarShowOption;
   showCost: StatusBarShowOption;
+  monthlyBudget?: number;
 };
 
 type DiagnosticsData = {
@@ -468,14 +472,32 @@ function buildSessionSummaryCardsHtml(filteredFiles: SessionFileDetails[], total
   <div class="filter-options"><label class="empty-sessions-toggle"><input type="checkbox" id="hide-empty-sessions" ${hideEmptySessions ? 'checked' : ''}>Hide sessions with 0 interactions${zeroInteractionCount > 0 ? `<span class="hidden-count">(${zeroInteractionCount} hidden)</span>` : ''}</label></div>`;
 }
 
+function buildHierarchyBadgesHtml(sf: SessionFileDetails): string {
+  let html = '';
+  if (sf.parentInfo) {
+    const parentTitle = escapeHtml(sf.parentInfo.name.length > 30 ? sf.parentInfo.name.substring(0, 30) + '…' : sf.parentInfo.name);
+    const linkAttr = sf.parentInfo.sessionFile
+      ? ` href="#" class="session-hierarchy-badge hierarchy-parent session-file-link" data-file="${encodeURIComponent(sf.parentInfo.sessionFile)}"`
+      : ` class="session-hierarchy-badge hierarchy-parent"`;
+    html += `<a${linkAttr} title="Parent session: ${escapeHtml(sf.parentInfo.name)}">↑ ${parentTitle}</a>`;
+  }
+  if (sf.totalChildCount && sf.totalChildCount > 0) {
+    const count = sf.totalChildCount;
+    const label = count === 1 ? '1 child' : `${count} children`;
+    html += `<span class="session-hierarchy-badge hierarchy-children" title="${label}">↓ ${count}</span>`;
+  }
+  return html ? `<div class="session-hierarchy-badges">${html}</div>` : '';
+}
+
 function buildSessionTableHtml(sortedFiles: SessionFileDetails[]): string {
   const rows = sortedFiles.map((sf, idx) => {
     const editorLabel = sf.editorName || sf.editorSource;
     const titleHtml = sf.title ? `<a href="#" class="session-file-link" data-file="${encodeURIComponent(sf.file)}" title="${escapeHtml(sf.title)}">${escapeHtml(sf.title.length > 40 ? sf.title.substring(0, 40) + "..." : sf.title)}</a>` : `<a href="#" class="session-file-link empty-session-link" data-file="${encodeURIComponent(sf.file)}" title="Empty session">(Empty session)</a>`;
+    const hierarchyBadges = buildHierarchyBadgesHtml(sf);
     const repoLabel = sf.repository ? escapeHtml(getRepoDisplayName(sf.repository)) : (sf.file.includes('session-store.db') ? '<span style="color: #888; font-style: italic;">No workspace</span>' : '<span style="color: #666;">—</span>');
     const repoTitle = sf.repository ? escapeHtml(sf.repository) : (sf.file.includes('session-store.db') ? 'Chat session — no workspace connected' : 'No repository detected');
     const isUnknownEditor = (sf.editorName || sf.editorSource || "Unknown") === "Unknown";
-    return `<tr><td>${idx + 1}</td><td><span class="${getEditorBadgeClass(editorLabel)}" title="${escapeHtml(sf.editorSource)}">${getEditorIcon(editorLabel)} ${escapeHtml(editorLabel)}</span></td><td class="session-title" title="${sf.title ? escapeHtml(sf.title) : "Empty session"}">${titleHtml}</td><td class="repository-cell" title="${repoTitle}">${repoLabel}</td><td>${formatFileSize(sf.size)}</td><td title="${Number(sf.tokens || 0).toLocaleString()} tokens">${formatTokenCount(sf.tokens)}</td><td>${sanitizeNumber(sf.interactions)}</td><td title="${escapeHtml(getContextRefsSummary(sf.contextReferences))}">${sanitizeNumber(getTotalContextRefs(sf.contextReferences))}</td><td>${formatDate(sf.lastInteraction)}</td><td><a href="#" class="view-formatted-link" data-file="${encodeURIComponent(sf.file)}" title="View formatted JSONL file">📄 View</a>${isUnknownEditor ? ` <a href="#" class="report-editor-link" data-path="${encodeURIComponent(sf.file)}" title="Report this unknown path so we can add editor support">📢 Report</a>` : ""}</td></tr>`;
+    return `<tr><td>${idx + 1}</td><td><span class="${getEditorBadgeClass(editorLabel)}" title="${escapeHtml(sf.editorSource)}">${getEditorIcon(editorLabel)} ${escapeHtml(editorLabel)}</span></td><td class="session-title" title="${sf.title ? escapeHtml(sf.title) : "Empty session"}">${hierarchyBadges}${titleHtml}</td><td class="repository-cell" title="${repoTitle}">${repoLabel}</td><td>${formatFileSize(sf.size)}</td><td title="${Number(sf.tokens || 0).toLocaleString()} tokens">${formatTokenCount(sf.tokens)}</td><td>${sanitizeNumber(sf.interactions)}</td><td title="${escapeHtml(getContextRefsSummary(sf.contextReferences))}">${sanitizeNumber(getTotalContextRefs(sf.contextReferences))}</td><td>${formatDate(sf.lastInteraction)}</td><td><a href="#" class="view-formatted-link" data-file="${encodeURIComponent(sf.file)}" title="View formatted JSONL file">📄 View</a>${isUnknownEditor ? ` <a href="#" class="report-editor-link" data-path="${encodeURIComponent(sf.file)}" title="Report this unknown path so we can add editor support">📢 Report</a>` : ""}</td></tr>`;
   }).join("");
   return `<div class="table-container"><table class="session-table"><thead><tr><th>#</th><th>Editor</th><th>Title</th><th>Repository</th><th class="sortable" data-sort="size">Size${getSortIndicator("size")}</th><th class="sortable" data-sort="tokens">Tokens${getSortIndicator("tokens")}</th><th class="sortable" data-sort="interactions">Interactions${getSortIndicator("interactions")}</th><th class="sortable" data-sort="contextRefs">Context Refs${getSortIndicator("contextRefs")}</th><th class="sortable" data-sort="lastInteraction">Last Interaction${getSortIndicator("lastInteraction")}</th><th>Actions</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
@@ -1156,6 +1178,16 @@ function setupDisplaySettingHandlers(): void {
       const value = (e.target as HTMLSelectElement).value;
       vscode.postMessage({ command: "updateDisplaySetting", key: "display.statusBar.showCost", value });
     });
+
+  document
+    .getElementById("input-monthly-budget")
+    ?.addEventListener("change", (e) => {
+      const input = e.target as HTMLInputElement;
+      const raw = parseFloat(input.value);
+      const value = isNaN(raw) ? 0 : Math.min(99999, Math.max(0, Math.round(raw * 100) / 100));
+      input.value = value.toString();
+      vscode.postMessage({ command: "updateDisplaySetting", key: "display.statusBar.monthlyBudget", value });
+    });
 }
 
 function setupSubtabHandlers(): void {
@@ -1748,6 +1780,7 @@ function sel(current: string, value: string): string {
 function renderDiagDisplayTabHtml(data: DiagnosticsData): string {
   const showTokens = data.displaySettings?.showTokens ?? 'both';
   const showCost = data.displaySettings?.showCost ?? 'none';
+  const monthlyBudget = Math.round((data.displaySettings?.monthlyBudget ?? 0) * 100) / 100;
   return `
 <div id="tab-display" class="tab-content">
 <div class="info-box">
@@ -1755,13 +1788,13 @@ function renderDiagDisplayTabHtml(data: DiagnosticsData): string {
 <div>Configure what is shown in the status bar at the bottom of VS Code. Changes take effect immediately — no data refresh needed.</div>
 </div>
 <div class="backend-card">
-<h4 style="color: #fff; font-size: 14px; margin-bottom: 12px;">📊 Status Bar Display</h4>
-<p style="color: #ccc; margin-bottom: 16px;">
+<h4>📊 Status Bar Display</h4>
+<p>
 Choose what to show in the VS Code status bar toolbar. You can show token counts, estimated costs, both, or neither for each period.
 </p>
 <div style="display: grid; gap: 16px;">
 <div style="display: flex; align-items: center; gap: 12px;">
-  <label style="color: #ccc; min-width: 160px; font-size: 13px;">🔢 Token counts:</label>
+  <label style="min-width: 175px; font-size: 13px;">🔢 Token counts:</label>
   <select id="select-show-tokens" class="settings-select" style="background: #2d2d2d; color: #ccc; border: 1px solid #555; border-radius: 4px; padding: 4px 8px; font-size: 13px;">
     <option value="none" ${sel(showTokens, 'none')}>None</option>
     <option value="today" ${sel(showTokens, 'today')}>Today only</option>
@@ -1772,7 +1805,7 @@ Choose what to show in the VS Code status bar toolbar. You can show token counts
   </select>
 </div>
 <div style="display: flex; align-items: center; gap: 12px;">
-  <label style="color: #ccc; min-width: 160px; font-size: 13px;">💰 Estimated cost (USD):</label>
+  <label style="min-width: 175px; font-size: 13px;">💰 Estimated cost (USD):</label>
   <select id="select-show-cost" class="settings-select" style="background: #2d2d2d; color: #ccc; border: 1px solid #555; border-radius: 4px; padding: 4px 8px; font-size: 13px;">
     <option value="none" ${sel(showCost, 'none')}>None (hidden)</option>
     <option value="today" ${sel(showCost, 'today')}>Today only</option>
@@ -1783,11 +1816,22 @@ Choose what to show in the VS Code status bar toolbar. You can show token counts
   </select>
 </div>
 </div>
-<p style="color: #888; font-size: 11px; margin-top: 12px;">Cost is estimated using GitHub Copilot AI-Credit rates (Usage Based Billing). Changes apply to the status bar immediately.</p>
+<p class="hint">Cost is estimated using GitHub Copilot AI-Credit rates (Usage Based Billing). Changes apply to the status bar immediately.</p>
 </div>
 <div class="backend-card">
-<h4 style="color: #fff; font-size: 14px; margin-bottom: 12px;">🔢 Number Formatting</h4>
-<p style="color: #ccc; margin-bottom: 12px;">
+<h4>💰 Monthly Budget</h4>
+<p>
+Set a monthly AI spend budget in USD to get visual alerts on the status bar. The bar turns yellow at 75%, orange at 90%, and red at 100% of your budget. Set to 0 to disable.
+</p>
+<div style="display: flex; align-items: center; gap: 12px;">
+  <label style="min-width: 175px; font-size: 13px;">💵 Monthly budget (USD):</label>
+  <input id="input-monthly-budget" type="number" min="0" max="99999" step="0.01" value="${monthlyBudget}" style="background: #2d2d2d; color: #ccc; border: 1px solid #555; border-radius: 4px; padding: 4px 8px; font-size: 13px; width: 100px;" />
+</div>
+<p class="hint">Budget coloring uses the current calendar month's estimated cost. Set to 0 to disable.</p>
+</div>
+<div class="backend-card">
+<h4>🔢 Number Formatting</h4>
+<p>
 Token counts can be shown in compact format using K/M suffixes (e.g. <strong>1.5K</strong>, <strong>1.2M</strong>)
 for quick scanning, or as full numbers (e.g. <strong>1,500</strong>, <strong>1,200,000</strong>) for precision.
 </p>

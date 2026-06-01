@@ -24,12 +24,14 @@ import * as path from 'path';
 import type { IEcosystemAdapter } from './ecosystemAdapter';
 import { isDiscoverable } from './ecosystemAdapter';
 import { normalizePathForDedup } from './workspaceHelpers';
+import type { WindsurfDataAccess } from './windsurf';
 
 export interface SessionDiscoveryDeps {
 	log: (message: string) => void;
 	warn: (message: string) => void;
 	error: (message: string, error?: any) => void;
 	ecosystems: IEcosystemAdapter[];
+	windsurf?: WindsurfDataAccess;
 	sampleDataDirectoryOverride?: () => string | undefined;
 }
 
@@ -103,6 +105,15 @@ export class SessionDiscovery {
 			} catch { /* ignore individual adapter errors */ }
 		}
 
+		if (this.deps.windsurf) {
+			const cascadeDir = this.deps.windsurf.getCascadeDir();
+			candidates.push({
+				path: cascadeDir,
+				exists: this.pathExistsWithLogging(cascadeDir, 'Windsurf Cascade'),
+				source: 'Windsurf Cascade',
+			});
+		}
+
 		return candidates;
 	}
 
@@ -161,17 +172,18 @@ export class SessionDiscovery {
 		}
 	}
 
-	private async discoverFromAdapters(onBatch?: (files: string[]) => void): Promise<string[]> {
-		const seen = new Set<string>();
-		const allDeduped: string[] = [];
-		const discoveryStartMs = Date.now();
-		const discoverableAdapters = this.deps.ecosystems.filter(isDiscoverable);
-		this.deps.log(`🔍 Searching for session files via ${discoverableAdapters.length} discoverable ecosystem adapter(s) (parallel)`);
-		const results = await Promise.allSettled(discoverableAdapters.map(eco => eco.discover(this.deps.log)));
+	/** Collect deduplicated files from adapter results, calling onBatch for each new batch. */
+	private collectAdapterFiles(
+		results: PromiseSettledResult<{ sessionFiles: string[] }>[],
+		adapters: IEcosystemAdapter[],
+		seen: Set<string>,
+		allDeduped: string[],
+		onBatch?: (files: string[]) => void,
+	): void {
 		for (let i = 0; i < results.length; i++) {
 			const result = results[i];
 			if (result.status === 'rejected') {
-				this.deps.warn(`Could not discover ${discoverableAdapters[i].displayName} sessions: ${result.reason}`);
+				this.deps.warn(`Could not discover ${adapters[i].displayName} sessions: ${result.reason}`);
 				this._lastDiscoveryHadError = true;
 				continue;
 			}
@@ -183,6 +195,35 @@ export class SessionDiscovery {
 			}
 			if (batch.length > 0) { allDeduped.push(...batch); if (onBatch) { onBatch(batch); } }
 		}
+	}
+
+	/** Collect deduplicated Windsurf session files and add them to allDeduped. */
+	private async collectWindsurfFiles(seen: Set<string>, allDeduped: string[], onBatch?: (files: string[]) => void): Promise<void> {
+		if (!this.deps.windsurf) { return; }
+		try {
+			const windsurfFiles = (await this.deps.windsurf.getWindsurfSessions()).map(session => session.file);
+			const batch = windsurfFiles.filter(f => {
+				const key = normalizePathForDedup(f);
+				if (seen.has(key)) { return false; }
+				seen.add(key);
+				return true;
+			});
+			if (batch.length > 0) { allDeduped.push(...batch); if (onBatch) { onBatch(batch); } }
+		} catch (error) {
+			this.deps.warn(`Could not discover Windsurf sessions: ${error}`);
+			this._lastDiscoveryHadError = true;
+		}
+	}
+
+	private async discoverFromAdapters(onBatch?: (files: string[]) => void): Promise<string[]> {
+		const seen = new Set<string>();
+		const allDeduped: string[] = [];
+		const discoveryStartMs = Date.now();
+		const discoverableAdapters = this.deps.ecosystems.filter(isDiscoverable);
+		this.deps.log(`🔍 Searching for session files via ${discoverableAdapters.length} discoverable ecosystem adapter(s) (parallel)`);
+		const results = await Promise.allSettled(discoverableAdapters.map(eco => eco.discover(this.deps.log)));
+		this.collectAdapterFiles(results, discoverableAdapters, seen, allDeduped, onBatch);
+		await this.collectWindsurfFiles(seen, allDeduped, onBatch);
 		const dupCount = results.reduce((n, r) => n + (r.status === 'fulfilled' ? r.value.sessionFiles.length : 0), 0) - allDeduped.length;
 		if (dupCount > 0) { this.deps.log(`🧹 Deduplicated ${dupCount} duplicate session path(s)`); }
 		this.deps.log(`✨ Total: ${allDeduped.length} session file(s) discovered in ${((Date.now() - discoveryStartMs) / 1000).toFixed(1)}s`);

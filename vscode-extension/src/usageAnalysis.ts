@@ -806,32 +806,27 @@ function _muaMergeThinkingEffort(period: UsageAnalysisPeriod, analysis: SessionU
 	}
 }
 
+const CONTEXT_REF_NUMERIC_KEYS = [
+	'file', 'selection', 'implicitSelection', 'symbol', 'codebase', 'workspace',
+	'terminal', 'vscode', 'terminalLastCommand', 'terminalSelection', 'clipboard',
+	'changes', 'outputPanel', 'problemsPanel', 'pullRequest', 'copilotInstructions', 'agentsMd',
+] as const;
+
+function _muaMergeCountMap(target: Record<string, number>, source: Record<string, number>): void {
+	for (const [key, count] of Object.entries(source)) {
+		target[key] = (target[key] || 0) + count;
+	}
+}
+
 function _muaMergeContextRefs(period: UsageAnalysisPeriod, analysis: SessionUsageAnalysis): void {
 	const c = period.contextReferences;
 	const a = analysis.contextReferences;
-	c.file += a.file;
-	c.selection += a.selection;
-	c.implicitSelection += a.implicitSelection || 0;
-	c.symbol += a.symbol;
-	c.codebase += a.codebase;
-	c.workspace += a.workspace;
-	c.terminal += a.terminal;
-	c.vscode += a.vscode;
-	c.terminalLastCommand += a.terminalLastCommand || 0;
-	c.terminalSelection += a.terminalSelection || 0;
-	c.clipboard += a.clipboard || 0;
-	c.changes += a.changes || 0;
-	c.outputPanel += a.outputPanel || 0;
-	c.problemsPanel += a.problemsPanel || 0;
-	c.pullRequest += a.pullRequest || 0;
-	c.copilotInstructions += a.copilotInstructions || 0;
-	c.agentsMd += a.agentsMd || 0;
-	for (const [kind, count] of Object.entries(a.byKind)) {
-		c.byKind[kind] = (c.byKind[kind] || 0) + count;
+	for (const key of CONTEXT_REF_NUMERIC_KEYS) {
+		c[key] += a[key] || 0;
 	}
-	for (const [path, count] of Object.entries(a.byPath)) {
-		c.byPath[path] = (c.byPath[path] || 0) + count;
-	}
+	c.codeContextLines = (c.codeContextLines || 0) + (a.codeContextLines || 0);
+	_muaMergeCountMap(c.byKind, a.byKind);
+	_muaMergeCountMap(c.byPath, a.byPath);
 }
 
 function _muaAccumulateTierModels(
@@ -1021,6 +1016,15 @@ function _avdProcessVariable(variable: VariableItemRaw, refs: ContextReferenceUs
 	if (typeof kind === 'string') {
 		refs.byKind[kind] = (refs.byKind[kind] || 0) + 1;
 	}
+	// VS Code stores images with kind='image' in variableData; map to 'copilot.image' so
+	// maturity scoring (which checks byKind['copilot.image']) detects them correctly.
+	if (kind === 'image') {
+		refs.byKind['copilot.image'] = (refs.byKind['copilot.image'] || 0) + 1;
+	}
+	// Explicit file variable attachments count the same as #file: text references.
+	if (kind === 'file') {
+		refs.file++;
+	}
 	if (kind === 'generic' && typeof variable.name === 'string' && variable.name.startsWith('sym:')) {
 		refs.symbol++;
 		const symbolKey = `#${variable.name}`;
@@ -1061,15 +1065,38 @@ export function deriveConversationPatterns(analysis: SessionUsageAnalysis): void
 	};
 }
 
+function _arcProcessDynamicPart(part: Record<string, unknown>, refs: ContextReferenceUsage): void {
+	if (part['kind'] !== 'dynamic') { return; }
+	const range = (part['data'] as Record<string, unknown> | undefined)?.['range'] as Record<string, unknown> | undefined;
+	const start = typeof range?.['startLineNumber'] === 'number' ? range['startLineNumber'] : 0;
+	const end = typeof range?.['endLineNumber'] === 'number' ? range['endLineNumber'] : 0;
+	if (end >= start && end > 0) {
+		refs.codeContextLines = (refs.codeContextLines || 0) + (end - start + 1);
+	}
+}
+
+function _arcProcessPromptPart(part: Record<string, unknown>, refs: ContextReferenceUsage): void {
+	if (part['kind'] !== 'prompt') { return; }
+	const cmd = (part['slashPromptCommand'] as Record<string, unknown> | undefined)?.['command'];
+	if (typeof cmd === 'string') {
+		refs.byKind['prompt'] = (refs.byKind['prompt'] || 0) + 1;
+	}
+}
+
+function _arcProcessPart(part: unknown, refs: ContextReferenceUsage): void {
+	if (!part || typeof part !== 'object') { return; }
+	const p = part as Record<string, unknown>;
+	if (typeof p['text'] === 'string') { analyzeContextReferences(p['text'], refs); }
+	_arcProcessDynamicPart(p, refs);
+	_arcProcessPromptPart(p, refs);
+}
+
 function _arcProcessMessage(msg: Record<string, unknown>, refs: ContextReferenceUsage): void {
 	if (typeof msg['text'] === 'string') { analyzeContextReferences(msg['text'], refs); }
 	const parts = msg['parts'];
 	if (!Array.isArray(parts)) { return; }
 	for (const part of parts) {
-		if (part && typeof part === 'object') {
-			const p = part as Record<string, unknown>;
-			if (typeof p['text'] === 'string') { analyzeContextReferences(p['text'], refs); }
-		}
+		_arcProcessPart(part, refs);
 	}
 }
 
@@ -1102,9 +1129,9 @@ export function analyzeRequestContext(request: unknown, refs: ContextReferenceUs
  * Read Claude Code session events from a JSONL file for usage analysis.
  * Lightweight: only used internally by analyzeSessionUsage.
  */
-export function readClaudeCodeEventsForAnalysis(sessionFilePath: string): any[] {
+export async function readClaudeCodeEventsForAnalysis(sessionFilePath: string): Promise<any[]> {
 	try {
-		const content = fs.readFileSync(sessionFilePath, 'utf8');
+		const content = await fs.promises.readFile(sessionFilePath, 'utf8');
 		const lines = content.trim().split('\n');
 		const events: unknown[] = [];
 		for (const line of lines) {
@@ -1352,6 +1379,61 @@ function _temStoreResults(analysis: SessionUsageAnalysis, state: TemState): void
 	analysis.agentTypes = state.agentCounts;
 }
 
+function _temCountLines(text: string): number {
+	return text.length > 0 ? (text.match(/\n/g) ?? []).length + (text.endsWith('\n') ? 0 : 1) : 0;
+}
+
+function _temHandleExecutionStart(
+	event: any,
+	pendingEdits: Map<string, { filePath: string; added: number; removed: number }>
+): void {
+	const toolName: unknown = event.data?.toolName;
+	const args: Record<string, unknown> = event.data?.arguments ?? {};
+	const toolCallId: unknown = event.data?.toolCallId;
+	const filePath: unknown = args.path;
+	if (typeof filePath !== 'string' || !filePath || typeof toolCallId !== 'string') { return; }
+	if (toolName !== 'edit' && toolName !== 'create') { return; }
+	const rawNew = toolName === 'edit' ? args.new_str : args.file_text;
+	const rawOld = toolName === 'edit' ? args.old_str : undefined;
+	const newText = typeof rawNew === 'string' ? rawNew : '';
+	const oldText = typeof rawOld === 'string' ? rawOld : '';
+	pendingEdits.set(toolCallId, { filePath, added: _temCountLines(newText), removed: _temCountLines(oldText) });
+}
+
+function _temHandleExecutionComplete(
+	event: any,
+	pendingEdits: Map<string, { filePath: string; added: number; removed: number }>,
+	state: TemState
+): void {
+	if (event.data?.success !== true) { return; }
+	const toolCallId: unknown = event.data?.toolCallId;
+	if (typeof toolCallId !== 'string') { return; }
+	const pending = pendingEdits.get(toolCallId);
+	if (!pending) { return; }
+	pendingEdits.delete(toolCallId);
+	state.totalLinesAdded += pending.added;
+	state.totalLinesRemoved += pending.removed;
+	state.editedFiles.add(pending.filePath);
+	const ext = normalizeExtension(pending.filePath);
+	if (!state.allLanguageUsage[ext]) { state.allLanguageUsage[ext] = { linesAdded: 0, linesRemoved: 0 }; }
+	state.allLanguageUsage[ext].linesAdded += pending.added;
+	state.allLanguageUsage[ext].linesRemoved += pending.removed;
+}
+
+function _temProcessNonDeltaJsonlEdits(lines: string[], state: TemState): void {
+	const pendingEdits = new Map<string, { filePath: string; added: number; removed: number }>();
+	for (const line of lines) {
+		try {
+			const event = JSON.parse(line);
+			if (event.type === 'tool.execution_start') {
+				_temHandleExecutionStart(event, pendingEdits);
+			} else if (event.type === 'tool.execution_complete') {
+				_temHandleExecutionComplete(event, pendingEdits, state);
+			}
+		} catch { /* skip malformed lines */ }
+	}
+}
+
 /**
  * Track enhanced metrics from session files:
  * - Edit scope (single vs multi-file edits)
@@ -1371,7 +1453,13 @@ export async function trackEnhancedMetrics(deps: Pick<UsageAnalysisDeps, 'warn'>
 			agentCounts: { editsAgent: 0, defaultAgent: 0, workspaceAgent: 0, other: 0 },
 		};
 		if (isJsonl) {
-			_temProcessDeltaJsonl(fileContent.trim().split('\n').filter((l: string) => l.trim()), state);
+			const lines = fileContent.trim().split('\n').filter((l: string) => l.trim());
+			_temProcessDeltaJsonl(lines, state);
+			if (!_asuIsDeltaBased(lines)) {
+				// Non-delta JSONL (Copilot CLI format): extract LOC from edit/create tool calls.
+				// Match execution_start to execution_complete by toolCallId so only successful edits count.
+				_temProcessNonDeltaJsonlEdits(lines, state);
+			}
 		} else {
 			const parsed = preloadedParsedJson !== undefined ? preloadedParsedJson : JSON.parse(fileContent);
 			if (!_temProcessJsonFile(deps, sessionFile, parsed, state)) { return; }
@@ -1548,6 +1636,28 @@ function _asuHandleUserMessageMode(jetBrainsMode: JetBrainsMode | null, analysis
 	else { analysis.modeUsage.cli++; }
 }
 
+/**
+ * Analyze CLI user.message attachments (images pasted from clipboard and @file references).
+ * Images arrive with a displayName ending in '-clipboard.png'.
+ * File/code references attached via @filename arrive with displayName '<N> lines' (for code)
+ * or as the bare filename (for non-image files like markdown docs).
+ */
+export function analyzeCliAttachments(attachments: unknown, refs: ContextReferenceUsage): void {
+	if (!Array.isArray(attachments)) { return; }
+	for (const att of attachments) {
+		if (!att || typeof att !== 'object') { continue; }
+		const displayName: unknown = (att as Record<string, unknown>)['displayName'];
+		if (typeof displayName !== 'string') { continue; }
+		if (/clipboard\.png$/i.test(displayName)) {
+			// Clipboard image pasted into the CLI chat
+			refs.byKind['copilot.image'] = (refs.byKind['copilot.image'] || 0) + 1;
+		} else if (/^\d+ lines$/.test(displayName) || /\.[a-z0-9]+$/i.test(displayName)) {
+			// @file reference: either 'N lines' (code file) or 'filename.ext' (doc/text file)
+			refs.file++;
+		}
+	}
+}
+
 /** Handle Copilot CLI events (session.start, session.model_change, user.message). */
  
 function _asuProcessCliEvents(event: any, cliState: AsuCliState, analysis: SessionUsageAnalysis, jetBrainsMode: JetBrainsMode | null): void {
@@ -1557,6 +1667,7 @@ function _asuProcessCliEvents(event: any, cliState: AsuCliState, analysis: Sessi
 		cliState.requestCount++;
 		const effort = typeof event.data?.reasoningEffort === 'string' ? event.data.reasoningEffort : cliState.defaultEffort;
 		if (effort) { cliState.effortByRequest[effort] = (cliState.effortByRequest[effort] || 0) + 1; }
+		analyzeCliAttachments(event.data?.attachments, analysis.contextReferences);
 		_asuHandleUserMessageMode(jetBrainsMode, analysis);
 	}
 }
@@ -1701,6 +1812,8 @@ async function _asuProcessNonDeltaJsonl(
 	_asuApplyCliLocToEditScope(cliState, analysis);
 	_asuApplyCliThinkingEffort(cliState, analysis);
 	await calculateModelSwitching(deps, sessionFile, analysis, fileContent);
+	// Track LOC/edit metrics for CLI sessions (delta path already handles this above)
+	await trackEnhancedMetrics(deps, sessionFile, analysis, fileContent);
 	deriveConversationPatterns(analysis);
 }
 
@@ -1715,6 +1828,9 @@ export async function analyzeSessionUsage(deps: UsageAnalysisDeps, sessionFile: 
 		if (eco && isAnalyzable(eco)) {
 			return eco.analyzeUsage(sessionFile, { modelPricing: deps.modelPricing, toolNameMap: deps.toolNameMap });
 		}
+		if (sessionFile.startsWith('windsurf://')) {
+			return analysis;
+		}
 
 		const fileContent = preloadedContent ?? await fs.promises.readFile(sessionFile, 'utf8');
 		const isJsonl = sessionFile.endsWith('.jsonl') || isJsonlContent(fileContent);
@@ -1723,6 +1839,7 @@ export async function analyzeSessionUsage(deps: UsageAnalysisDeps, sessionFile: 
 			const lines = fileContent.trim().split('\n').filter((l: string) => l.trim());
 			if (_asuIsDeltaBased(lines)) {
 				_asuReconstructAndProcessDeltaState(deps, lines, analysis);
+				// Also track enhanced metrics (edit scope / LOC data) from the reconstructed requests
 				await trackEnhancedMetrics(deps, sessionFile, analysis, fileContent);
 				return analysis;
 			}
@@ -2046,6 +2163,9 @@ export async function getModelUsageFromSession(deps: Pick<UsageAnalysisDeps, 'wa
 	if (deps.ecosystems) {
 		const eco = deps.ecosystems.find(e => e.handles(sessionFile));
 		if (eco) { return eco.getModelUsage(sessionFile); }
+	}
+	if (sessionFile.startsWith('windsurf://')) {
+		return modelUsage;
 	}
 	try {
 		const fileContent = preloadedContent ?? await fs.promises.readFile(sessionFile, 'utf8');

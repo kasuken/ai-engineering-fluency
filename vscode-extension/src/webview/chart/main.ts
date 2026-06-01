@@ -70,6 +70,7 @@ type InitialChartData = {
 	initialView?: 'total' | 'model' | 'editor' | 'repository' | 'cost';
 	initialMetric?: 'tokens' | 'output' | 'cost';
 	initialSplit?: 'total' | 'model' | 'editor' | 'repository' | 'language';
+	monthlyBudget?: number;
 	periods?: {
 		day: ChartPeriodData;
 		week: ChartPeriodData;
@@ -300,8 +301,10 @@ function renderLayout(data: InitialChartData): void {
 	chartSectionHeader.append(el('h3', '', '📊 Charts'), buildPeriodToggles(data.periodsReady !== false));
 	const canvasWrap = el('div', 'canvas-wrap');
 	const canvas = document.createElement('canvas'); canvas.id = 'token-chart'; canvasWrap.append(canvas);
+	const heatmapContainer = el('div', 'heatmap-container hidden');
+	heatmapContainer.id = 'heatmap-container';
 	const chartShell = el('div', 'chart-shell');
-	chartShell.append(buildChartControls(data), canvasWrap);
+	chartShell.append(buildChartControls(data), canvasWrap, heatmapContainer);
 	const chartSection = el('div', 'section');
 	chartSection.append(chartSectionHeader, chartShell);
 	const footer = el('div', 'footer',
@@ -478,6 +481,7 @@ async function setupChart(canvas: HTMLCanvasElement, data: InitialChartData): Pr
 	pendingMetric = null;
 	pendingSplit = null;
 	pendingPeriod = null;
+	refreshHeatmapView(data);
 }
 
 async function switchPeriod(period: ChartPeriod, data: InitialChartData): Promise<void> {
@@ -489,6 +493,8 @@ async function switchPeriod(period: ChartPeriod, data: InitialChartData): Promis
 	saveWebviewState();
 	setActivePeriod(period);
 	updateSummaryCards(data);
+	refreshHeatmapView(data);
+	if (isHeatmapView()) { return; }
 	if (!chart) {
 		return;
 	}
@@ -530,15 +536,7 @@ async function switchMetric(metric: typeof currentMetric, data: InitialChartData
 		rollingBtnEl.classList.toggle('active', rollingApplicable && currentDisplayMode === 'rolling');
 	}
 	updateSummaryCards(data);
-	if (!chart) { return; }
-	const canvas = chart.canvas as HTMLCanvasElement | null;
-	chart.destroy();
-	if (!canvas) { return; }
-	const ctx = canvas.getContext('2d');
-	if (!ctx) { return; }
-	await loadChartModule();
-	if (!Chart) { return; }
-	chart = new Chart(ctx, createConfig(data));
+	await reinitChart(data);
 }
 
 function isSplitSupported(metric: typeof currentMetric, split: typeof currentSplit): boolean {
@@ -548,7 +546,22 @@ function isSplitSupported(metric: typeof currentMetric, split: typeof currentSpl
 }
 
 async function reinitChart(data: InitialChartData): Promise<void> {
-	if (!chart) { return; }
+	refreshHeatmapView(data);
+	if (isHeatmapView()) {
+		if (chart) { chart.destroy(); chart = undefined; }
+		return;
+	}
+	if (!chart) {
+		// May have come from heatmap view with no active chart — get canvas from DOM
+		const canvasEl = document.getElementById('token-chart') as HTMLCanvasElement | null;
+		if (!canvasEl) { return; }
+		await loadChartModule();
+		if (!Chart) { return; }
+		const ctx = canvasEl.getContext('2d');
+		if (!ctx) { return; }
+		chart = new Chart(ctx, createConfig(data));
+		return;
+	}
 	const canvas = chart.canvas as HTMLCanvasElement | null;
 	chart.destroy();
 	if (!canvas) { return; }
@@ -693,7 +706,47 @@ function buildTotalViewConfig(period: ChartPeriodData, baseOptions: ReturnType<t
 	};
 }
 
-function buildCostViewConfig(period: ChartPeriodData, baseOptions: ReturnType<typeof buildBaseOptions>, c: ChartColors, data: InitialChartData): ChartConfig {
+function buildBudgetLinePlugin(monthlyBudget: number) {
+	return {
+		id: 'budgetLine',
+		afterDraw(ch: any) {
+			const { ctx, chartArea, scales: { y } } = ch;
+			if (!y || !chartArea) { return; }
+			const yPos = y.getPixelForValue(monthlyBudget);
+			if (yPos < chartArea.top || yPos > chartArea.bottom) { return; }
+			ctx.save();
+			ctx.strokeStyle = 'rgba(255, 80, 80, 0.9)';
+			ctx.lineWidth = 2;
+			ctx.setLineDash([6, 4]);
+			ctx.beginPath();
+			ctx.moveTo(chartArea.left, yPos);
+			ctx.lineTo(chartArea.right, yPos);
+			ctx.stroke();
+			ctx.setLineDash([]);
+			ctx.fillStyle = 'rgba(255, 80, 80, 0.9)';
+			ctx.font = 'bold 11px sans-serif';
+			ctx.textAlign = 'left';
+			ctx.fillText(`Budget: $${monthlyBudget.toFixed(2)}`, chartArea.left + 6, yPos - 5);
+			ctx.restore();
+		},
+	};
+}
+
+function buildCostDataset(isRolling: boolean, rollingLabel: string, costData: number[]) {
+	return {
+		label: isRolling ? `${rollingLabel} (UBB)` : 'Est. Cost (UBB)',
+		data: costData,
+		backgroundColor: isRolling ? 'rgba(34, 197, 94, 0.15)' : 'rgba(34, 197, 94, 0.6)',
+		borderColor: 'rgba(34, 197, 94, 1)',
+		borderWidth: isRolling ? 2 : 1,
+		type: isRolling ? 'line' as const : undefined,
+		tension: isRolling ? 0.4 : undefined,
+		fill: isRolling ? false : undefined,
+		yAxisID: 'y' as const,
+	};
+}
+
+function buildCostViewConfig(period: ChartPeriodData, baseOptions: ReturnType<typeof buildBaseOptions>, c: ChartColors, monthlyBudget = 0): ChartConfig {
 	const isRolling = currentDisplayMode === 'rolling';
 	const costData = isRolling ? computeRollingAverage(period.costData, ROLLING_WINDOW[currentPeriod]) : period.costData;
 	const lastIdx = period.costData.length - 1;
@@ -702,17 +755,16 @@ function buildCostViewConfig(period: ChartPeriodData, baseOptions: ReturnType<ty
 	const budget = data.monthlyCostBudget ?? 0;
 	const budgetDs = budget > 0 && currentPeriod === 'month' ? [{ label: `Monthly Budget ($${budget.toFixed(2)})`, data: period.labels.map(() => budget), type: 'line' as const, borderColor: 'rgba(255, 165, 0, 0.9)', borderWidth: 2, borderDash: [6, 4], pointRadius: 0, fill: false, yAxisID: 'y' }] : [];
 	const rollingLabel = getRollingLabel();
+	const showBudgetLine = currentPeriod === 'month' && monthlyBudget > 0;
+	const budgetLinePlugin = showBudgetLine ? buildBudgetLinePlugin(monthlyBudget) : null;
 	return {
 		type: 'bar' as const,
-		data: { labels: period.labels, datasets: [
-			{ label: isRolling ? `${rollingLabel} (UBB)` : 'Est. Cost (UBB)', data: costData, backgroundColor: isRolling ? 'rgba(34, 197, 94, 0.15)' : 'rgba(34, 197, 94, 0.6)', borderColor: 'rgba(34, 197, 94, 1)', borderWidth: isRolling ? 2 : 1, type: isRolling ? 'line' as const : undefined, tension: isRolling ? 0.4 : undefined, fill: isRolling ? false : undefined, yAxisID: 'y' },
-			...projDs,
-			...budgetDs
-		] },
+		data: { labels: period.labels, datasets: [buildCostDataset(isRolling, rollingLabel, costData), ...projDs] },
 		options: { ...baseOptions, plugins: { ...baseOptions.plugins, tooltip: { ...baseOptions.plugins.tooltip, callbacks: { label: (ctx: any) => ` $${Number(ctx.parsed.y).toFixed(4)}` } } },
-			scales: { x: { stacked: true, grid: { color: c.gridColor }, ticks: { color: c.textColor, font: { size: 11 } } }, y: { stacked: true, type: 'linear' as const, display: true, position: 'left' as const, grid: { color: c.gridColor }, ticks: { color: c.textColor, font: { size: 11 }, callback: (value: any) => `$${Number(value).toFixed(2)}` }, title: { display: true, text: 'Estimated Cost (UBB)', color: c.textColor, font: { size: 12, weight: 'bold' as const } } } }
-		}
-	};
+			scales: { x: { stacked: true, grid: { color: c.gridColor }, ticks: { color: c.textColor, font: { size: 11 } } }, y: { stacked: true, type: 'linear' as const, display: true, position: 'left' as const, grid: { color: c.gridColor }, ticks: { color: c.textColor, font: { size: 11 }, callback: (value: any) => `$${Number(value).toFixed(2)}` }, title: { display: true, text: 'Estimated Cost (UBB)', color: c.textColor, font: { size: 12, weight: 'bold' as const } }, ...(showBudgetLine ? { suggestedMax: monthlyBudget * 1.05 } : {}) } }
+		},
+		...(budgetLinePlugin ? { plugins: [budgetLinePlugin] } : {}),
+	} as ChartConfig;
 }
 
 function buildOutputViewConfig(view: string, period: ChartPeriodData, baseOptions: ReturnType<typeof buildBaseOptions>, c: ChartColors): ChartConfig {
@@ -726,6 +778,103 @@ function buildOutputViewConfig(view: string, period: ChartPeriodData, baseOption
 			scales: { x: { stacked, grid: { color: c.gridColor }, ticks: { color: c.textColor, font: { size: 11 } } }, y: { stacked, grid: { color: c.gridColor }, ticks: { color: c.textColor, font: { size: 11 }, callback: (value: any) => Math.abs(Number(value)).toLocaleString() }, title: { display: true, text: 'Lines of Code', color: c.textColor, font: { size: 12, weight: 'bold' } } } }
 		}
 	};
+}
+
+function getHeatmapColor(value: number, maxValue: number): string {
+	if (maxValue === 0 || value === 0) { return 'rgba(128, 128, 128, 0.06)'; }
+	// Log scale, dark forest green → bright green accent (#22c55e)
+	const f = Math.log1p(value) / Math.log1p(maxValue);
+	const r = Math.round(5 + (34 - 5) * f);
+	const g = Math.round(60 + (197 - 60) * f);
+	const b = Math.round(30 + (94 - 30) * f);
+	const a = (0.55 + 0.45 * f).toFixed(2);
+	return `rgba(${r}, ${g}, ${b}, ${a})`;
+}
+
+const HEATMAP_TOP_LANGUAGES = 10;
+
+function shortenDateLabel(label: string): string {
+	const m = /^\d{4}-(\d{2})-(\d{2})$/.exec(label);
+	if (m) { return `${parseInt(m[1])}/${parseInt(m[2])}`; }
+	return label;
+}
+
+function buildLanguageHeatmap(period: ChartPeriodData): HTMLElement {
+	const datasets = (period.languageDatasets ?? []) as ModelDataset[];
+	const withTotals = datasets
+		.map(ds => ({ label: ds.label, data: ds.data as number[], total: (ds.data as number[]).reduce((a, b) => a + b, 0) }))
+		.filter(ds => ds.total > 0)
+		.sort((a, b) => b.total - a.total);
+	const topLangs = withTotals.slice(0, HEATMAP_TOP_LANGUAGES);
+	const otherLangs = withTotals.slice(HEATMAP_TOP_LANGUAGES);
+	if (otherLangs.length > 0) {
+		const otherData = otherLangs[0].data.map((_, i) => otherLangs.reduce((sum, ds) => sum + ds.data[i], 0));
+		const otherTotal = otherData.reduce((a, b) => a + b, 0);
+		if (otherTotal > 0) { topLangs.push({ label: 'Other', data: otherData, total: otherTotal }); }
+	}
+	const labels = period.labels;
+	const shortLabels = labels.map(shortenDateLabel);
+	const wrap = el('div', 'heatmap-wrap');
+	if (!topLangs.length) {
+		wrap.append(el('div', 'heatmap-empty', 'No language data for this period.'));
+		return wrap;
+	}
+	const maxValue = Math.max(...topLangs.flatMap(ds => ds.data));
+	const table = document.createElement('table');
+	table.className = 'heatmap-table';
+	const thead = document.createElement('thead');
+	const headerRow = document.createElement('tr');
+	const cornerTh = document.createElement('th');
+	cornerTh.className = 'heatmap-lang-header';
+	headerRow.append(cornerTh);
+	labels.forEach((label, i) => {
+		const th = document.createElement('th');
+		th.className = 'heatmap-date-header';
+		const span = document.createElement('span');
+		span.textContent = shortLabels[i];
+		th.title = label;
+		th.append(span);
+		headerRow.append(th);
+	});
+	thead.append(headerRow);
+	table.append(thead);
+	const tbody = document.createElement('tbody');
+	topLangs.forEach(ds => {
+		const tr = document.createElement('tr');
+		const langTd = document.createElement('td');
+		langTd.className = 'heatmap-lang-label';
+		langTd.textContent = ds.label;
+		tr.append(langTd);
+		ds.data.forEach((value, i) => {
+			const td = document.createElement('td');
+			td.className = 'heatmap-data-cell';
+			td.style.backgroundColor = getHeatmapColor(value, maxValue);
+			if (value > 0) {
+				td.title = `${ds.label} · ${labels[i]}: ${value.toLocaleString()} lines`;
+			}
+			tr.append(td);
+		});
+		tbody.append(tr);
+	});
+	table.append(tbody);
+	wrap.append(table);
+	return wrap;
+}
+
+function isHeatmapView(): boolean {
+	return currentMetric === 'output' && currentSplit === 'language';
+}
+
+function refreshHeatmapView(data: InitialChartData): void {
+	const canvasWrap = document.querySelector('.canvas-wrap') as HTMLElement | null;
+	const heatmapContainer = document.getElementById('heatmap-container');
+	if (!canvasWrap || !heatmapContainer) { return; }
+	const show = isHeatmapView();
+	canvasWrap.classList.toggle('hidden', show);
+	heatmapContainer.classList.toggle('hidden', !show);
+	if (show) {
+		heatmapContainer.replaceChildren(buildLanguageHeatmap(getActivePeriodData(data)));
+	}
 }
 
 function buildStackedViewConfig(view: string, period: ChartPeriodData, baseOptions: ReturnType<typeof buildBaseOptions>, c: ChartColors): ChartConfig {
@@ -756,7 +905,7 @@ function createConfig(data: InitialChartData): ChartConfig {
 	const c = getChartColors();
 	const baseOptions = buildBaseOptions(c);
 	if (view === 'total') { return buildTotalViewConfig(period, baseOptions, c); }
-	if (view === 'cost') { return buildCostViewConfig(period, baseOptions, c, data); }
+	if (view === 'cost') { return buildCostViewConfig(period, baseOptions, c, data.monthlyBudget ?? 0); }
 	if (view.startsWith('output-')) { return buildOutputViewConfig(view, period, baseOptions, c); }
 	return buildStackedViewConfig(view, period, baseOptions, c);
 }

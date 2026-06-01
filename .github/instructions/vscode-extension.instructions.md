@@ -41,6 +41,11 @@ The entire extension's logic is contained within the `CopilotTokenTracker` class
   1. **Status Bar**: A `vscode.StatusBarItem` (`statusBarItem`) shows a brief summary. Its tooltip provides more detail.
   2. **Details Panel**: The `aiEngineeringFluency.showDetails` command opens a `vscode.WebviewPanel`. The content for this panel is generated dynamically as an HTML string by the `getDetailsHtml` method.
 
+- **Multi-window cache coordination** (`cacheManager.ts` + `_runUpdateTokenStats`): When several VS Code/Codium windows of the same edition are open, only one performs the heavy discover+parse pass per refresh; the others reuse its results instead of re-parsing every session file (which would multiply CPU usage by the number of windows).
+  - **Why globalState isn't enough**: `context.globalState` is loaded into memory once at activation and is **not** propagated live between windows. So cross-window sharing goes through a **shared on-disk snapshot** file `cache_<id>.snapshot.json` in `globalStorageUri` (a path shared per edition), written atomically (temp file + `rename`) with a versioned envelope (`schemaVersion`, `cacheVersion`). `readSharedSnapshot` ignores snapshots with a mismatched version or a corrupt/partial body.
+  - **Leader election**: Before parsing, a window calls `acquireRefreshLock()` (a `refresh_<id>.lock` file using the same atomic O_EXCL + PID/timestamp staleness logic as the cache-save lock). The **leader** (lock acquired) parses everything, publishes the snapshot, and renews the lock via a 30s heartbeat (`renewRefreshLock`) so a long parse isn't mistaken for stale. **Followers** (lock held by another window) warm their in-memory cache from the snapshot (`loadSharedSnapshotIfChanged`) and parse at most `FOLLOWER_MISS_BUDGET` newly-changed files (the "hybrid" freshness policy), then `scheduleFollowerResync` reloads the snapshot a few times to pick up the leader's results. A lone window always wins the election, so single-window behaviour is unchanged.
+  - **No-regression invariant**: `writeSharedSnapshot` merges with the existing on-disk snapshot keeping the newer entry by `mtime`, so a window with a partial/stale cache can never drop entries another window published. Only the leader writes the snapshot during a refresh; the merge keeps dispose-time saves safe too.
+
 ## Developer Workflow
 
 - **Setup**: Run `npm install` inside `vscode-extension/` to install dependencies.
@@ -49,6 +54,8 @@ The entire extension's logic is contained within the `CopilotTokenTracker` class
 - **Testing/Debugging**: Press `F5` in VS Code to open the Extension Development Host. This will launch a new VS Code window with the extension running. `console.log` statements from `vscode-extension/src/extension.ts` will appear in the Developer Tools console of this new window (Help > Toggle Developer Tools).
 
 **Important build guidance:** After making changes to source code or related files (TypeScript, JavaScript, JSON, or other code files used by the extension), always run both `npm ci` and then `npm run compile` from `vscode-extension/` to validate that the project still builds and lints cleanly before opening a pull request or releasing. Also run the unit tests with `npm run test:node` to catch any regressions. You do not need to run the full compile step for documentation-only changes (Markdown files), but you should run it after any edits that touch source, configuration, or JSON data files.
+
+**Zero warnings policy:** `npm run compile` must report `0 problems (0 errors, 0 warnings)`. ESLint warnings count as failures — do not leave new warnings in the codebase. If `compile` outputs `✖ N problems`, fix all of them before committing.
 
 **Always use `npm ci` (not `npm install`) when validating a build** — `npm ci` installs from the lockfile exactly, mirroring what CI does, and will catch any dependency drift. Use `npm install` only when intentionally adding or updating packages.
 

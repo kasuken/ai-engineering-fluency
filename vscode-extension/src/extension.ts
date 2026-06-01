@@ -53,7 +53,18 @@ import type {
   WorkspaceCustomizationSummary,
   AgentSessionsResult,
   TokenEstimator,
+  SessionRelationRef,
+  EvaluatedInsight,
+  InsightStateBag,
 } from './types';
+
+// --- Insights engine ---
+import {
+  evaluateInsights as _evaluateInsights,
+  mergeInsightStates as _mergeInsightStates,
+  countNewInsights as _countNewInsights,
+  isToastAllowed as _isToastAllowed,
+} from './insightsEngine';
 
 // --- Ecosystem adapter types & helpers ---
 import type { OpenCodeDataAccess } from './opencode';
@@ -65,11 +76,14 @@ import type { ClaudeDesktopCoworkDataAccess } from './claudedesktop';
 import type { MistralVibeDataAccess } from './mistralvibe';
 import type { GeminiCliDataAccess } from './geminicli';
 import type { IEcosystemAdapter } from './ecosystemAdapter';
+import { WindsurfDataAccess } from './windsurf';
 import { getEcosystemDisplayName } from './ecosystemAdapter';
 import { buildAdapterRegistry, createDataAccessInstances } from './adapters';
+import { CopilotAppDataAccess } from './copilotAppData';
 import { getVSCodeUserPaths } from './adapters/copilotChatAdapter';
 import { isJetBrainsSessionPath } from './adapters/adapterPredicates';
 import { detectJetBrainsModelHintFromContent } from './jetbrains';
+import { createWakeupGate } from './utils/promises';
 
 // --- Session parsing & token estimation ---
 import {
@@ -182,6 +196,7 @@ import { ConfirmationMessages } from './backend/ui/messages';
 // --- Utilities ---
 import { getNonce, buildCspMeta } from './utils/webviewUtils';
 import { isGuidMcpTool } from './utils/toolUtils';
+import { toLocalDayKey } from './utils/dayKeys';
 import { determineOnboardingAction } from './onboarding';
 
 type LocalViewRegressionProbeResult = {
@@ -285,14 +300,18 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private claudeDesktopCowork!: ClaudeDesktopCoworkDataAccess;
 	private mistralVibe!: MistralVibeDataAccess;
 	private geminiCli!: GeminiCliDataAccess;
+	public windsurf!: WindsurfDataAccess;
 	private ecosystems!: IEcosystemAdapter[];
 	private cacheManager!: CacheManager;
+	private readonly copilotAppData = new CopilotAppDataAccess();
 
 	private get usageAnalysisDeps(): UsageAnalysisDeps {
 		return { warn: (m: string) => this.warn(m), tokenEstimators: this.tokenEstimators, modelPricing: this.modelPricing, toolNameMap: this.toolNameMap, ecosystems: this.ecosystems };
 	}
 	public sessionDiscovery!: SessionDiscovery;
 	private statusBarItem!: vscode.StatusBarItem;
+	/** Dedicated status bar item for insights — shown only when new insights exist. */
+	private insightsStatusBarItem!: vscode.StatusBarItem;
 	private readonly extensionUri: vscode.Uri;
 	private readonly context: vscode.ExtensionContext;
 	private _devBranch: string | undefined;
@@ -352,6 +371,18 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private lastChartSplit: string = 'total';
 	private lastUsageAnalysisStats: UsageAnalysisStats | undefined;
 	private lastDashboardData: any | undefined;
+	/** Insight engine: persisted state for all surfaced insights. */
+	private _insightStateBag: InsightStateBag = {};
+	/** ISO timestamp of the last time an insight toast was shown. */
+	private _lastInsightNudgeAt: string | null = null;
+	/** Count of insights currently in 'new' status (drives the status-bar badge). */
+	private _newInsightCount = 0;
+	/** The last non-badge status bar text (so badge can be appended/removed). */
+	private _statusBarBaseText = '';
+	/** Cached top new insight title for tooltip display. */
+	private _topInsightTitle: string | null = null;
+	/** Cached last detailed stats for tooltip rebuilding. */
+	private _lastDetailedStats: DetailedStats | undefined;
 	private tokenEstimators: Record<string, TokenEstimator> = tokenEstimatorsData.estimators;
 	private co2Per1kTokens = 0.2; // gCO2e per 1000 tokens, a rough estimate
 	private co2AbsorptionPerTreePerYear = 21000; // grams of CO2 per tree per year
@@ -368,8 +399,27 @@ class CopilotTokenTracker implements vscode.Disposable {
 	// In-flight updateTokenStats promise — coalesces concurrent callers onto the same run
 	private _updateTokenStatsInFlight: Promise<DetailedStats | undefined> | undefined;
 
+	// --- Multi-window refresh coordination ---
+	// When several VS Code/Codium windows are open, only the window that holds the
+	// refresh leader lock performs the heavy discover+parse pass and publishes a
+	// shared snapshot. Follower windows warm their cache from that snapshot and skip
+	// parsing, except for a small budget of newly-changed files so the actively-used
+	// window still shows fresh data (the "hybrid" freshness policy).
+	private static readonly FOLLOWER_MISS_BUDGET = 25;
+	// Bounded retry chain a follower uses to pick up the leader's snapshot when it
+	// started before any snapshot existed (cold simultaneous start).
+	private static readonly FOLLOWER_RESYNC_MAX_RETRIES = 4;
+	private static readonly FOLLOWER_RESYNC_DELAY_MS = 15 * 1000;
+	private _followerResyncTimer: NodeJS.Timeout | undefined;
+	private _refreshHeartbeat: NodeJS.Timeout | undefined;
+
 	// Flag to track if details panel is currently showing the loading screen
 	private _detailsPanelIsLoading = false;
+
+	// Editor list captured during the last (or current) log analysis, used to render the loading tooltip SVG
+	private _loadingEditors: { icon: string; name: string }[] = [];
+	// Previous progress percentage used to animate the progress bar smoothly between tooltip updates
+	private _prevLoadingPercentage = 0;
 
 	// Cache mapping workspaceStorageId -> resolved workspace folder path (or undefined if not resolvable)
 	private _workspaceIdToFolderCache: Map<string, string | undefined> = new Map();
@@ -446,6 +496,16 @@ class CopilotTokenTracker implements vscode.Disposable {
 	public async statSessionFile(sessionFile: string): Promise<import('fs').Stats> {
 		const eco = this.findEcosystem(sessionFile);
 		if (eco) { return eco.stat(sessionFile); }
+		if (this.windsurf.isWindsurfSessionFile(sessionFile)) {
+			const session = await this.windsurf.resolveSession(sessionFile);
+			if (session) {
+				const baseStats = await fs.promises.stat(__filename);
+				Object.defineProperty(baseStats, 'mtime', { value: new Date(session.modified), writable: false });
+				Object.defineProperty(baseStats, 'size', { value: session.size, writable: false });
+				return baseStats;
+			}
+			return fs.promises.stat(__filename);
+		}
 		return fs.promises.stat(sessionFile);
 	}
 
@@ -874,6 +934,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this.sessionDiscovery.checkCopilotExtension();
 		this.initializeStatusBar();
 		this.setupConfigurationListener(context);
+		this.loadInsightState();
 		this.scheduleInitialUpdate();
 		this.updateInterval = setInterval(() => {
 			this.updateTokenStats(true, true);
@@ -890,6 +951,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this.claudeDesktopCowork = dataAccess.claudeDesktopCowork;
 		this.mistralVibe = dataAccess.mistralVibe;
 		this.geminiCli = dataAccess.geminiCli;
+		this.windsurf = new WindsurfDataAccess(extensionUri, (m) => this.log(m));
 		this.ecosystems = buildAdapterRegistry({
 			...dataAccess,
 			estimateTokens: (t, m) => this.estimateTokensFromText(t, m),
@@ -902,8 +964,14 @@ class CopilotTokenTracker implements vscode.Disposable {
 			warn: (m) => this.warn(m),
 			error: (m, e) => this.error(m, e),
 			ecosystems: this.ecosystems,
+			windsurf: this.windsurf,
 			sampleDataDirectoryOverride: () => this.localRegressionSampleDataDir,
 		});
+	}
+
+	private loadInsightState(): void {
+		this._insightStateBag = this.context.globalState.get<InsightStateBag>('insights.state', {});
+		this._lastInsightNudgeAt = this.context.globalState.get<string>('insights.lastNudgeAt', '') || null;
 	}
 
 	private initializeOutputChannel(context: vscode.ExtensionContext): void {
@@ -954,12 +1022,19 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private initializeStatusBar(): void {
-		this.statusBarItem = vscode.window.createStatusBarItem('ai-engineering-fluency', vscode.StatusBarAlignment.Right, 100);
+		this.statusBarItem = vscode.window.createStatusBarItem('ai-engineering-fluency', vscode.StatusBarAlignment.Right, 102);
 		this.statusBarItem.name = "AI Engineering Fluency";
 		this.setStatusBarText("$(loading~spin) AI Fluency: Loading...");
 		this.statusBarItem.tooltip = "AI Engineering Fluency — daily and 30-day token usage - Click to open details";
 		this.statusBarItem.command = 'aiEngineeringFluency.showDetails';
 		this.statusBarItem.show();
+
+		// Separate insights badge — hidden until there are new insights
+		this.insightsStatusBarItem = vscode.window.createStatusBarItem('ai-engineering-fluency-insights', vscode.StatusBarAlignment.Right, 101);
+		this.insightsStatusBarItem.name = "AI Engineering Fluency — Insights";
+		this.insightsStatusBarItem.command = 'aiEngineeringFluency.openInsightsTab';
+		// starts hidden; shown in refreshStatusBarInsightBadge when count > 0
+
 		this.log('Status bar item created and shown');
 	}
 
@@ -1154,7 +1229,31 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private setStatusBarText(text: string): void {
+		this._statusBarBaseText = text;
 		this.statusBarItem.text = this._devBranch ? `${text} [${this._devBranch}]` : text;
+	}
+
+	private refreshStatusBarInsightBadge(count: number, topInsightTitle?: string): void {
+		this._newInsightCount = count;
+		this._topInsightTitle = topInsightTitle ?? this._topInsightTitle;
+		// Main status bar: remove the 💡 badge — it now lives in its own item
+		this.setStatusBarText(this._statusBarBaseText);
+
+		if (count > 0) {
+			const label = count === 1 ? '1 insight' : `${count} insights`;
+			this.insightsStatusBarItem.text = `💡 ${label}`;
+			const tooltip = new vscode.MarkdownString();
+			tooltip.isTrusted = false;
+			tooltip.appendMarkdown(`**AI Fluency Insights** — ${label} waiting for you\n\n`);
+			if (this._topInsightTitle) {
+				tooltip.appendMarkdown(`${this._topInsightTitle}\n\n`);
+			}
+			tooltip.appendMarkdown('Click to open the Insights tab');
+			this.insightsStatusBarItem.tooltip = tooltip;
+			this.insightsStatusBarItem.show();
+		} else {
+			this.insightsStatusBarItem.hide();
+		}
 	}
 
 	private sendLoadingPanelMessage(msg: object): void {
@@ -1516,7 +1615,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private async _preloadSessionFiles(
 		cutoffMs: number,
 		progressCallback?: (completed: number, total: number) => void,
-		editorSet?: Set<string>
+		editorSet?: Set<string>,
+		missBudget?: { remaining: number }
 	): Promise<{ sessionFiles: string[]; preloaded: SessionFilePreload[] }> {
 		// --- Streaming pipeline: overlap discovery with parsing ---
 		// Discovery pushes file batches into a shared queue as each adapter completes.
@@ -1528,6 +1628,10 @@ class CopilotTokenTracker implements vscode.Disposable {
 		const preloaded: SessionFilePreload[] = [];
 		let processed = 0;
 		const CONCURRENCY = 20;
+
+		// Event-driven wakeups: workers that find the queue empty park on the gate
+		// instead of polling on a timer, avoiding pointless wake-ups while discovery runs.
+		const gate = createWakeupGate();
 
 		const analyzeStartMs = Date.now();
 
@@ -1543,9 +1647,11 @@ class CopilotTokenTracker implements vscode.Disposable {
 					}
 					queue.push(...batch);
 					totalDiscovered += batch.length;
+					gate.signal();
 				});
 			} finally {
 				discoveryDone = true;
+				gate.signal();
 			}
 		})();
 
@@ -1554,12 +1660,14 @@ class CopilotTokenTracker implements vscode.Disposable {
 			while (true) {
 				if (readIndex >= queue.length) {
 					if (discoveryDone) { break; }
-					// Briefly yield to allow discovery batches to arrive
-					await new Promise(r => setTimeout(r, 20));
+					// Park until discovery pushes more work or signals completion. The gate
+					// registers the waiter synchronously in this same tick, so no batch can
+					// slip in unobserved between the emptiness check and parking.
+					await gate.wait();
 					continue;
 				}
 				const sessionFile = queue[readIndex++];
-				try { await this.processPreloadQueueFile(sessionFile, cutoffMs, preloaded); } catch { /* skip files that fail to stat/parse */ }
+				try { await this.processPreloadQueueFile(sessionFile, cutoffMs, preloaded, missBudget); } catch { /* skip files that fail to stat/parse */ }
 				processed++;
 				if (progressCallback) { progressCallback(processed, totalDiscovered); }
 			}
@@ -1585,15 +1693,28 @@ class CopilotTokenTracker implements vscode.Disposable {
 		return { sessionFiles, preloaded };
 	}
 
-	private async processPreloadQueueFile(sessionFile: string, cutoffMs: number, preloaded: SessionFilePreload[]): Promise<void> {
+	private async processPreloadQueueFile(sessionFile: string, cutoffMs: number, preloaded: SessionFilePreload[], missBudget?: { remaining: number }): Promise<void> {
 		const fileStats = await this.statSessionFile(sessionFile);
 		const mtime = fileStats.mtime.getTime();
 		const fileSize = fileStats.size;
 		if (mtime < cutoffMs) { return; }
 		const cachedData = this.getCachedSessionData(sessionFile);
 		const wasCached = cachedData !== undefined && cachedData.mtime === mtime && cachedData.size === fileSize;
+		// Follower mode (missBudget defined): avoid the N-windows-parse-everything
+		// stampede. Serve cache hits freely, but only parse a bounded number of
+		// cache-miss files; skip the rest until the leader publishes a snapshot.
+		if (!wasCached && missBudget) {
+			if (missBudget.remaining <= 0) { return; }
+			missBudget.remaining--;
+		}
 		const sessionData = await this.getSessionFileDataCached(sessionFile, mtime, fileSize);
-		const details = sessionData.interactions > 0 ? await this.getSessionFileDetails(sessionFile, fileStats) : undefined;
+		// Avoid the expensive full getSessionFileDetails parse (which calls _reconstructJsonlStateAsync
+		// for delta-based .jsonl files) during the hot preloading loop. Use the detail cache when
+		// already populated (e.g. warm run), or fall back to a lightweight stub built from sessionData.
+		// The details panel fetches full details on demand; repository is not needed for stats.
+		const details = sessionData.interactions > 0
+			? ((await this.getSessionFileDetailsFromCache(sessionFile, fileStats)) ?? this.buildMinimalPreloadDetails(sessionFile, fileStats, sessionData))
+			: undefined;
 		preloaded.push({ sessionFile, mtime, fileSize, sessionData, wasCached, details } as SessionFilePreload);
 		if (!wasCached) {
 			// Yield after CPU-intensive cache-miss work to keep VS Code responsive
@@ -1601,75 +1722,206 @@ class CopilotTokenTracker implements vscode.Disposable {
 		}
 	}
 
+	/**
+	 * Build a lightweight SessionFileDetails stub from already-computed sessionData.
+	 * Used during preloading to avoid re-parsing files just to extract repository info.
+	 * The full parse (including repository) is deferred to the details panel on demand.
+	 */
+	private buildMinimalPreloadDetails(sessionFile: string, stat: import('fs').Stats, sessionData: SessionFileCache): SessionFileDetails {
+		const details: SessionFileDetails = {
+			file: sessionFile,
+			size: stat.size,
+			modified: stat.mtime.toISOString(),
+			interactions: sessionData.interactions,
+			tokens: sessionData.actualTokens || sessionData.tokens || 0,
+			contextReferences: sessionData.usageAnalysis?.contextReferences ?? this.createEmptyContextRefs(),
+			firstInteraction: sessionData.firstInteraction ?? null,
+			lastInteraction: sessionData.lastInteraction ?? null,
+			editorSource: this.detectEditorSource(sessionFile),
+			title: sessionData.title,
+			repository: sessionData.repository,
+		};
+		this.enrichDetailsWithEditorInfo(sessionFile, details);
+		return details;
+	}
+
 	private async _runUpdateTokenStats(silent: boolean): Promise<DetailedStats | undefined> {
+		// Warm the in-memory cache from any newer snapshot another window published,
+		// so most files become cache hits and parsing is skipped.
+		try { await this.cacheManager.loadSharedSnapshotIfChanged(); }
+		catch (err) { this.warn(`Failed to warm cache from shared snapshot: ${err}`); }
+
+		// Elect a refresh leader. The single window in a lone-window setup always
+		// wins, so its behaviour is unchanged. With multiple windows, only the leader
+		// performs the heavy parse and publishes the snapshot; followers parse at most
+		// a small budget of newly-changed files and reload the leader's snapshot.
+		let isLeader = false;
+		try { isLeader = await this.cacheManager.acquireRefreshLock(); }
+		catch (err) { this.warn(`Failed to acquire refresh lock, proceeding as leader: ${err}`); isLeader = true; }
+		this.startRefreshHeartbeat(isLeader);
+
 		try {
-			this.log('Updating token stats...');
-
-			const { last30DaysStartMs, lastMonthStartMs } = computeUtcDateRanges(new Date());
-			const fileLoadCutoffMs = Math.min(last30DaysStartMs, lastMonthStartMs);
-
-			this.sendLoadingPanelMessage({ command: 'loadingStep', step: 'discovering' });
-
-			// Streaming pipeline: discovery and parsing run concurrently.
-			// Workers start processing files as each adapter batch arrives.
-			const discoveredEditorSet = new Set<string>();
-			const progressCallback = this.buildProgressCallback(silent, () =>
-				[...discoveredEditorSet].map(name => ({ icon: this.getEditorIconForLoader(name), name }))
-			);
-			const { sessionFiles, preloaded } = await this._preloadSessionFiles(fileLoadCutoffMs, progressCallback, discoveredEditorSet);
-
-			this.sendLoadingPanelMessage({ command: 'loadingStep', step: 'computing' });
-
-			const { stats: detailedStats, dailyStats } = await this.calculateDetailedStats(undefined, preloaded);
-			this.lastDailyStats = dailyStats;
-			this.mergeIntoFullDailyStats(dailyStats);
-
-			this.updateStatusBarAndTooltip(detailedStats);
-
-			this.updateDetailsPanelIfOpen(detailedStats, silent);
-			this.updateChartPanelIfOpen(silent);
-			await this.updateAnalysisPanelIfOpen(silent, preloaded);
-			await this.computeAndUploadFluencyScore(silent, preloaded);
-			this.updateEnvironmentalPanelIfOpen(detailedStats, silent);
-
-			this.log(`Updated stats - Today: ${detailedStats.today.tokens}, Last 30 Days: ${detailedStats.last30Days.tokens}`);
-			this.lastDetailedStats = detailedStats;
-
-			void (async () => {
-				try { await this.saveCacheToStorage(); }
-				catch (err) { this.warn(`Failed to save cache: ${err}`); }
-			})();
-
-			if (!this.lastFullDailyStats && !this.chartPanel) {
-				void this.calculateDailyStats(365, sessionFiles);
-			}
-
-			return detailedStats;
+			return await this._runRefreshCore(silent, isLeader);
 		} catch (error) {
 			this.error('Error updating token stats:', error);
 			this.setStatusBarText('$(error) Token Error');
 			this.statusBarItem.tooltip = 'Error calculating token usage';
 			return undefined;
+		} finally {
+			this.stopRefreshHeartbeat();
+			if (isLeader) {
+				try { await this.cacheManager.releaseRefreshLock(); }
+				catch (err) { this.warn(`Failed to release refresh lock: ${err}`); }
+			}
 		}
+	}
+
+	/** Core discover → parse → compute → render → persist pass for one refresh. */
+	private async _runRefreshCore(silent: boolean, isLeader: boolean): Promise<DetailedStats | undefined> {
+		this.log(isLeader ? 'Updating token stats (leader)...' : 'Updating token stats (follower)...');
+
+		const { last30DaysStartMs, lastMonthStartMs } = computeUtcDateRanges(new Date());
+		const fileLoadCutoffMs = Math.min(last30DaysStartMs, lastMonthStartMs);
+
+		this._loadingEditors = [];
+		this.sendLoadingPanelMessage({ command: 'loadingStep', step: 'discovering' });
+		if (!silent && !this._detailsPanelIsLoading) { this.statusBarItem.tooltip = this.buildLoadingTooltipMarkdown('discovering'); }
+
+		// Streaming pipeline: discovery and parsing run concurrently.
+		// Workers start processing files as each adapter batch arrives.
+		const discoveredEditorSet = new Set<string>();
+		const progressCallback = this.buildProgressCallback(silent, () =>
+			[...discoveredEditorSet].map(name => ({ icon: this.getEditorIconForLoader(name), name }))
+		);
+		const missBudget = isLeader ? undefined : { remaining: CopilotTokenTracker.FOLLOWER_MISS_BUDGET };
+		const { sessionFiles, preloaded } = await this._preloadSessionFiles(fileLoadCutoffMs, progressCallback, discoveredEditorSet, missBudget);
+
+		this.sendLoadingPanelMessage({ command: 'loadingStep', step: 'computing' });
+		if (!silent && !this._detailsPanelIsLoading) { this.statusBarItem.tooltip = this.buildLoadingTooltipMarkdown('computing'); }
+
+		const { stats: detailedStats, dailyStats } = await this.calculateDetailedStats(undefined, preloaded);
+		this.lastDailyStats = dailyStats;
+		this.mergeIntoFullDailyStats(dailyStats);
+
+		this.updateStatusBarAndTooltip(detailedStats);
+
+		this.updateDetailsPanelIfOpen(detailedStats, silent);
+		this.updateChartPanelIfOpen(silent);
+		await this.updateAnalysisPanelIfOpen(silent, preloaded);
+		await this.computeAndUploadFluencyScore(silent, preloaded);
+		this.updateEnvironmentalPanelIfOpen(detailedStats, silent);
+		await this.evaluateAndSurfaceInsights();
+
+		this.log(`Updated stats - Today: ${detailedStats.today.tokens}, Last 30 Days: ${detailedStats.last30Days.tokens}`);
+		this.lastDetailedStats = detailedStats;
+
+		this.persistRefreshResult(isLeader);
+
+		if (!this.lastFullDailyStats && !this.chartPanel) {
+			void this.calculateDailyStats(365, sessionFiles);
+		}
+
+		return detailedStats;
+	}
+
+	/**
+	 * Persist results after a refresh. Only the leader publishes the shared
+	 * snapshot (so a follower's partial cache can never regress it); a follower
+	 * instead schedules a bounded resync to pick up the leader's snapshot.
+	 */
+	private persistRefreshResult(isLeader: boolean): void {
+		if (isLeader) {
+			void (async () => {
+				try { await this.saveCacheToStorage(); }
+				catch (err) { this.warn(`Failed to save cache: ${err}`); }
+			})();
+		} else {
+			this.scheduleFollowerResync();
+		}
+	}
+
+	/**
+	 * Start (leader) or clear (follower) the periodic heartbeat that renews the
+	 * refresh leader lock so a legitimately long parse is not treated as stale by
+	 * another window.
+	 */
+	private startRefreshHeartbeat(isLeader: boolean): void {
+		this.stopRefreshHeartbeat();
+		if (!isLeader) { return; }
+		this._refreshHeartbeat = setInterval(() => {
+			void this.cacheManager.renewRefreshLock();
+		}, 30 * 1000);
+	}
+
+	private stopRefreshHeartbeat(): void {
+		if (this._refreshHeartbeat) {
+			clearInterval(this._refreshHeartbeat);
+			this._refreshHeartbeat = undefined;
+		}
+	}
+
+	/**
+	 * Bounded retry chain for a follower window that started before a snapshot
+	 * existed. Periodically reloads the shared snapshot; once the leader publishes
+	 * fresher data, triggers a single recompute and stops. Capped to avoid looping.
+	 */
+	private scheduleFollowerResync(retriesLeft: number = CopilotTokenTracker.FOLLOWER_RESYNC_MAX_RETRIES): void {
+		if (this._followerResyncTimer) { return; }
+		if (retriesLeft <= 0) { return; }
+		this._followerResyncTimer = setTimeout(() => {
+			this._followerResyncTimer = undefined;
+			void (async () => {
+				let merged = 0;
+				try { merged = await this.cacheManager.loadSharedSnapshotIfChanged(); }
+				catch { /* best-effort */ }
+				if (merged > 0) {
+					// Leader published fresher data — recompute once with the warm cache.
+					void this.updateTokenStats(true, true);
+					return;
+				}
+				this.scheduleFollowerResync(retriesLeft - 1);
+			})();
+		}, CopilotTokenTracker.FOLLOWER_RESYNC_DELAY_MS);
+		if (typeof this._followerResyncTimer.unref === 'function') { this._followerResyncTimer.unref(); }
 	}
 
 	private buildProgressCallback(silent: boolean, getEditors?: () => { icon: string; name: string }[]): ((completed: number, total: number) => void) | undefined {
 		if (silent) { return undefined; }
 		let parsingStepNotified = false;
 		let lastProgressSentMs = 0;
+		let lastPercentage = -1;
 		return (completed: number, total: number) => {
 			const percentage = Math.round((completed / total) * 100);
-			this.setStatusBarText(`$(loading~spin) Analyzing Logs: ${percentage}%`);
+			// Only touch the status bar text when the rounded percentage actually changes,
+			// to avoid needless status-bar relayout on every callback.
+			if (percentage !== lastPercentage) {
+				lastPercentage = percentage;
+				this.setStatusBarText(`$(loading~spin) Analyzing Logs: ${percentage}%`);
+			}
 			if (!parsingStepNotified) {
 				parsingStepNotified = true;
 				const editors = getEditors?.() ?? [];
+				this._loadingEditors = editors;
 				const msg: Record<string, unknown> = { command: 'loadingStep', step: 'parsing', total, editors };
 				this.sendLoadingPanelMessage(msg);
+				// Set the hover tooltip exactly once when parsing starts, using the
+				// indeterminate (self-animating SMIL) variant. The tooltip is never
+				// reassigned during parsing, so the hover popup no longer flickers on
+				// every progress redraw — the previous per-500ms reassignment forced
+				// VS Code to rebuild the hover and reload the data-URI <img>. The live
+				// climbing percentage stays visible in the status bar text instead.
+				// Skip entirely when the loading panel is already open — it shows progress itself.
+				if (!this._detailsPanelIsLoading) {
+					this.statusBarItem.tooltip = this.buildLoadingTooltipMarkdown('parsing');
+				}
 			}
+			// The hover popup intentionally stays put during parsing; only the live
+			// webview panel (if open) receives incremental progress updates.
 			const now = Date.now();
 			if (now - lastProgressSentMs >= 500 || completed === total) {
 				lastProgressSentMs = now;
-				this.sendLoadingPanelMessage({ command: 'loadingProgress', completed, total, percentage });
+				const editors = getEditors?.() ?? [];
+				this.sendLoadingPanelMessage({ command: 'loadingProgress', completed, total, percentage, editors });
 			}
 		};
 	}
@@ -1694,12 +1946,148 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private updateStatusBarAndTooltip(detailedStats: DetailedStats): void {
+		this._lastDetailedStats = detailedStats;
 		if (detailedStats.today.sessions === 0 && detailedStats.last30Days.sessions === 0) {
 			this.setStatusBarText('$(symbol-numeric) No session data yet');
 		} else {
 			this.setStatusBarText(this.buildStatusBarText(detailedStats));
 		}
 		this.statusBarItem.tooltip = this.buildTooltipMarkdown(detailedStats);
+		this.updateStatusBarBackgroundColor(detailedStats);
+	}
+
+	private buildLoadingTooltipMarkdown(step: 'discovering' | 'parsing' | 'computing', percentage?: number): vscode.MarkdownString {
+		const svg = this.generateLoadingSvg(step, this._loadingEditors, percentage, this._prevLoadingPercentage);
+		this._prevLoadingPercentage = percentage ?? this._prevLoadingPercentage;
+		const tooltip = new vscode.MarkdownString(`![Loading](data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)})`);
+		tooltip.isTrusted = true;
+		tooltip.supportThemeIcons = false;
+		return tooltip;
+	}
+
+	// eslint-disable-next-line max-lines-per-function, complexity, sonarjs/cognitive-complexity
+	private generateLoadingSvg(
+		step: 'discovering' | 'parsing' | 'computing',
+		editors: { icon: string; name: string }[],
+		percentage?: number,
+		prevPercentage?: number
+	): string {
+		const W = 440, P = 12;
+		const CARD  = '#24273a', FG  = '#cdd6f4';
+		const MUT  = '#9399b2', ACC   = '#89b4fa', OK  = '#a6e3a1';
+		const BRD  = '#313244';
+		const FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";
+		const esc  = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+		const doneUntil  = step === 'discovering' ? 0 : step === 'parsing' ? 1 : 2;
+		const activeStep = step === 'discovering' ? 0 : step === 'parsing' ? 1 : 2;
+		const STEPS = [
+			'Discovering session files',
+			'Parsing session logs', 'Computing statistics', 'Ready!',
+		];
+		const pct     = step === 'computing' ? 96 : (percentage ?? 0);
+		const pctTxt  = step === 'computing' ? '96%' : (percentage !== undefined && percentage > 0 ? `${percentage}%` : '–');
+		const subtitle =
+			step === 'discovering' ? 'Discovering session files...' :
+			step === 'parsing'     ? 'Parsing session files...'     :
+			                         'Computing statistics...';
+		const pills   = editors.slice(0, 6);
+
+		// Layout — always reserve pills row so height never changes between phases
+		const BY    = P + 13;
+		const TY    = BY + 20;
+		const SBY   = TY + 16;
+		const PRY   = SBY + 16;
+		const PRH   = 5;
+		const PIL_Y = PRY + PRH + 8;
+		const SBX_Y = PIL_Y + 34;  // 28px pills height + 6px gap, always reserved
+		const SBX_H = P + STEPS.length * 22 + 8;
+		const H     = SBX_Y + SBX_H + P;
+		const PW    = W - P * 2;
+
+		const o: string[] = [];
+		o.push(`<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}">`);
+		o.push(`<defs>
+  <linearGradient id="pg" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0%" stop-color="${ACC}"/>
+    <stop offset="100%" stop-color="${OK}"/>
+  </linearGradient>
+  <clipPath id="pclip"><rect x="${P}" y="${PRY}" width="${PW}" height="${PRH}" rx="2.5"/></clipPath>
+</defs>`);
+
+		// Badge
+		o.push(`<text x="${P}" y="${BY}" font-family="${FONT}" font-size="10" font-weight="700" letter-spacing="1.5" fill="${ACC}">🤖 ANALYZING YOUR AI ACTIVITY</text>`);
+
+		// Title + large pct display
+		o.push(`<text x="${P}" y="${TY}" font-family="${FONT}" font-size="17" font-weight="700" fill="${FG}">Building Activity Index</text>`);
+		o.push(`<text x="${W - P}" y="${TY}" text-anchor="end" font-family="${FONT}" font-size="26" font-weight="800" fill="${FG}">${esc(pctTxt)}</text>`);
+
+		// Subtitle
+		o.push(`<text x="${P}" y="${SBY}" font-family="${FONT}" font-size="11" fill="${MUT}">${esc(subtitle)}</text>`);
+
+		// Progress track
+		o.push(`<rect x="${P}" y="${PRY}" width="${PW}" height="${PRH}" rx="2.5" fill="${BRD}"/>`);
+
+		// Progress fill — shimmer (indeterminate) during discovering/early parsing, animated fill when progress is known
+		if (step !== 'computing' && pct === 0) {
+			const sw = Math.round(PW * 0.25);
+			o.push(`<rect y="${PRY}" width="${sw}" height="${PRH}" rx="2.5" fill="url(#pg)" clip-path="url(#pclip)">
+  <animate attributeName="x" from="${P - Math.round(PW * 0.35)}" to="${P + Math.round(PW * 1.1)}" dur="1.8s" repeatCount="indefinite" calcMode="ease-in-out"/>
+</rect>`);
+		} else {
+			const fw = Math.max(8, Math.round((pct / 100) * PW));
+			const prevFw = Math.max(8, Math.round(((prevPercentage ?? 0) / 100) * PW));
+			if (prevFw < fw) {
+				// Animate from previous width to current width so the bar grows smoothly
+				o.push(`<rect x="${P}" y="${PRY}" height="${PRH}" rx="2.5" fill="url(#pg)" width="${prevFw}">
+  <animate attributeName="width" from="${prevFw}" to="${fw}" dur="0.5s" fill="freeze" calcMode="spline" keySplines="0.25 0.46 0.45 0.94" keyTimes="0;1"/>
+</rect>`);
+			} else {
+				o.push(`<rect x="${P}" y="${PRY}" width="${fw}" height="${PRH}" rx="2.5" fill="url(#pg)"/>`);
+			}
+		}
+
+		// Editor pills
+		if (pills.length > 0) {
+			let px = P;
+			for (const ed of pills) {
+				const rawLbl = `${ed.icon} ${ed.name}`;
+				const pw2    = Math.min(Math.max([...rawLbl].length * 7 + 16, 64), 130);
+				if (px + pw2 > W - P) { break; }
+				o.push(`<rect x="${px}" y="${PIL_Y}" width="${pw2}" height="22" rx="11" fill="${CARD}" stroke="${BRD}"/>`);
+				o.push(`<text x="${px + pw2 / 2}" y="${PIL_Y + 15}" text-anchor="middle" font-family="${FONT}" font-size="10.5" fill="${FG}">${esc(rawLbl)}</text>`);
+				px += Math.round(pw2) + 6;
+			}
+		}
+
+		// Steps box
+		o.push(`<rect x="${P}" y="${SBX_Y}" width="${PW}" height="${SBX_H}" rx="8" fill="${CARD}" stroke="${BRD}"/>`);
+
+		const ICX = P + P + 4;
+		const LBX = ICX + 18;
+		let sy = SBX_Y + P + 8;
+		for (let i = 0; i < STEPS.length; i++) {
+			const done   = i < doneUntil;
+			const active = i === activeStep;
+			const col    = done ? OK : active ? ACC : MUT;
+			const wt     = active ? '600' : '400';
+			const lbl    = STEPS[i];
+
+			if (done) {
+				o.push(`<text x="${ICX}" y="${sy}" text-anchor="middle" font-family="monospace" font-size="13" fill="${OK}">✓</text>`);
+			} else if (active) {
+				// Spinning ↻ via SMIL animateTransform around the glyph centre
+				const cy = sy - 4;
+				o.push(`<text x="${ICX}" y="${sy}" text-anchor="middle" font-family="monospace" font-size="13" fill="${ACC}">↻<animateTransform attributeName="transform" type="rotate" values="0 ${ICX} ${cy};360 ${ICX} ${cy}" dur="0.75s" repeatCount="indefinite" additive="sum"/></text>`);
+			} else {
+				o.push(`<text x="${ICX}" y="${sy}" text-anchor="middle" font-size="13" fill="${MUT}">○</text>`);
+			}
+			o.push(`<text x="${LBX}" y="${sy}" font-family="${FONT}" font-size="12" font-weight="${wt}" fill="${col}">${esc(lbl)}</text>`);
+			sy += 22;
+		}
+
+		o.push('</svg>');
+		return o.join('');
 	}
 
 	private buildTooltipMarkdown(detailedStats: DetailedStats): vscode.MarkdownString {
@@ -1727,8 +2115,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 		tooltip.appendMarkdown(`| Average interactions/session :      | ${detailedStats.last30Days.avgInteractionsPerSession} |\n`);
 		tooltip.appendMarkdown(`| Average tokens/session :            | ${detailedStats.last30Days.avgTokensPerSession.toLocaleString()} |\n`);
 		tooltip.appendMarkdown('\n---\n');
-		tooltip.appendMarkdown('*(UBB) = Copilot AI Credit rates — what Copilot will bill you under Usage Based Billing.*  \n');
-		tooltip.appendMarkdown('*Updates automatically every 5 minutes.*');
+		const budget = this.getEffectiveMonthlyBudget();
+		if (budget > 0) {
+			const monthCost = detailedStats.month.estimatedCostCopilot ?? detailedStats.month.estimatedCost ?? 0;
+			const pct = Math.round((monthCost / budget) * 100);
+			tooltip.appendMarkdown(`\n---\n💰 Monthly budget: $${budget.toFixed(2)} — this month: $${monthCost.toFixed(2)} (${pct}%)`);
+		}
 		return tooltip;
 	}
 
@@ -1753,7 +2145,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		if (!this.chartPanel || (!this.lastFullDailyStats && !this.lastDailyStats)) { return; }
 		const chartStats = this.lastFullDailyStats ?? this.lastDailyStats!;
 		if (silent) {
-			void this.chartPanel.webview.postMessage({ command: 'updateChartData', data: { ...this.buildChartData(chartStats), compactNumbers: this.getCompactNumbersSetting() } });
+			void this.chartPanel.webview.postMessage({ command: 'updateChartData', data: { ...this.buildChartData(chartStats), compactNumbers: this.getCompactNumbersSetting(), monthlyBudget: this.getEffectiveMonthlyBudget() } });
 		} else {
 			this.chartPanel.webview.html = this.getChartHtml(this.chartPanel.webview, chartStats);
 		}
@@ -1771,6 +2163,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 					missedPotential: analysisStats.missedPotential || [],
 					lastUpdated: analysisStats.lastUpdated.toISOString(), backendConfigured: this.isBackendConfigured(),
 					currentWorkspacePaths: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
+					insights: this.buildCurrentInsights(analysisStats),
 				},
 			});
 		} else {
@@ -1819,8 +2212,85 @@ class CopilotTokenTracker implements vscode.Disposable {
 		}
 	}
 
-	private async calculateTokenUsage(): Promise<Pick<TokenUsageStats, 'todayTokens' | 'monthTokens'>> {
-		const now = new Date();
+	private async evaluateAndSurfaceInsights(): Promise<void> {
+		const stats = this.lastUsageAnalysisStats;
+		if (!stats) { return; }
+
+		const insightsEnabled = vscode.workspace.getConfiguration('aiEngineeringFluency').get<boolean>('insights.enabled', true);
+		if (!insightsEnabled) { return; }
+
+		const cadenceDays = vscode.workspace.getConfiguration('aiEngineeringFluency').get<number>('insights.cadenceDays', 2);
+		const now = new Date().toISOString();
+
+		const ctx = {
+			today: stats.today,
+			last30Days: stats.last30Days,
+			missedPotential: stats.missedPotential ?? [],
+			customizationMatrix: stats.customizationMatrix,
+		};
+
+		const evaluated = _evaluateInsights(ctx, this._insightStateBag, cadenceDays, this._lastInsightNudgeAt);
+		_mergeInsightStates(evaluated, this._insightStateBag, now);
+
+		const newCount = _countNewInsights(this._insightStateBag, now);
+		const topNew = evaluated.find(i => i.status === 'new');
+		this.refreshStatusBarInsightBadge(newCount, topNew?.title);
+
+		await this.context.globalState.update('insights.state', this._insightStateBag);
+
+		// Push updated insights to the analysis panel if it is open
+		if (this.analysisPanel) {
+			void this.analysisPanel.webview.postMessage({
+				command: 'updateInsights',
+				insights: evaluated,
+			});
+		}
+
+		// Surface a toast for the highest-weight 'new' allowToast insight (rate-limited)
+		const toastsEnabled = vscode.workspace.getConfiguration('aiEngineeringFluency').get<boolean>('insights.toastsEnabled', true);
+		if (!toastsEnabled) { return; }
+		if (!_isToastAllowed(cadenceDays, this._lastInsightNudgeAt, now)) { return; }
+
+		const toastCandidate = evaluated.find(i => i.allowToast && i.status === 'new');
+		if (!toastCandidate) { return; }
+
+		this._lastInsightNudgeAt = now;
+		await this.context.globalState.update('insights.lastNudgeAt', now);
+
+		const view = 'Open Insights tab';
+		const dismiss = 'Dismiss';
+		const choice = await vscode.window.showInformationMessage(
+			`💡 ${toastCandidate.title}`,
+			view,
+			dismiss,
+		);
+		if (choice === view) {
+			await this.showUsageAnalysisOnInsightsTab();
+		} else if (choice === dismiss) {
+			this._insightStateBag[toastCandidate.id] = {
+				...(this._insightStateBag[toastCandidate.id] ?? { firstSurfacedAt: now }),
+				status: 'dismissed',
+				lastSurfacedAt: now,
+			};
+			await this.context.globalState.update('insights.state', this._insightStateBag);
+			this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+		}
+	}
+
+	/** Builds the current evaluated insight list from cached state + latest stats. */
+	private buildCurrentInsights(stats: UsageAnalysisStats): EvaluatedInsight[] {
+		const cadenceDays = vscode.workspace.getConfiguration('aiEngineeringFluency').get<number>('insights.cadenceDays', 2);
+		const ctx = {
+			today: stats.today,
+			last30Days: stats.last30Days,
+			missedPotential: stats.missedPotential ?? [],
+			customizationMatrix: stats.customizationMatrix,
+			todaySessions: stats.todaySessions,
+		};
+		return _evaluateInsights(ctx, this._insightStateBag, cadenceDays, this._lastInsightNudgeAt);
+	}
+
+	private async calculateTokenUsage(): Promise<Pick<TokenUsageStats, 'todayTokens' | 'monthTokens'>> {		const now = new Date();
 		const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 		const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
@@ -1911,7 +2381,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private async loadSessionDataStandalone(fileLoadCutoffMs: number, progressCallback?: (completed: number, total: number) => void): Promise<({ sessionFile: string; sessionData: SessionFileCache; details: SessionFileDetails; mtime: number; wasCached: boolean } | null | undefined)[]> {
-		this.cacheManager.clearExpiredCache();
+		void this.cacheManager.clearExpiredCache();
 		const sessionFiles = await this.sessionDiscovery.getCopilotSessionFiles();
 		this.log(`📊 Analyzing ${sessionFiles.length} session file(s)...`);
 		if (sessionFiles.length === 0) { this.warn('⚠️ No session files found - Have you used GitHub Copilot Chat yet?'); }
@@ -1931,16 +2401,16 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private fillMissingDailyStats(dailyStatsMap: Map<string, DailyTokenStats>, now: Date): DailyTokenStats[] {
-		const thirtyDaysAgo = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 30));
-		const todayDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+		const thirtyDaysAgo = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 30);
+		const todayKey = toLocalDayKey(now);
 		const existingDates = new Set(dailyStatsMap.keys());
 		const fillDate = new Date(thirtyDaysAgo);
-		while (fillDate <= todayDate) {
-			const dateKey = fillDate.toISOString().slice(0, 10);
+		while (toLocalDayKey(fillDate) <= todayKey) {
+			const dateKey = toLocalDayKey(fillDate);
 			if (!existingDates.has(dateKey)) {
 				dailyStatsMap.set(dateKey, { date: dateKey, tokens: 0, sessions: 0, interactions: 0, modelUsage: {}, editorUsage: {}, repositoryUsage: {} });
 			}
-			fillDate.setUTCDate(fillDate.getUTCDate() + 1);
+			fillDate.setDate(fillDate.getDate() + 1);
 		}
 		return Array.from(dailyStatsMap.values()).sort((a, b) => a.date.localeCompare(b.date));
 	}
@@ -2014,7 +2484,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private formatDateKey(date: Date): string {
-		return date.toISOString().slice(0, 10); // UTC-based YYYY-MM-DD key
+		return toLocalDayKey(date);
 	}
 
 	/**
@@ -2045,6 +2515,38 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 	private getStatusBarShowCostSetting(): StatusBarDisplaySetting {
 		return vscode.workspace.getConfiguration('aiEngineeringFluency.display.statusBar').get<StatusBarDisplaySetting>('showCost', 'none');
+	}
+
+	private getMonthlyBudgetSetting(): number {
+		return vscode.workspace.getConfiguration('aiEngineeringFluency.display.statusBar').get<number>('monthlyBudget', 0);
+	}
+
+	/** Returns the effective monthly budget: the explicitly configured value if set, otherwise falls back
+	 *  to the monthly AI credits included with the user's Copilot plan (derived from license info). */
+	private getEffectiveMonthlyBudget(): number {
+		const configured = this.getMonthlyBudgetSetting();
+		if (configured > 0) { return configured; }
+		return this._copilotPlanResolved?.monthlyAiCreditsUsd ?? 0;
+	}
+
+	/** Updates the status bar background color based on current-month spend vs. the configured budget.
+	 *  Uses VS Code's built-in theme colors: warning (yellow) at ≥75%, error (red/orange) at ≥90%.
+	 *  Clears the background when no budget is configured or spend is below 75%. */
+	private updateStatusBarBackgroundColor(stats: DetailedStats): void {
+		const budget = this.getEffectiveMonthlyBudget();
+		if (budget <= 0) {
+			this.statusBarItem.backgroundColor = undefined;
+			return;
+		}
+		const monthCost = stats.month.estimatedCostCopilot ?? stats.month.estimatedCost ?? 0;
+		const ratio = monthCost / budget;
+		if (ratio >= 0.90) {
+			this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+		} else if (ratio >= 0.75) {
+			this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+		} else {
+			this.statusBarItem.backgroundColor = undefined;
+		}
 	}
 
 	private buildTokenParts(show: StatusBarDisplaySetting, stats: DetailedStats): string[] {
@@ -2094,8 +2596,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private refreshOpenPanelsForSettingChange(): void {
 		const stats = this.lastDetailedStats;
 		if (!stats) { return; }
-		// Refresh status bar text (respects new display settings)
+		// Refresh status bar text and background color (respects new display settings)
 		this.setStatusBarText(this.buildStatusBarText(stats));
+		this.updateStatusBarBackgroundColor(stats);
 		if (this.detailsPanel) {
 			this.detailsPanel.webview.html = this.getDetailsHtml(this.detailsPanel.webview, stats);
 		}
@@ -2113,9 +2616,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 	 *  `lastFullDailyStats` and returns it. Zero-fill is handled per-period in buildChartData. */
 	private async calculateDailyStats(daysBack = 365, knownSessionFiles?: string[]): Promise<DailyTokenStats[]> {
 		const now = new Date();
-		const cutoffUtcStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - daysBack));
-		const cutoffUtcStartKey = cutoffUtcStart.toISOString().slice(0, 10);
-		const cutoffMs = cutoffUtcStart.getTime();
+		const cutoffStart = new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysBack);
+		const cutoffStartKey = toLocalDayKey(cutoffStart);
+		const cutoffMs = cutoffStart.getTime();
 		const dailyStatsMap = new Map<string, DailyTokenStats>();
 
 		try {
@@ -2138,9 +2641,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 					const editorType = this.getEditorTypeFromPath(sessionFile);
 					const repository = sessionData.repository || 'Unknown';
 					if (sessionData.dailyRollups && Object.keys(sessionData.dailyRollups).length > 0) {
-						this.accumulateDailyRollups(dailyStatsMap, sessionData, editorType, repository, cutoffUtcStartKey);
+						this.accumulateDailyRollups(dailyStatsMap, sessionData, editorType, repository, cutoffStartKey);
 					} else {
-						this.accumulateSessionFallback(dailyStatsMap, sessionData, mtime, editorType, repository, cutoffUtcStartKey);
+						this.accumulateSessionFallback(dailyStatsMap, sessionData, mtime, editorType, repository, cutoffStartKey);
 					}
 				} catch (fileError) {
 					this.warn(`Error processing session file ${sessionFile} for daily stats: ${fileError}`);
@@ -2175,7 +2678,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		const actualTokens = sessionData.actualTokens || 0;
 		const tokens = (actualTokens > 0 ? actualTokens : sessionData.tokens);
 		const lastActivity = sessionData.lastInteraction ? new Date(sessionData.lastInteraction) : new Date(mtime);
-		const dateKey = lastActivity.toISOString().slice(0, 10);
+		const dateKey = toLocalDayKey(lastActivity);
 		if (dateKey < cutoffUtcStartKey) { return; }
 		const dailyEntry = this.getOrCreateDailyEntry(dailyStatsMap, dateKey);
 		this.addUsageToDailyEntry(dailyEntry, tokens, sessionData.interactions, editorType, repository, sessionData.modelUsage);
@@ -2284,6 +2787,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 			this.aggregateUsageFileResults(usageResults, periods, wsMaps, todaySessionsList, totalFiles);
 			this.deduplicateWorkspacePaths(workspaceSessionCounts, workspaceInteractionCounts);
 			this.buildUsageCustomizationMatrix(workspaceSessionCounts, workspaceInteractionCounts, unresolvedWorkspaceIds, unresolvedWorkspaceInteractionCounts);
+			await this.enrichMultiAgentParentCount(usageResults, last30DaysStats, last30DaysUtcStartKey);
 		} catch (error) {
 			this.error('Error calculating usage analysis stats:', error);
 		}
@@ -2328,6 +2832,36 @@ class CopilotTokenTracker implements vscode.Disposable {
 			conversationPatterns: { multiTurnSessions: 0, singleTurnSessions: 0, avgTurnsPerSession: 0, maxTurnsInSession: 0 },
 			agentTypes: { editsAgent: 0, defaultAgent: 0, workspaceAgent: 0, other: 0 }
 		};
+	}
+
+	/**
+	 * Query data.db for multi-agent parent count and set it on the period.
+	 * A session counts as a "multi-agent parent" when it has 2+ direct child workspaces.
+	 * Errors are swallowed — this is optional enrichment only.
+	 */
+	private async enrichMultiAgentParentCount(
+		usageResults: ({ sessionFile: string; sessionData: SessionFileCache; mtime: number } | null | undefined)[],
+		last30DaysStats: UsageAnalysisPeriod,
+		last30DaysUtcStartKey: string,
+	): Promise<void> {
+		const uuids: string[] = [];
+		for (const r of usageResults) {
+			if (!r) { continue; }
+			const lastActivityKey = this.computeLastActivityKey(r.sessionData, r.mtime);
+			if (lastActivityKey < last30DaysUtcStartKey) { continue; }
+			const uuid = this.extractCopilotCliUuid(r.sessionFile);
+			if (uuid) { uuids.push(uuid); }
+		}
+		if (uuids.length === 0) { return; }
+		try {
+			const hierarchy = await this.copilotAppData.getSessionHierarchy(uuids);
+			let count = 0;
+			for (const uuid of uuids) {
+				const node = hierarchy.get(uuid);
+				if (node && node.totalChildCount >= 2) { count++; }
+			}
+			if (count > 0) { last30DaysStats.multiAgentParentSessions = count; }
+		} catch { /* optional enrichment — suppress */ }
 	}
 
 	private buildDefaultSessionAnalysis(): SessionUsageAnalysis {
@@ -2376,7 +2910,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 			return Object.keys(sessionData.dailyRollups).sort().pop()!;
 		}
 		const lastActivity = sessionData.lastInteraction ? new Date(sessionData.lastInteraction) : new Date(mtime);
-		return lastActivity.toISOString().slice(0, 10);
+		return toLocalDayKey(lastActivity);
 	}
 
 	private collectTodaySessionInfo(
@@ -2672,6 +3206,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 			const eco = this.findEcosystem(sessionFile);
 			if (eco) { return eco.countInteractions(sessionFile); }
 
+			// Handle Windsurf sessions - API-based with interaction count, file-based fallback
+			if (this.windsurf.isWindsurfSessionFile(sessionFile)) {
+				const session = await this.windsurf.resolveSession(sessionFile);
+				return session?.interactions ?? 0;
+			}
+
 			const fileContent = preloadedContent ?? await fs.promises.readFile(sessionFile, 'utf8');
 			if (this.isUuidPointerFile(fileContent)) { return 0; }
 
@@ -2785,12 +3325,35 @@ class CopilotTokenTracker implements vscode.Disposable {
 		return _extractRepositoryFromContentReferences(contentReferences);
 	}
 
+	/** Extract session metadata for a Windsurf virtual session. */
+	private async extractWindsurfSessionMetadata(sessionFile: string): Promise<{
+		title: string | undefined;
+		firstInteraction: string | null;
+		lastInteraction: string | null;
+		dailyInteractions: { [utcDayKey: string]: number };
+	}> {
+		const session = await this.windsurf.resolveSession(sessionFile);
+		const lastInteraction = session?.lastInteraction ?? null;
+		const dailyInteractions: { [utcDayKey: string]: number } = {};
+		if (lastInteraction) {
+			const d = new Date(lastInteraction);
+			if (!isNaN(d.getTime())) {
+				dailyInteractions[d.toISOString().slice(0, 10)] = Math.max(1, session?.interactions ?? 1);
+			}
+		}
+		return {
+			title: session?.title,
+			firstInteraction: session?.firstInteraction ?? null,
+			lastInteraction,
+			dailyInteractions,
+		};
+	}
 
 	private async extractSessionMetadata(sessionFile: string, preloadedContent?: string, preloadedParsedJson?: any): Promise<{
 		title: string | undefined;
 		firstInteraction: string | null;
 		lastInteraction: string | null;
-		dailyInteractions: { [utcDayKey: string]: number };
+		dailyInteractions: { [localDayKey: string]: number };
 	}> {
 		let title: string | undefined;
 		const timestamps: number[] = [];
@@ -2801,6 +3364,11 @@ class CopilotTokenTracker implements vscode.Disposable {
 			if (eco) {
 				const meta = await eco.getMeta(sessionFile);
 				return { ...meta, dailyInteractions: {} };
+			}
+
+			// Handle Windsurf virtual sessions
+			if (this.windsurf.isWindsurfSessionFile(sessionFile)) {
+				return this.extractWindsurfSessionMetadata(sessionFile);
 			}
 
 			const fileContent = preloadedContent ?? await fs.promises.readFile(sessionFile, 'utf8');
@@ -2826,9 +3394,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 			lastInteraction = new Date(timestamps[timestamps.length - 1]).toISOString();
 		}
 
-		const dailyInteractions: { [utcDayKey: string]: number } = {};
+		const dailyInteractions: { [localDayKey: string]: number } = {};
 		for (const ts of requestTimestamps) {
-			const dayKey = new Date(ts).toISOString().slice(0, 10);
+			const dayKey = toLocalDayKey(new Date(ts));
 			dailyInteractions[dayKey] = (dailyInteractions[dayKey] || 0) + 1;
 		}
 
@@ -2948,14 +3516,47 @@ class CopilotTokenTracker implements vscode.Disposable {
 		const debugLogTokens = await this.readTokensFromDebugLog(sessionFilePath);
 		const { resolvedActualTokens, finalCacheReadTokens, resolvedModelUsage } = this.resolveAndApplyDebugLog(tokenResult, debugLogTokens, modelUsage, dailyRollups, totalInteractions);
 
+		await this.applyWindsurfBreakdown(sessionFilePath, resolvedModelUsage, dailyRollups, usageAnalysis);
+
 		const sessionData = this.buildSessionDataObject(tokenResult, interactions, resolvedModelUsage, mtime, fileSize, usageAnalysis, sessionMeta, resolvedActualTokens, finalCacheReadTokens, debugLogTokens, dailyRollups);
 		this.setCachedSessionData(sessionFilePath, sessionData, fileSize);
 		return sessionData;
 	}
 
+	/**
+	 * Windsurf sessions are discovered via the gRPC API (not a re-parseable file), so the
+	 * data layer pre-builds a ModelUsage map and tool-call breakdown. Fold those into the
+	 * resolved model usage / daily rollups / analysis so Today's Sessions shows real
+	 * input/output/cached tokens, models and cost instead of zeros.
+	 */
+	private async applyWindsurfBreakdown(
+		sessionFilePath: string,
+		resolvedModelUsage: ModelUsage,
+		dailyRollups: { [utcDayKey: string]: DailyRollupEntry },
+		usageAnalysis: SessionUsageAnalysis
+	): Promise<void> {
+		if (!this.windsurf.isWindsurfSessionFile(sessionFilePath)) { return; }
+		const session = await this.windsurf.resolveSession(sessionFilePath);
+		if (!session) { return; }
+		if (session.modelUsage && Object.keys(session.modelUsage).length > 0) {
+			for (const [model, usage] of Object.entries(session.modelUsage)) {
+				resolvedModelUsage[model] = { ...usage };
+			}
+			// Windsurf has a single activity day; mirror the model usage onto its rollup
+			// so per-day model/cost aggregation matches the session totals.
+			for (const day of Object.keys(dailyRollups)) {
+				dailyRollups[day].modelUsage = session.modelUsage;
+				if (session.cachedTokens) { dailyRollups[day].cachedReadTokens = session.cachedTokens; }
+			}
+		}
+		if (session.toolCalls) { usageAnalysis.toolCalls = session.toolCalls; }
+	}
+
 	private async preloadSessionFileContent(sessionFilePath: string): Promise<{ preloadedContent: string | undefined; preloadedParsedJson: any | undefined }> {
 		const isSpecialSession = this.findEcosystem(sessionFilePath) !== null;
 		if (isSpecialSession) { return { preloadedContent: undefined, preloadedParsedJson: undefined }; }
+		// Windsurf sessions use virtual paths (windsurf://trajectory/...) — no file to read
+		if (this.windsurf.isWindsurfSessionFile(sessionFilePath)) { return { preloadedContent: undefined, preloadedParsedJson: undefined }; }
 		const preloadedContent = await fs.promises.readFile(sessionFilePath, 'utf8');
 		let preloadedParsedJson: any | undefined;
 		const isPlainJson = !sessionFilePath.endsWith('.jsonl') && !_isJsonlContent(preloadedContent) && !_isUuidPointerFile(preloadedContent);
@@ -3026,12 +3627,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private computeDailyRollups(
-		sessionMeta: { firstInteraction: string | null; dailyInteractions: { [utcDayKey: string]: number } },
+		sessionMeta: { firstInteraction: string | null; dailyInteractions: { [localDayKey: string]: number } },
 		tokenResult: { tokens: number; actualTokens?: number; thinkingTokens?: number },
 		modelUsage: ModelUsage,
 		interactions: number
-	): { dailyRollups: { [utcDayKey: string]: DailyRollupEntry }; totalInteractions: number } {
-		const dailyRollups: { [utcDayKey: string]: DailyRollupEntry } = {};
+	): { dailyRollups: { [localDayKey: string]: DailyRollupEntry }; totalInteractions: number } {
+		const dailyRollups: { [localDayKey: string]: DailyRollupEntry } = {};
 		const dailyInteractionMap = sessionMeta.dailyInteractions;
 		const totalInteractions = Object.values(dailyInteractionMap).reduce((a, b) => a + b, 0);
 
@@ -3047,12 +3648,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 		return { dailyRollups, totalInteractions };
 	}
 
-	private computeFallbackDailyRollup(dailyRollups: { [utcDayKey: string]: DailyRollupEntry }, firstInteraction: string | null, tokenResult: { tokens: number; actualTokens?: number; thinkingTokens?: number }, modelUsage: ModelUsage, interactions: number): void {
+	private computeFallbackDailyRollup(dailyRollups: { [localDayKey: string]: DailyRollupEntry }, firstInteraction: string | null, tokenResult: { tokens: number; actualTokens?: number; thinkingTokens?: number }, modelUsage: ModelUsage, interactions: number): void {
 		if (!tokenResult.tokens || !firstInteraction) { return; }
 		try {
 			const interactionDate = new Date(firstInteraction);
 			if (isNaN(interactionDate.getTime())) { return; }
-			const dayKey = interactionDate.toISOString().slice(0, 10);
+			const dayKey = toLocalDayKey(interactionDate);
 			const dayModelUsage = this.scaledModelUsage(modelUsage, 1);
 			dailyRollups[dayKey] = { tokens: tokenResult.tokens, actualTokens: tokenResult.actualTokens || 0, thinkingTokens: tokenResult.thinkingTokens || 0, cachedReadTokens: 0, interactions: Math.max(1, interactions), modelUsage: dayModelUsage };
 		} catch { /* ignore */ }
@@ -3188,6 +3789,10 @@ class CopilotTokenTracker implements vscode.Disposable {
 		if (eco) {
 			details.editorRoot = eco.getEditorRoot(sessionFile);
 			details.editorName = getEcosystemDisplayName(eco, sessionFile);
+			return;
+		}
+		if (this.windsurf.isWindsurfSessionFile(sessionFile)) {
+			details.editorName = 'Windsurf';
 			return;
 		}
 		try {
@@ -3341,13 +3946,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 		const stat = existingStat ?? await this.statSessionFile(sessionFile);
 
 		const cachedDetails = await this.getSessionFileDetailsFromCache(sessionFile, stat);
-		if (cachedDetails) {
-			if (cachedDetails.repository === undefined && sessionFile.endsWith('.jsonl')) {
-				// Fall through to re-parse
-			} else {
-				this._cacheHits++;
-				return cachedDetails;
-			}
+		if (cachedDetails && !(cachedDetails.repository === undefined && sessionFile.endsWith('.jsonl'))) {
+			this._cacheHits++;
+			return cachedDetails;
 		}
 
 		this._cacheMisses++;
@@ -3364,6 +3965,11 @@ class CopilotTokenTracker implements vscode.Disposable {
 			const eco = this.findEcosystem(sessionFile);
 			if (eco) { return this.processEcosystemSessionDetails(eco, sessionFile, stat, details); }
 
+			// Handle Windsurf virtual sessions — resolve via API or .pb file metadata
+			if (this.windsurf.isWindsurfSessionFile(sessionFile)) {
+				return this.processWindsurfSessionDetails(sessionFile, stat, details);
+			}
+
 			const fileContent = await fs.promises.readFile(sessionFile, 'utf8');
 			if (this.isUuidPointerFile(fileContent)) {
 				await this.updateCacheWithSessionDetails(sessionFile, stat, details);
@@ -3377,7 +3983,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 			const sessionContent = JSON.parse(fileContent);
 			if (sessionContent.customTitle) { details.title = sessionContent.customTitle; }
-			if (sessionContent.requests && Array.isArray(sessionContent.requests)) {
+			if (Array.isArray(sessionContent.requests)) {
 				await this.processJsonRequestsDetails(sessionContent.requests, sessionFile, stat, details);
 			}
 			await this.updateCacheWithSessionDetails(sessionFile, stat, details);
@@ -3385,6 +3991,20 @@ class CopilotTokenTracker implements vscode.Disposable {
 			this.warn(`Error analyzing session file details for ${sessionFile}: ${error}`);
 		}
 
+		return details;
+	}
+
+	private async processWindsurfSessionDetails(sessionFile: string, stat: fs.Stats, details: SessionFileDetails): Promise<SessionFileDetails> {
+		const session = await this.windsurf.resolveSession(sessionFile);
+		if (session) {
+			details.title = session.title;
+			details.interactions = session.interactions;
+			details.editorSource = 'windsurf';
+			details.editorName = 'Windsurf';
+			details.firstInteraction = session.firstInteraction ?? stat.mtime.toISOString();
+			details.lastInteraction = session.lastInteraction ?? stat.mtime.toISOString();
+		}
+		await this.updateCacheWithSessionDetails(sessionFile, stat, details);
 		return details;
 	}
 
@@ -3436,7 +4056,10 @@ class CopilotTokenTracker implements vscode.Disposable {
 		}
 
 		this.setDetailsTimestamps(details, timestamps, stat);
-		if (allContentReferences.length > 0) { details.repository = await this.extractRepositoryFromContentReferences(allContentReferences); }
+		// Use '' as a "checked but not found" sentinel so warm-cache runs don't re-parse this file.
+		details.repository = allContentReferences.length > 0
+			? (await this.extractRepositoryFromContentReferences(allContentReferences) ?? '')
+			: '';
 		await this.updateCacheWithSessionDetails(sessionFile, stat, details);
 		return details;
 	}
@@ -3457,7 +4080,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 			details.title = trimmed.length > 60 ? trimmed.slice(0, 60) + '…' : trimmed;
 		}
 		this.setDetailsTimestamps(details, timestamps, stat);
-		if (allContentReferences.length > 0) { details.repository = await this.extractRepositoryFromContentReferences(allContentReferences); }
+		details.repository = allContentReferences.length > 0
+			? (await this.extractRepositoryFromContentReferences(allContentReferences) ?? '')
+			: '';
 		await this.updateCacheWithSessionDetails(sessionFile, stat, details);
 		return details;
 	}
@@ -3504,7 +4129,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 		}
 
 		this.setDetailsTimestamps(details, timestamps, stat);
-		if (allContentReferences.length > 0) { details.repository = await this.extractRepositoryFromContentReferences(allContentReferences); }
+		details.repository = allContentReferences.length > 0
+			? (await this.extractRepositoryFromContentReferences(allContentReferences) ?? '')
+			: '';
 	}
 
 	private processJsonRequest(request: any, details: SessionFileDetails, timestamps: number[], allContentReferences: any[]): void {
@@ -3616,6 +4243,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 			editorName, size: details.size, modified: details.modified, interactions: details.interactions,
 			contextReferences: details.contextReferences, firstInteraction: details.firstInteraction,
 			lastInteraction: details.lastInteraction, turns, usageAnalysis, actualTokens,
+			...(details.parentInfo ? { parentInfo: details.parentInfo } : {}),
+			...(details.childInfo ? { childInfo: details.childInfo, totalChildCount: details.totalChildCount } : {}),
 			...this.buildLogDataCacheFields(sessionCache, subAgentsStarted),
 		};
 	}
@@ -3983,6 +4612,11 @@ class CopilotTokenTracker implements vscode.Disposable {
 		try {
 			const eco = this.findEcosystem(sessionFilePath);
 			if (eco) { return eco.getTokens(sessionFilePath); }
+			if (this.windsurf.isWindsurfSessionFile(sessionFilePath)) {
+				const session = await this.windsurf.resolveSession(sessionFilePath);
+				const tokens = session?.tokens ?? 0;
+				return { tokens, thinkingTokens: 0, actualTokens: tokens, cacheReadTokens: session?.cachedTokens };
+			}
 			const fileContent = preloadedContent ?? await fs.promises.readFile(sessionFilePath, 'utf8');
 			if (this.isUuidPointerFile(fileContent)) { return { tokens: 0, thinkingTokens: 0, actualTokens: 0 }; }
 			if (sessionFilePath.endsWith('.jsonl') || this.isJsonlContent(fileContent)) {
@@ -4155,7 +4789,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 			{
 				enableScripts: true,
 				retainContextWhenHidden: false,
-				localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'dist')]
+				localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, 'dist'), vscode.Uri.joinPath(this.extensionUri, 'media')]
 			}
 		);
 
@@ -4192,6 +4826,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		if (!stats) {
 			this.log('No cached stats — showing loading screen while calculating...');
 			this._detailsPanelIsLoading = true;
+			this.statusBarItem.tooltip = 'AI Engineering Fluency — loading in panel…';
 			this.detailsPanel.webview.html = this.getLoadingHtml(this.detailsPanel.webview);
 
 			stats = await this.updateTokenStats();
@@ -4387,6 +5022,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 		this.analysisPanel.onDidDispose(() => { this.log('📊 Usage Analysis dashboard closed'); this.analysisPanel = undefined; });
 	}
 
+	/** Opens the Usage Analysis panel and immediately activates the Insights tab. */
+	public async showUsageAnalysisOnInsightsTab(): Promise<void> {
+		await this.showUsageAnalysis();
+		void this.analysisPanel?.webview.postMessage({ command: 'switchTab', tab: 'insights' });
+	}
+
 	private async handleAnalysisMessage(message: any): Promise<void> {
 		switch (message.command) {
 			case 'refresh':
@@ -4406,13 +5047,14 @@ class CopilotTokenTracker implements vscode.Disposable {
 			case 'suppressUnknownTool': {
 				const toolName = message.toolName as string;
 				if (toolName) {
+					// Acknowledge immediately so the webview can remove the item without waiting for the disk write.
+					this.analysisPanel?.webview.postMessage({ command: 'toolSuppressed', toolName });
 					const config = vscode.workspace.getConfiguration('aiEngineeringFluency');
 					const current = config.get<string[]>('suppressedUnknownTools', []);
 					if (!current.includes(toolName)) {
 						await config.update('suppressedUnknownTools', [...current, toolName], vscode.ConfigurationTarget.Global);
 						this.log(`🔇 Suppressed unknown tool: ${toolName}`);
 					}
-					this.analysisPanel?.webview.postMessage({ command: 'toolSuppressed', toolName });
 				}
 				break;
 			}
@@ -4430,6 +5072,52 @@ class CopilotTokenTracker implements vscode.Disposable {
 					});
 				}
 				break;
+			case 'insightAction':
+					await this.dispatch('insightAction', () => this.handleInsightAction(message));
+					break;
+		}
+	}
+
+	private async handleInsightAction(message: any): Promise<void> {
+		const id = typeof message.id === 'string' ? message.id : '';
+		const action = typeof message.action === 'string' ? message.action : '';
+		if (!id || !action) { return; }
+		const now = new Date().toISOString();
+		const existing = this._insightStateBag[id] ?? { status: 'new', firstSurfacedAt: now, lastSurfacedAt: now };
+		switch (action) {
+			case 'seen':
+				if (existing.status === 'new') {
+					this._insightStateBag[id] = { ...existing, status: 'seen', lastSurfacedAt: now };
+					this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+				}
+				break;
+			case 'dismiss':
+				this._insightStateBag[id] = { ...existing, status: 'dismissed', lastSurfacedAt: now };
+				this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+				break;
+			case 'snooze': {
+				const snoozeUntil = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+				this._insightStateBag[id] = { ...existing, status: 'snoozed', lastSurfacedAt: now, snoozeUntil };
+				this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+				break;
+			}
+			case 'done':
+				this._insightStateBag[id] = { ...existing, status: 'done', lastSurfacedAt: now };
+				this.refreshStatusBarInsightBadge(_countNewInsights(this._insightStateBag, now));
+				break;
+		}
+		await this.context.globalState.update('insights.state', this._insightStateBag);
+		// Push refreshed state back to the webview
+		if (this.analysisPanel && this.lastUsageAnalysisStats) {
+			const cadenceDays = vscode.workspace.getConfiguration('aiEngineeringFluency').get<number>('insights.cadenceDays', 2);
+			const ctx = {
+				today: this.lastUsageAnalysisStats.today,
+				last30Days: this.lastUsageAnalysisStats.last30Days,
+				missedPotential: this.lastUsageAnalysisStats.missedPotential ?? [],
+				customizationMatrix: this.lastUsageAnalysisStats.customizationMatrix,
+			};
+			const evaluated = _evaluateInsights(ctx, this._insightStateBag, cadenceDays, this._lastInsightNudgeAt);
+			void this.analysisPanel.webview.postMessage({ command: 'updateInsights', insights: evaluated });
 		}
 	}
 
@@ -4445,6 +5133,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 					missedPotential: analysisStats.missedPotential || [], lastUpdated: analysisStats.lastUpdated.toISOString(),
 					backendConfigured: this.isBackendConfigured(),
 					currentWorkspacePaths: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
+					insights: this.buildCurrentInsights(analysisStats),
 				},
 			});
 		} catch (err) {
@@ -4604,7 +5293,10 @@ Return ONLY the JSON object, no markdown formatting, no explanations.`;
 	}
 
 	private async invokeCopilotModel(prompt: string): Promise<string> {
-		const models = await vscode.lm.selectChatModels({ vendor: 'copilot', family: 'gpt-4o' });
+		let models = await vscode.lm.selectChatModels({ vendor: 'copilot', family: 'auto' });
+		if (models.length === 0) {
+			models = await vscode.lm.selectChatModels({ vendor: 'copilot' });
+		}
 		if (models.length === 0) {
 			throw new Error('No Copilot models available. Please ensure GitHub Copilot is installed and activated.');
 		}
@@ -4714,6 +5406,19 @@ Return ONLY the JSON object, no markdown formatting, no explanations.`;
 	}
 
 	public async showLogViewer(sessionFilePath: string): Promise<void> {
+		if (this.windsurf.isWindsurfSessionFile(sessionFilePath)) {
+			const trajectoryId = sessionFilePath.replace('windsurf://trajectory/', '');
+			const pbPath = path.join(os.homedir(), '.codeium', 'windsurf', 'cascade', `${trajectoryId}.pb`);
+			vscode.window.showInformationMessage(
+				`Windsurf sessions are stored as binary protobuf files and cannot be viewed as text. The session file is: ${pbPath}`,
+				'Reveal in Explorer'
+			).then(choice => {
+				if (choice === 'Reveal in Explorer') {
+					vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(pbPath));
+				}
+			});
+			return;
+		}
 		if (this.logViewerPanel) { this.logViewerPanel.dispose(); this.logViewerPanel = undefined; }
 		const logData = await this.getSessionLogData(sessionFilePath);
 		this.logViewerPanel = vscode.window.createWebviewPanel(
@@ -4819,6 +5524,21 @@ Return ONLY the JSON object, no markdown formatting, no explanations.`;
 	 * Does not modify the original file.
 	 */
 	public async showFormattedJsonlFile(sessionFilePath: string): Promise<void> {
+		// Windsurf sessions are binary protobuf files — open the real .pb file in the OS
+		if (this.windsurf.isWindsurfSessionFile(sessionFilePath)) {
+			const trajectoryId = sessionFilePath.replace('windsurf://trajectory/', '');
+			const pbPath = path.join(os.homedir(), '.codeium', 'windsurf', 'cascade', `${trajectoryId}.pb`);
+			vscode.window.showInformationMessage(
+				`Windsurf sessions are stored as binary protobuf files and cannot be viewed as text. The session file is: ${pbPath}`,
+				'Reveal in Explorer'
+			).then(choice => {
+				if (choice === 'Reveal in Explorer') {
+					vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(pbPath));
+				}
+			});
+			return;
+		}
+
 		try {
 			// Read the file content
 			const fileContent = await fs.promises.readFile(sessionFilePath, 'utf-8');
@@ -5909,7 +6629,7 @@ ${hashtag}`;
       this.lastDailyStats = freshDailyStats;
       const cutoffDate = new Date();
       cutoffDate.setDate(cutoffDate.getDate() - lookbackDays);
-      const cutoffStr = cutoffDate.toISOString().slice(0, 10);
+      const cutoffStr = toLocalDayKey(cutoffDate);
       const inWindow = (this.lastDailyStats ?? []).filter(d => d.date >= cutoffStr);
       return { localTokens: inWindow.reduce((sum, d) => sum + d.tokens, 0), localInteractions: inWindow.reduce((sum, d) => sum + d.interactions, 0) };
     } catch { return { localTokens: undefined, localInteractions: undefined }; }
@@ -5989,6 +6709,7 @@ ${hashtag}`;
 
   private getLoadingHtml(webview: vscode.Webview): string {
     const nonce = getNonce();
+    const iconUri = webview.asWebviewUri(vscode.Uri.joinPath(this.extensionUri, 'media', 'robot-icon.png'));
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -6001,7 +6722,7 @@ ${this.getLoadingHtmlCssBase()}
 ${this.getLoadingHtmlCssSteps()}
 </style>
 </head>
-${this.getLoadingHtmlBody(nonce)}
+${this.getLoadingHtmlBody(nonce, iconUri.toString())}
 </html>`;
   }
 
@@ -6057,12 +6778,15 @@ body {
 .pop { animation: pop-in 0.35s ease both; }`;
   }
 
-  private getLoadingHtmlBody(nonce: string): string {
+  private getLoadingHtmlBody(nonce: string, iconUri?: string): string {
+    const badgeIcon = iconUri
+      ? `<img src="${iconUri}" alt="" width="20" height="20" style="vertical-align:middle;margin-right:6px;border-radius:3px;" />`
+      : '🤖 ';
     return `<body>
 <div class="card">
     <div class="header-row">
         <div>
-            <div class="badge-label">🤖 Analyzing Your AI Activity</div>
+            <div class="badge-label">${badgeIcon}Analyzing Your AI Activity</div>
             <div class="title">Building Activity Index</div>
             <div class="subtitle" id="subtitle">Discovering session files...</div>
         </div>
@@ -6082,7 +6806,7 @@ body {
     <div id="editors-row" style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;"></div>
     <div class="steps-box">
         <div class="step step-active" id="s-discover"><i class="step-ico"><span class="spin-ico">↻</span></i><span class="step-lbl">Discovering session files</span><span class="step-cnt" id="sc-discover"></span></div>
-        <div class="step" id="s-cache"><i class="step-ico">○</i><span class="step-lbl">Checking cache</span><span class="step-cnt"></span></div>
+
         <div class="step" id="s-parse"><i class="step-ico">○</i><span class="step-lbl">Parsing session logs</span><span class="step-cnt" id="sc-parse"></span></div>
         <div class="step" id="s-compute"><i class="step-ico">○</i><span class="step-lbl">Computing statistics</span><span class="step-cnt"></span></div>
         <div class="step" id="s-ready"><i class="step-ico">○</i><span class="step-lbl">Ready!</span><span class="step-cnt"></span></div>
@@ -6116,26 +6840,43 @@ ${this.getLoadingHtmlScript()}
         el.classList.remove('step-done'); el.classList.add('step-active');
         var ico = el.querySelector('.step-ico'); if (ico) { ico.className = 'step-ico'; ico.innerHTML = '<span class="spin-ico">↻</span>'; }
     }
+    // Advance the checklist into the parsing phase. Idempotent: the step transition runs
+    // once even if it is triggered by a loadingProgress message because the one-time
+    // loadingStep 'parsing' was posted before this webview's listener was attached.
+    var parsingShown = false;
+    function enterParsing(total) {
+        if (!parsingShown) {
+            parsingShown = true;
+            setDone('s-discover'); setActive('s-parse');
+            var chips = document.getElementById('chips'); if (chips) chips.style.display = 'flex';
+        }
+        if (total) { var sc = document.getElementById('sc-discover'); if (sc) sc.textContent = '(' + total + ' found)'; }
+    }
     window.addEventListener('message', function (ev) {
         var m = ev.data; if (!m) return;
         if (m.command === 'loadingStep') {
             if (m.step === 'discovering') { setActive('s-discover');
             } else if (m.step === 'parsing') {
-                var total = m.total || 0; setDone('s-discover');
+                var total = m.total || 0;
                 if (m.editors !== undefined) { EDITORS = m.editors; editorsSeen = 0; }
-                var sc = document.getElementById('sc-discover'); if (sc) sc.textContent = '(' + total + ' found)';
-                setDone('s-cache'); setActive('s-parse');
+                enterParsing(total);
                 var sub = document.getElementById('subtitle'); if (sub) sub.textContent = 'Parsing ' + total + ' session files...';
                 var bf = document.getElementById('badge-files'); if (bf) bf.textContent = total + ' files';
-                var chips = document.getElementById('chips'); if (chips) chips.style.display = 'flex';
                 var ct = document.getElementById('chip-total'); if (ct) ct.textContent = total.toLocaleString();
             } else if (m.step === 'computing') {
+                enterParsing(0);
                 setDone('s-parse'); setActive('s-compute');
                 var fill = document.getElementById('prog-fill'); if (fill) { fill.classList.remove('indeterminate'); fill.style.width = '96%'; }
                 var pct = document.getElementById('pct'); if (pct) pct.textContent = '96%';
                 var sub2 = document.getElementById('subtitle'); if (sub2) sub2.textContent = 'Computing statistics...';
             }
         } else if (m.command === 'loadingProgress') {
+            // Receiving progress means parsing is underway — reconcile the checklist in case
+            // the loadingStep 'parsing' transition was missed during webview startup.
+            enterParsing(m.total);
+            // Editors are included in every progress tick so pills appear even when the
+            // one-time loadingStep 'parsing' message was dropped before the listener attached.
+            if (m.editors && m.editors.length > EDITORS.length) { EDITORS = m.editors; }
             var pct2 = document.getElementById('pct'); if (pct2) pct2.textContent = m.percentage + '%';
             var fill2 = document.getElementById('prog-fill'); if (fill2) { fill2.classList.remove('indeterminate'); fill2.style.width = (m.percentage < 3 ? 3 : m.percentage) + '%'; }
             var cd = document.getElementById('chip-done'); if (cd) cd.textContent = m.completed.toLocaleString();
@@ -6496,9 +7237,16 @@ ${this.getLoadingHtmlScript()}
     const fullKeyMap: Record<string, string> = {
       'display.statusBar.showTokens': 'aiEngineeringFluency.display.statusBar.showTokens',
       'display.statusBar.showCost': 'aiEngineeringFluency.display.statusBar.showCost',
+      'display.statusBar.monthlyBudget': 'aiEngineeringFluency.display.statusBar.monthlyBudget',
     };
     const fullKey = fullKeyMap[key];
-    if (fullKey) { await vscode.workspace.getConfiguration().update(fullKey, value, vscode.ConfigurationTarget.Global); }
+    if (!fullKey) { return; }
+    let sanitised: any = value;
+    if (key === 'display.statusBar.monthlyBudget') {
+      const n = typeof value === 'number' ? value : parseFloat(value);
+      sanitised = isNaN(n) ? 0 : Math.min(99999, Math.max(0, Math.round(n * 100) / 100));
+    }
+    await vscode.workspace.getConfiguration().update(fullKey, sanitised, vscode.ConfigurationTarget.Global);
   }
 
   private async diagHandleResetDebugCounters(): Promise<void> {
@@ -6693,7 +7441,69 @@ ${this.getLoadingHtmlScript()}
         if (lastActivity >= fourteenDaysAgo) { detailedSessionFiles.push(details); }
       } catch { /* Skip inaccessible files */ }
     }
+    await this.enrichSessionHierarchy(detailedSessionFiles);
     await this.sendBgLoadResults(panel, detailedSessionFiles, initialCacheHits, initialCacheMisses);
+  }
+
+  /**
+   * Extract the Copilot CLI events.jsonl UUID from a session file path.
+   * Handles both:
+   *   - ~/.copilot/session-state/{uuid}/events.jsonl  → returns the uuid directory name
+   *   - ~/.copilot/session-store.db#{uuid}           → returns the uuid after '#'
+   * Returns null for all other session types.
+   */
+  private extractCopilotCliUuid(sessionFile: string): string | null {
+    const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    // Virtual DB path: .../session-store.db#uuid
+    if (sessionFile.includes('session-store.db#')) {
+      const uuid = sessionFile.split('session-store.db#')[1] ?? '';
+      return UUID_RE.test(uuid) ? uuid : null;
+    }
+    // events.jsonl path: .../session-state/{uuid}/events.jsonl
+    if (sessionFile.includes('session-state')) {
+      const uuid = path.basename(path.dirname(sessionFile));
+      return UUID_RE.test(uuid) ? uuid : null;
+    }
+    return null;
+  }
+
+  /**
+   * Enrich Copilot CLI sessions in `files` with parent/child hierarchy data
+   * read from ~/.copilot/data.db.  All other session types are left untouched.
+   * Errors are suppressed — hierarchy is an optional enrichment.
+   */
+  private async enrichSessionHierarchy(files: SessionFileDetails[]): Promise<void> {
+    // Build uuid → SessionFileDetails map for Copilot CLI sessions only.
+    const uuidToDetails = new Map<string, SessionFileDetails>();
+    for (const details of files) {
+      const uuid = this.extractCopilotCliUuid(details.file);
+      if (uuid) { uuidToDetails.set(uuid, details); }
+    }
+    if (uuidToDetails.size === 0) { return; }
+
+    try {
+      const hierarchy = await this.copilotAppData.getSessionHierarchy([...uuidToDetails.keys()]);
+      for (const [uuid, node] of hierarchy) {
+        const details = uuidToDetails.get(uuid);
+        if (!details) { continue; }
+        if (node.parentUuid) {
+          const ref: SessionRelationRef = {
+            uuid: node.parentUuid,
+            name: node.parentName ?? node.parentUuid,
+            sessionFile: uuidToDetails.get(node.parentUuid)?.file,
+          };
+          details.parentInfo = ref;
+        }
+        if (node.childUuids.length > 0) {
+          details.childInfo = node.childUuids.map(cUuid => ({
+            uuid: cUuid,
+            name: node.childNames.get(cUuid) ?? cUuid,
+            sessionFile: uuidToDetails.get(cUuid)?.file,
+          } satisfies SessionRelationRef));
+          details.totalChildCount = node.totalChildCount;
+        }
+      }
+    } catch { /* hierarchy is optional — never surface errors */ }
   }
 
   private async sortSessionFilesByMtime(sessionFiles: string[]): Promise<string[]> {
@@ -6861,7 +7671,7 @@ ${this.getLoadingHtmlScript()}
       report, sessionFiles, detailedSessionFiles, sessionFolders,
       cacheInfo, backendStorageInfo,
       backendConfigured: this.isBackendConfigured(), isDebugMode, globalStateCounters,
-      displaySettings: { showTokens: this.getStatusBarShowTokensSetting(), showCost: this.getStatusBarShowCostSetting() },
+      displaySettings: { showTokens: this.getStatusBarShowTokensSetting(), showCost: this.getStatusBarShowCostSetting(), monthlyBudget: this.getMonthlyBudgetSetting() },
     }).replace(/</g, "\\u003c");
 
     return `<!DOCTYPE html>
@@ -6949,7 +7759,7 @@ ${this.getLoadingHtmlScript()}
       vscode.Uri.joinPath(this.extensionUri, "dist", "webview", "chart.js"),
     );
 
-    const chartData = { ...this.buildChartData(dailyStats), periodsReady, initialPeriod: this.lastChartPeriod, initialView: this.lastChartView, initialMetric: this.lastChartMetric, initialSplit: this.lastChartSplit };
+    const chartData = { ...this.buildChartData(dailyStats), periodsReady, initialPeriod: this.lastChartPeriod, initialView: this.lastChartView, initialMetric: this.lastChartMetric, initialSplit: this.lastChartSplit, monthlyBudget: this.getEffectiveMonthlyBudget() };
 
     const initialData = JSON.stringify(chartData).replace(/</g, "\\u003c");
 
@@ -7015,6 +7825,7 @@ ${this.getLoadingHtmlScript()}
       suppressedUnknownTools,
       todaySessions: stats.todaySessions || [],
       use24HourTime: this.getUse24HourTimeSetting(),
+      insights: this.buildCurrentInsights(stats),
     }).replace(/</g, "\\u003c") : 'null';
 
     return `<!DOCTYPE html>
@@ -7039,6 +7850,14 @@ ${this.getLoadingHtmlScript()}
     if (this.updateInterval) {
       clearInterval(this.updateInterval);
     }
+    this.stopRefreshHeartbeat();
+    if (this._followerResyncTimer) {
+      clearTimeout(this._followerResyncTimer);
+      this._followerResyncTimer = undefined;
+    }
+    // Release the refresh leader lock if this window held it, so another window can
+    // take over promptly instead of waiting for the stale-lock timeout.
+    void this.cacheManager.releaseRefreshLock().catch(() => { /* best-effort */ });
     if (this.detailsPanel) {
       this.detailsPanel.dispose();
     }
@@ -7070,6 +7889,7 @@ ${this.getLoadingHtmlScript()}
     }
     this.openCode.dispose();
     this.statusBarItem.dispose();
+    this.insightsStatusBarItem.dispose();
     this._disposed = true;
     this.outputChannel.dispose();
   }
@@ -7323,6 +8143,14 @@ function registerViewCommands(context: vscode.ExtensionContext, tokenTracker: Co
     },
   );
 
+  const openInsightsTabCommand = vscode.commands.registerCommand(
+    "aiEngineeringFluency.openInsightsTab",
+    async () => {
+      tokenTracker.log("Open Insights tab command called");
+      await tokenTracker.showUsageAnalysisOnInsightsTab();
+    },
+  );
+
   const showMaturityCommand = vscode.commands.registerCommand(
     "aiEngineeringFluency.showMaturity",
     async () => {
@@ -7352,14 +8180,65 @@ function registerViewCommands(context: vscode.ExtensionContext, tokenTracker: Co
     showDetailsCommand,
     showChartCommand,
     showUsageAnalysisCommand,
+    openInsightsTabCommand,
     showMaturityCommand,
     showDashboardCommand,
     showEnvironmentalCommand,
   );
 }
 
+function formatWindsurfDiagnosticsContent(diagnostics: any): string {
+  return `# Windsurf Diagnostics Report
+
+Generated: ${new Date().toISOString()}
+
+## Environment
+- Running in Windsurf: ${diagnostics.environment.isRunningInWindsurf}
+- App Name: ${diagnostics.environment.appName}
+
+## Extension Status
+- Extension Found: ${diagnostics.extension.found}
+- Extension Active: ${diagnostics.extension.active}
+- Extension Version: ${diagnostics.extension.packageJSON}
+
+## Credentials
+- Available: ${diagnostics.credentials.available}
+- Port: ${diagnostics.credentials.port}
+- CSRF Token Length: ${diagnostics.credentials.csrfLength}
+
+## API Connectivity Test
+- Success: ${diagnostics.apiTest.success}
+- Status Code: ${diagnostics.apiTest.statusCode}
+- Error: ${diagnostics.apiTest.error || 'None'}
+
+## Configuration
+- Windsurf Integration Enabled: ${diagnostics.configuration.enabled}
+
+## Sessions
+- Available: ${diagnostics.sessions.available}
+- Count: ${diagnostics.sessions.count}
+- Error: ${diagnostics.sessions.error || 'None'}
+
+## Recommendations
+
+${!diagnostics.extension.found ? '- Install the Windsurf extension\n' : ''}${!diagnostics.extension.active ? '- Activate the Windsurf extension or restart Windsurf\n' : ''}${!diagnostics.credentials.available ? '- Check if Windsurf language server is running\n' : ''}${!diagnostics.apiTest.success ? `- API connectivity issue: ${diagnostics.apiTest.error}\n` : ''}${diagnostics.sessions.count === 0 && diagnostics.apiTest.success ? '- Windsurf is working correctly, but no chat sessions have been created yet. Try starting a chat session in Windsurf and then refresh the token tracker.\n' : ''}
+`;
+}
+
+async function handleWindsurfDiagnosticsCommand(tokenTracker: CopilotTokenTracker): Promise<void> {
+  try {
+    const diagnostics = await tokenTracker.windsurf.runDiagnostics();
+    const doc = await vscode.workspace.openTextDocument({
+      content: formatWindsurfDiagnosticsContent(diagnostics),
+      language: 'markdown'
+    });
+    await vscode.window.showTextDocument(doc);
+  } catch (error) {
+    vscode.window.showErrorMessage(`Failed to run Windsurf diagnostics: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function registerDiagnosticAndAuthCommands(context: vscode.ExtensionContext, tokenTracker: CopilotTokenTracker): void {
-  // Register the show fluency level viewer command (debug-only)
   const showFluencyLevelViewerCommand = vscode.commands.registerCommand(
     "aiEngineeringFluency.showFluencyLevelViewer",
     async () => {
@@ -7403,12 +8282,19 @@ function registerDiagnosticAndAuthCommands(context: vscode.ExtensionContext, tok
     },
   );
 
-  // Register the GitHub sign out command
   const signOutGitHubCommand = vscode.commands.registerCommand(
     "aiEngineeringFluency.signOutGitHub",
     async () => {
       tokenTracker.log("GitHub sign out command called");
       await tokenTracker.signOutFromGitHub();
+    },
+  );
+
+  const windsurfDiagnosticsCommand = vscode.commands.registerCommand(
+    "copilot-token-tracker.checkWindsurfStatus",
+    async () => {
+      tokenTracker.log("Windsurf diagnostics command called");
+      await handleWindsurfDiagnosticsCommand(tokenTracker);
     },
   );
 
@@ -7419,6 +8305,7 @@ function registerDiagnosticAndAuthCommands(context: vscode.ExtensionContext, tok
     clearCacheCommand,
     authenticateGitHubCommand,
     signOutGitHubCommand,
+    windsurfDiagnosticsCommand,
   );
 }
 

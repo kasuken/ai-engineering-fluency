@@ -297,7 +297,8 @@ export interface ContextReferenceUsage {
   outputPanel: number; // #outputPanel references
   problemsPanel: number; // #problemsPanel references
   pullRequest: number; // #pr / #pullRequest references (Copilot PR chat, April 2026)
-// contentReferences tracking from session logs
+  codeContextLines?: number; // Total lines of code referenced via #file: range selections
+  // contentReferences tracking from session logs
   byKind: { [kind: string]: number }; // Count by reference kind
   copilotInstructions: number; // .github/copilot-instructions.md
   agentsMd: number; // agents.md in repo root
@@ -440,6 +441,20 @@ export interface UsageAnalysisPeriod {
     sessionCount: number; // sessions with effort data
     switchCount: number;  // total effort switches across all sessions
   };
+  /**
+   * Number of sessions in this period that are parents of 2+ child workspaces,
+   * indicating multi-agent orchestration. Populated from ~/.copilot/data.db;
+   * absent (undefined) when data.db is not available.
+   */
+  multiAgentParentSessions?: number;
+}
+
+/** Parent/child session reference used in hierarchy info (Copilot CLI sessions). */
+export interface SessionRelationRef {
+  uuid: string;
+  name: string;
+  /** Resolved path to the related session file (undefined when outside the loaded set). */
+  sessionFile?: string;
 }
 
 // Detailed session file information for diagnostics view
@@ -457,6 +472,21 @@ export interface SessionFileDetails {
   editorName?: string; // friendly editor name (e.g., 'VS Code')
   title?: string; // session title (customTitle from session file)
   repository?: string; // Git remote origin URL for the session's workspace
+  /** Parent session info (Copilot CLI sessions only, populated from ~/.copilot/data.db). */
+  parentInfo?: SessionRelationRef | null;
+  /** Direct child sessions (Copilot CLI sessions only, populated from ~/.copilot/data.db). */
+  childInfo?: SessionRelationRef[];
+  /**
+   * Total child count from data.db — may exceed childInfo.length when some
+   * children fall outside the loaded 14-day diagnostic window.
+   */
+  totalChildCount?: number;
+  // Windsurf-only: pre-built token/model/tool breakdown derived from the
+  // trajectory steps (the gRPC API gives no per-day file we can re-parse later,
+  // so the data layer maps it into the extension's standard shapes up front).
+  modelUsage?: ModelUsage; // per-model input/output/cached token breakdown
+  cachedTokens?: number;   // session-level cache-read tokens
+  toolCalls?: { total: number; byTool: { [tool: string]: number } }; // tool invocation breakdown
 }
 
 // Prompt token detail from actual LLM usage data
@@ -513,6 +543,12 @@ export interface SessionLogData {
   cachedTokens?: number;
   /** Number of distinct subagent sessions started (CLI format only, from subagent.started events). */
   subAgentsStarted?: number;
+  /** Parent session info (Copilot CLI sessions only, from data.db hierarchy). */
+  parentInfo?: SessionRelationRef | null;
+  /** Direct child sessions (Copilot CLI sessions only, from data.db hierarchy). */
+  childInfo?: SessionRelationRef[];
+  /** Total child count from data.db (may exceed childInfo.length). */
+  totalChildCount?: number;
   /** Input token total from debug log (sum of all llm_request events). Present for VS Code Copilot Chat agent-mode sessions. */
   debugLogInputTokens?: number;
   /** Output token total from debug log (sum of all llm_request events). Present for VS Code Copilot Chat agent-mode sessions. */
@@ -567,5 +603,33 @@ export interface WorkspaceCustomizationSummary {
   staleFiles: number;
 }
 
+// ---------------------------------------------------------------------------
+// Insights / Nudges framework
+// ---------------------------------------------------------------------------
 
+export type InsightCategory = 'context' | 'agentic' | 'customization' | 'consistency' | 'tools' | 'trend';
+export type InsightSeverity = 'tip' | 'opportunity' | 'celebration';
+export type InsightStatus = 'new' | 'seen' | 'dismissed' | 'snoozed' | 'done';
 
+export interface InsightState {
+  status: InsightStatus;
+  firstSurfacedAt: string;   // ISO timestamp
+  lastSurfacedAt: string;    // ISO timestamp
+  snoozeUntil?: string;      // ISO timestamp; present when status === 'snoozed'
+}
+
+/** Persisted bag of per-insight state keyed by insight id. */
+export type InsightStateBag = Record<string, InsightState>;
+
+/** A fully evaluated, display-ready insight card. */
+export interface EvaluatedInsight {
+  id: string;
+  category: InsightCategory;
+  severity: InsightSeverity;
+  title: string;
+  body: string;
+  actionLabel?: string;
+  actionCommand?: string;
+  status: InsightStatus;
+  allowToast?: boolean;
+}
