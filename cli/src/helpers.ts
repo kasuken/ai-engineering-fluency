@@ -15,6 +15,8 @@ import { parseSessionFileContent } from '../../vscode-extension/src/sessionParse
 import { estimateTokensFromText, getModelFromRequest, isJsonlContent, estimateTokensFromJsonlSession, calculateEstimatedCost } from '../../vscode-extension/src/tokenEstimation';
 import { extractDailyFractions } from '../../vscode-extension/src/dailyAttribution';
 import { toLocalDayKey } from '../../vscode-extension/src/utils/dayKeys';
+import { isJetBrainsSessionPath } from '../../vscode-extension/src/adapters/adapterPredicates';
+import { parseJetBrainsPartition } from '../../vscode-extension/src/jetbrains';
 import type { DetailedStats, ModelUsage, UsageAnalysisStats, WorkspaceCustomizationMatrix } from '../../vscode-extension/src/types';
 import { analyzeSessionUsage, mergeUsageAnalysis } from '../../vscode-extension/src/usageAnalysis';
 import { withErrorRecovery } from '../../vscode-extension/src/utils/errors';
