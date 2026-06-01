@@ -18,6 +18,7 @@ export type ContextReferenceUsage = {
 	outputPanel: number;
 	problemsPanel: number;
 	pullRequest: number; // #pr / #pullRequest references (Copilot PR chat, April 2026)
+	codeContextLines?: number;
 	byKind: { [kind: string]: number };
 	copilotInstructions: number;
 	agentsMd: number;

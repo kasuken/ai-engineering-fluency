@@ -6,6 +6,7 @@ import {
     analyzeContentReferences,
     analyzeVariableData,
     analyzeRequestContext,
+    analyzeCliAttachments,
     calculateModelSwitching,
     trackEnhancedMetrics,
     analyzeSessionUsage,
@@ -29,7 +30,7 @@ function emptyRefs(): ContextReferenceUsage {
         file: 0, selection: 0, implicitSelection: 0, symbol: 0, codebase: 0,
         workspace: 0, terminal: 0, vscode: 0, terminalLastCommand: 0,
         terminalSelection: 0, clipboard: 0, changes: 0, outputPanel: 0,
-        problemsPanel: 0, pullRequest: 0, byKind: {}, byPath: {}, copilotInstructions: 0, agentsMd: 0,
+        problemsPanel: 0, pullRequest: 0, codeContextLines: 0, byKind: {}, byPath: {}, copilotInstructions: 0, agentsMd: 0,
     };
 }
 
@@ -156,6 +157,19 @@ test('mergeUsageAnalysis: accumulates context reference counts', () => {
     assert.equal(period.contextReferences.file, 6);
     assert.equal(period.contextReferences.workspace, 4);
     assert.equal(period.contextReferences.codebase, 2);
+});
+
+test('mergeUsageAnalysis: accumulates code context line counts', () => {
+    const period = emptyPeriod();
+    const a1 = emptyAnalysis();
+    a1.contextReferences.codeContextLines = 12;
+    const a2 = emptyAnalysis();
+    a2.contextReferences.codeContextLines = 8;
+
+    mergeUsageAnalysis(period, a1);
+    mergeUsageAnalysis(period, a2);
+
+    assert.equal(period.contextReferences.codeContextLines, 20);
 });
 
 test('mergeUsageAnalysis: accumulates MCP tool counts by server and tool', () => {
@@ -476,6 +490,29 @@ test('analyzeVariableData: tracks byKind for each variable', () => {
     assert.equal(refs.byKind['file'], 2);
 });
 
+test('analyzeVariableData: file variables also increment refs.file', () => {
+    const refs = emptyRefs();
+    analyzeVariableData({
+        variables: [
+            { kind: 'file', name: 'foo.ts' },
+            { kind: 'file', name: 'bar.ts' },
+        ]
+    }, refs);
+    assert.equal(refs.file, 2);
+});
+
+test('analyzeVariableData: image variables increment byKind[image] and byKind[copilot.image]', () => {
+    const refs = emptyRefs();
+    analyzeVariableData({
+        variables: [
+            { kind: 'image' },
+            { kind: 'image' },
+        ]
+    }, refs);
+    assert.equal(refs.byKind['image'], 2);
+    assert.equal(refs.byKind['copilot.image'], 2);
+});
+
 test('analyzeVariableData: increments symbol for generic sym: variables', () => {
     const refs = emptyRefs();
     analyzeVariableData({
@@ -498,6 +535,64 @@ test('analyzeVariableData: does not increment symbol for generic without sym: pr
 });
 
 // ---------------------------------------------------------------------------
+// analyzeCliAttachments
+// ---------------------------------------------------------------------------
+
+test('analyzeCliAttachments: null/missing input is ignored', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments(null, refs);
+    analyzeCliAttachments(undefined, refs);
+    assert.equal(refs.file, 0);
+    assert.deepEqual(refs.byKind, {});
+});
+
+test('analyzeCliAttachments: clipboard PNG increments copilot.image', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([
+        { displayName: 'bce9bcb7-35f8-49ba-a49d-a8114dd26214-clipboard.png', type: 'file' },
+        { displayName: '3a695656-0157-4e9d-8613-781da1b54ee7-clipboard.png', type: 'file' },
+    ], refs);
+    assert.equal(refs.byKind['copilot.image'], 2);
+    assert.equal(refs.file, 0);
+});
+
+test('analyzeCliAttachments: "N lines" displayName increments refs.file', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([
+        { displayName: '210 lines', type: 'file' },
+        { displayName: '46 lines', type: 'file' },
+    ], refs);
+    assert.equal(refs.file, 2);
+    assert.equal(refs.byKind['copilot.image'], undefined);
+});
+
+test('analyzeCliAttachments: named file (e.g. refactor.agent.md) increments refs.file', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([
+        { displayName: 'refactor.agent.md', type: 'file' },
+    ], refs);
+    assert.equal(refs.file, 1);
+});
+
+test('analyzeCliAttachments: mixed attachments (images + file refs) split correctly', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([
+        { displayName: 'abc-clipboard.png', type: 'file' },
+        { displayName: '285 lines', type: 'file' },
+        { displayName: 'AGENTS.md', type: 'file' },
+    ], refs);
+    assert.equal(refs.byKind['copilot.image'], 1);
+    assert.equal(refs.file, 2);
+});
+
+test('analyzeCliAttachments: entry without displayName is skipped', () => {
+    const refs = emptyRefs();
+    analyzeCliAttachments([{ type: 'file' }, null, 42], refs);
+    assert.equal(refs.file, 0);
+    assert.deepEqual(refs.byKind, {});
+});
+
+// ---------------------------------------------------------------------------
 // analyzeRequestContext
 // ---------------------------------------------------------------------------
 
@@ -514,6 +609,32 @@ test('analyzeRequestContext: processes message.parts for context refs', () => {
     }, refs);
     assert.equal(refs.codebase, 1);
     assert.equal(refs.file, 1);
+});
+
+test('analyzeRequestContext: extracts code context lines from dynamic parts', () => {
+    const refs = emptyRefs();
+    analyzeRequestContext({
+        message: {
+            parts: [{
+                kind: 'dynamic',
+                data: { range: { startLineNumber: 10, endLineNumber: 24 } },
+            }]
+        }
+    }, refs);
+    assert.equal(refs.codeContextLines, 15);
+});
+
+test('analyzeRequestContext: counts custom prompt parts in byKind', () => {
+    const refs = emptyRefs();
+    analyzeRequestContext({
+        message: {
+            parts: [{
+                kind: 'prompt',
+                slashPromptCommand: { command: 'galery' },
+            }]
+        }
+    }, refs);
+    assert.equal(refs.byKind['prompt'], 1);
 });
 
 test('analyzeRequestContext: processes contentReferences array', () => {

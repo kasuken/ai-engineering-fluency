@@ -243,7 +243,12 @@ function _cfstmComputeDerived(fd: CfstmFd, dashboardSessions: number): CfstmDeri
 		avgFilesPerSession: fd.filesPerEditCount > 0 ? fd.filesPerEditSum / fd.filesPerEditCount : 0,
 		avgApplyRate: fd.applyRateCount > 0 ? fd.applyRateSum / fd.applyRateCount : 0,
 		totalContextRefs: fd.ctxFile + fd.ctxSelection + fd.ctxSymbol + fd.ctxCodebase + fd.ctxWorkspace,
-		usedRefTypeCount: [fd.ctxFile, fd.ctxSelection, fd.ctxSymbol, fd.ctxCodebase, fd.ctxWorkspace, fd.ctxTerminal, fd.ctxVscode, fd.ctxClipboard, fd.ctxChanges, fd.ctxProblemsPanel, fd.ctxOutputPanel, fd.ctxTerminalLastCommand, fd.ctxTerminalSelection].filter(v => v > 0).length,
+		usedRefTypeCount: [
+			fd.ctxFile, fd.ctxSelection, fd.ctxSymbol, fd.ctxCodebase, fd.ctxWorkspace,
+			fd.ctxTerminal, fd.ctxVscode, fd.ctxClipboard, fd.ctxChanges,
+			fd.ctxProblemsPanel, fd.ctxOutputPanel, fd.ctxTerminalLastCommand, fd.ctxTerminalSelection,
+			fd.ctxByKind['copilot.image'] ?? 0, fd.ctxByKind['promptFile'] ?? 0, fd.ctxByKind['prompt'] ?? 0,
+		].filter(v => v > 0).length,
 		effectiveSessions: Math.max(dashboardSessions, fd.sessionCount),
 	};
 }
@@ -279,6 +284,8 @@ function _cfstmScorePromptEng(fd: CfstmFd, d: CfstmDerived): { stage: Stage; tip
 function _cfstmCeSpecializedItems(fd: CfstmFd): { name: string; used: boolean }[] {
 	return [
 		{ name: 'image attachments', used: (fd.ctxByKind['copilot.image'] ?? 0) > 0 },
+		{ name: 'prompt files', used: (fd.ctxByKind['promptFile'] ?? 0) > 0 },
+		{ name: 'custom prompt commands', used: (fd.ctxByKind['prompt'] ?? 0) > 0 },
 		{ name: '#changes', used: fd.ctxChanges > 0 },
 		{ name: '#problemsPanel', used: fd.ctxProblemsPanel > 0 },
 		{ name: '#outputPanel', used: fd.ctxOutputPanel > 0 },
@@ -317,7 +324,7 @@ function _cfstmScoreContextEng(fd: CfstmFd, d: CfstmDerived): { stage: Stage; ti
 	if (totalContextRefs >= STAGE_THRESHOLDS.contextEngineering.stage2MinTotalRefs) { ceStage = 2; }
 	if (usedRefTypeCount >= STAGE_THRESHOLDS.contextEngineering.stage3MinRefTypes && totalContextRefs >= STAGE_THRESHOLDS.contextEngineering.stage3MinTotalRefs) { ceStage = 3; }
 	if (usedRefTypeCount >= STAGE_THRESHOLDS.contextEngineering.stage4MinRefTypes && totalContextRefs >= STAGE_THRESHOLDS.contextEngineering.stage4MinTotalRefs) { ceStage = 4; }
-	if ((fd.ctxByKind['copilot.image'] ?? 0) > 0) { ceStage = promoteStage(ceStage, 3); }
+	if ((fd.ctxByKind['copilot.image'] ?? 0) > 0 || (fd.ctxByKind['promptFile'] ?? 0) > 0) { ceStage = promoteStage(ceStage, 3); }
 	const ceTips: string[] = [];
 	if (ceStage < 2) { ceTips.push('Add #file or #selection references to give Copilot more context'); }
 	if (ceStage < 3) { ceTips.push('Explore @workspace, #codebase, and @terminal for broader context'); }
@@ -473,6 +480,8 @@ function _buildCeStage4Tip(refs: UsageAnalysisPeriod['contextReferences'], usedR
 	const refsStillNeeded = Math.max(0, T.stage4MinTotalRefs - totalContextRefs);
 	const specializedItems = [
 		{ name: 'image attachments', used: (refs.byKind?.['copilot.image'] ?? 0) > 0 },
+		{ name: 'prompt files', used: (refs.byKind?.['promptFile'] ?? 0) > 0 },
+		{ name: 'custom prompt commands', used: (refs.byKind?.['prompt'] ?? 0) > 0 },
 		{ name: '#changes', used: refs.changes > 0 },
 		{ name: '#problemsPanel', used: refs.problemsPanel > 0 },
 		{ name: '#outputPanel', used: refs.outputPanel > 0 },
@@ -498,44 +507,67 @@ function _buildCeStage4Tip(refs: UsageAnalysisPeriod['contextReferences'], usedR
 	return _ceFormatSpecializedTip(specializedItems, '[specialized context variables](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts)');
 }
 
+function _pushCeEvidence(evidence: string[], count: number, label: string): void {
+	if (count > 0) { evidence.push(`${fmt(count)} ${label}`); }
+}
+
 function _buildCeEvidence(refs: UsageAnalysisPeriod['contextReferences']): string[] {
 	const evidence: string[] = [];
-	if (refs.file > 0) { evidence.push(`${fmt(refs.file)} #file references`); }
-	if (refs.selection > 0) { evidence.push(`${fmt(refs.selection)} #selection references`); }
-	if (refs.codebase > 0) { evidence.push(`${fmt(refs.codebase)} #codebase references`); }
-	if (refs.workspace > 0) { evidence.push(`${fmt(refs.workspace)} @workspace references`); }
-	if (refs.terminal > 0) { evidence.push(`${fmt(refs.terminal)} @terminal references`); }
-	if (refs.vscode > 0) { evidence.push(`${fmt(refs.vscode)} @vscode references`); }
-	if (refs.clipboard > 0) { evidence.push(`${fmt(refs.clipboard)} #clipboard references`); }
-	if (refs.changes > 0) { evidence.push(`${fmt(refs.changes)} #changes references`); }
-	if (refs.problemsPanel > 0) { evidence.push(`${fmt(refs.problemsPanel)} #problemsPanel references`); }
-	if (refs.outputPanel > 0) { evidence.push(`${fmt(refs.outputPanel)} #outputPanel references`); }
-	if (refs.terminalLastCommand > 0) { evidence.push(`${fmt(refs.terminalLastCommand)} #terminalLastCommand references`); }
-	if (refs.terminalSelection > 0) { evidence.push(`${fmt(refs.terminalSelection)} #terminalSelection references`); }
+	const baseEvidence: Array<[number, string]> = [
+		[refs.file, '#file references'],
+		[refs.selection, '#selection references'],
+		[refs.codebase, '#codebase references'],
+		[refs.workspace, '@workspace references'],
+		[refs.terminal, '@terminal references'],
+		[refs.vscode, '@vscode references'],
+		[refs.clipboard, '#clipboard references'],
+		[refs.changes, '#changes references'],
+		[refs.problemsPanel, '#problemsPanel references'],
+		[refs.outputPanel, '#outputPanel references'],
+		[refs.terminalLastCommand, '#terminalLastCommand references'],
+		[refs.terminalSelection, '#terminalSelection references'],
+		[refs.byKind?.['promptFile'] ?? 0, 'prompt file uses'],
+		[refs.byKind?.['prompt'] ?? 0, 'custom prompt commands'],
+		[refs.codeContextLines ?? 0, 'lines of code context'],
+	];
+	for (const [count, label] of baseEvidence) {
+		_pushCeEvidence(evidence, count, label);
+	}
 	return evidence;
+}
+
+function _getCeUsedRefTypeCount(refs: UsageAnalysisPeriod['contextReferences']): number {
+	return [
+		refs.file, refs.selection, refs.symbol, refs.codebase, refs.workspace,
+		refs.terminal, refs.vscode, refs.clipboard, refs.changes,
+		refs.problemsPanel, refs.outputPanel, refs.terminalLastCommand, refs.terminalSelection,
+		refs.byKind?.['copilot.image'] ?? 0, refs.byKind?.['promptFile'] ?? 0, refs.byKind?.['prompt'] ?? 0,
+	].filter(Boolean).length;
+}
+
+function _applyCeBoosters(refs: UsageAnalysisPeriod['contextReferences'], evidence: string[], stage: Stage): Stage {
+	const imageRefs = refs.byKind['copilot.image'] || 0;
+	if (imageRefs > 0) {
+		evidence.push(`${fmt(imageRefs)} image references (vision)`);
+		stage = promoteStage(stage, 3);
+	}
+	if ((refs.byKind['promptFile'] || 0) > 0) {
+		stage = promoteStage(stage, 3);
+	}
+	return stage;
 }
 
 function _scoreContextEngineering(p: UsageAnalysisPeriod): CategoryScore {
 	let stage: Stage = 1;
 	const T = STAGE_THRESHOLDS.contextEngineering;
-
 	const refs = p.contextReferences;
 	const totalContextRefs = refs.file + refs.selection + refs.symbol + refs.codebase + refs.workspace;
-	const usedRefTypeCount = [
-		refs.file, refs.selection, refs.symbol, refs.codebase, refs.workspace,
-		refs.terminal, refs.vscode, refs.clipboard, refs.changes,
-		refs.problemsPanel, refs.outputPanel, refs.terminalLastCommand, refs.terminalSelection,
-	].filter(Boolean).length;
-
+	const usedRefTypeCount = _getCeUsedRefTypeCount(refs);
 	const evidence = _buildCeEvidence(refs);
-
 	if (totalContextRefs >= T.stage2MinTotalRefs) { stage = 2; }
 	if (usedRefTypeCount >= T.stage3MinRefTypes && totalContextRefs >= T.stage3MinTotalRefs) { stage = 3; }
 	if (usedRefTypeCount >= T.stage4MinRefTypes && totalContextRefs >= T.stage4MinTotalRefs) { stage = 4; }
-
-	const imageRefs = refs.byKind['copilot.image'] || 0;
-	if (imageRefs > 0) { evidence.push(`${fmt(imageRefs)} image references (vision)`); stage = promoteStage(stage, 3); }
-
+	stage = _applyCeBoosters(refs, evidence, stage);
 	const tips: string[] = [];
 	if (stage < 2) { tips.push('Try adding [#file or #selection](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts) references to give Copilot more context'); }
 	if (stage < 3) { tips.push('Explore [@workspace, #codebase, and @terminal](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts) for broader context'); }
@@ -863,6 +895,8 @@ function _buildCeGapTip(fd: FluencyInputData, cv: FluencyVars, T: typeof STAGE_T
 	const refsStillNeeded = Math.max(0, T.stage4MinTotalRefs - cv.totalContextRefs);
 	const specializedItems = [
 		{ name: 'image attachments', used: (fd.ctxByKind["copilot.image"] ?? 0) > 0 },
+		{ name: 'prompt files', used: (fd.ctxByKind["promptFile"] ?? 0) > 0 },
+		{ name: 'custom prompt commands', used: (fd.ctxByKind["prompt"] ?? 0) > 0 },
 		{ name: '#changes', used: fd.ctxChanges > 0 },
 		{ name: '#problemsPanel', used: fd.ctxProblemsPanel > 0 },
 		{ name: '#outputPanel', used: fd.ctxOutputPanel > 0 },
@@ -904,7 +938,7 @@ function _calcFluencyCE(fd: FluencyInputData, cv: FluencyVars): FluencyStageResu
 	if (cv.totalContextRefs >= T.stage2MinTotalRefs) { stage = 2; }
 	if (cv.usedRefTypeCount >= T.stage3MinRefTypes && cv.totalContextRefs >= T.stage3MinTotalRefs) { stage = 3; }
 	if (cv.usedRefTypeCount >= T.stage4MinRefTypes && cv.totalContextRefs >= T.stage4MinTotalRefs) { stage = 4; }
-	if ((fd.ctxByKind["copilot.image"] ?? 0) > 0) { stage = promoteStage(stage, 3); }
+	if ((fd.ctxByKind["copilot.image"] ?? 0) > 0 || (fd.ctxByKind["promptFile"] ?? 0) > 0) { stage = promoteStage(stage, 3); }
 	return { stage, tips: _buildCeTips(fd, cv, stage) };
 }
 
