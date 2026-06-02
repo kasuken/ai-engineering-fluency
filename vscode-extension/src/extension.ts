@@ -12,6 +12,7 @@ import toolNamesData from './toolNames.json';
 import customizationPatternsData from './customizationPatterns.json';
 import copilotPlansData from './copilotPlans.json';
 import * as packageJson from '../package.json';
+import { getToolFamilies, DEFAULT_TOOL_FAMILIES } from './toolFamilies';
 
 // --- Core types ---
 import type {
@@ -280,7 +281,7 @@ function _scdlDistributeToDays(
 
 class CopilotTokenTracker implements vscode.Disposable {
 	// Cache version - increment this when making changes that require cache invalidation
-	private static readonly CACHE_VERSION = 55; // Fix LOC extraction for Copilot CLI coding agent sessions (edit/create tools)
+	private static readonly CACHE_VERSION = 57; // Fix output token counting: use tool.execution_complete events
 	// Maximum length for displaying workspace IDs in diagnostics/customization matrix
 	private static readonly WORKSPACE_ID_DISPLAY_LENGTH = 8;
 
@@ -7117,6 +7118,7 @@ ${this.getLoadingHtmlScript()}
       configureTeamServer: () => this.dispatch('configureTeamServer:diagnostics', () => this.diagHandleConfigureTeamServer()),
       openSettings: () => this.dispatch('openSettings:diagnostics', () => vscode.commands.executeCommand("workbench.action.openSettings", "aiEngineeringFluency.backend")),
       openDisplaySettings: () => this.dispatch('openDisplaySettings:diagnostics', () => vscode.commands.executeCommand("workbench.action.openSettings", "aiEngineeringFluency.display")),
+      openToolFamiliesSettings: () => this.dispatch('openToolFamiliesSettings:diagnostics', () => vscode.commands.executeCommand("workbench.action.openSettings", "aiEngineeringFluency.toolFamilies")),
       resetDebugCounters: () => this.dispatch('resetDebugCounters:diagnostics', () => this.diagHandleResetDebugCounters()),
       authenticateGitHub: () => this.dispatch('authenticateGitHub:diagnostics', () => this.diagHandleGitHubAuth(true)),
       signOutGitHub: () => this.dispatch('signOutGitHub:diagnostics', () => this.diagHandleGitHubAuth(false)),
@@ -7326,6 +7328,12 @@ ${this.getLoadingHtmlScript()}
         this.log("✅ Cache populated, proceeding with diagnostics load");
       }
 
+      if (!this.lastUsageAnalysisStats) {
+        this.log("⚡ No usage analysis stats cached - computing for tool analysis tab...");
+        await this.calculateUsageAnalysisStats(false);
+        this.log("✅ Usage analysis stats computed");
+      }
+
       const report = await this.generateDiagnosticReport();
       this.lastDiagnosticReport = report;
 
@@ -7356,6 +7364,8 @@ ${this.getLoadingHtmlScript()}
         candidatePaths,
         backendStorageInfo,
         githubAuth: githubAuthStatus,
+        toolCallStats: this.lastUsageAnalysisStats?.last30Days?.toolCalls ?? null,
+        toolFamilies: getToolFamilies(),
       });
 
       this.log("✅ Diagnostic data loaded and sent to webview");
@@ -7673,6 +7683,8 @@ ${this.getLoadingHtmlScript()}
       cacheInfo, backendStorageInfo,
       backendConfigured: this.isBackendConfigured(), isDebugMode, globalStateCounters,
       displaySettings: { showTokens: this.getStatusBarShowTokensSetting(), showCost: this.getStatusBarShowCostSetting(), monthlyBudget: this.getMonthlyBudgetSetting() },
+      toolCallStats: this.lastUsageAnalysisStats?.last30Days?.toolCalls ?? null,
+      toolFamilies: getToolFamilies(),
     }).replace(/</g, "\\u003c");
 
     return `<!DOCTYPE html>
@@ -8317,6 +8329,13 @@ export async function activate(context: vscode.ExtensionContext): Promise<AiFlue
   // Migrate settings from the old copilotTokenTracker namespace to aiEngineeringFluency.
   // Run before any other settings are read so the new keys are populated first.
   await migrateSettingsIfNeeded(context, (m) => tokenTracker.log(m));
+
+  // Pre-fill toolFamilies setting with defaults so users have a starting point for customisation.
+  const cfg = vscode.workspace.getConfiguration('aiEngineeringFluency');
+  const existingFamilies = cfg.get<unknown[]>('toolFamilies');
+  if (!existingFamilies || existingFamilies.length === 0) {
+    await cfg.update('toolFamilies', DEFAULT_TOOL_FAMILIES, vscode.ConfigurationTarget.Global);
+  }
 
   // Migrate any stored shared key secrets from the old key name to the new key name.
   await migrateSecretsIfNeeded(context, (m) => tokenTracker.log(m));
