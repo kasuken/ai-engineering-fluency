@@ -362,6 +362,59 @@ body {
 	opacity: 0.4;
 }
 
+.tool-family-section {
+	margin-bottom: 20px;
+}
+
+.tool-family-heading {
+	margin: 8px 0 4px;
+	font-size: 13px;
+	font-weight: 600;
+	color: var(--fg-muted, #ccc);
+}
+
+.tool-type-badge {
+	padding: 1px 5px;
+	border-radius: 3px;
+	font-size: 10px;
+	white-space: nowrap;
+	margin-left: 4px;
+	vertical-align: middle;
+}
+
+.tool-type-badge.built-in {
+	background: rgba(100, 120, 180, 0.25);
+	color: #9bb0d8;
+}
+
+.tool-type-badge.alternative {
+	background: rgba(100, 200, 120, 0.2);
+	color: #7ecf8e;
+}
+
+.tool-ratio {
+	font-variant-numeric: tabular-nums;
+	text-align: right;
+}
+
+.tool-builtin-label {
+	opacity: 0.5;
+	font-style: italic;
+}
+
+.ratio-better {
+	color: #7ecf8e;
+}
+
+.ratio-worse {
+	color: #e06c75;
+}
+
+.ratio-neutral {
+	color: var(--fg-muted, #ccc);
+}
+
+
 .session-table tr:hover {
 	background: rgb(255, 255, 255, 0.03);
 }

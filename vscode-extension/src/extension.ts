@@ -12,6 +12,7 @@ import toolNamesData from './toolNames.json';
 import customizationPatternsData from './customizationPatterns.json';
 import copilotPlansData from './copilotPlans.json';
 import * as packageJson from '../package.json';
+import { getToolFamilies } from './toolFamilies';
 
 // --- Core types ---
 import type {
@@ -7362,6 +7363,7 @@ ${this.getLoadingHtmlScript()}
         backendStorageInfo,
         githubAuth: githubAuthStatus,
         toolCallStats: this.lastUsageAnalysisStats?.last30Days?.toolCalls ?? null,
+        toolFamilies: getToolFamilies(),
       });
 
       this.log("✅ Diagnostic data loaded and sent to webview");
@@ -7680,6 +7682,7 @@ ${this.getLoadingHtmlScript()}
       backendConfigured: this.isBackendConfigured(), isDebugMode, globalStateCounters,
       displaySettings: { showTokens: this.getStatusBarShowTokensSetting(), showCost: this.getStatusBarShowCostSetting(), monthlyBudget: this.getMonthlyBudgetSetting() },
       toolCallStats: this.lastUsageAnalysisStats?.last30Days?.toolCalls ?? null,
+      toolFamilies: getToolFamilies(),
     }).replace(/</g, "\\u003c");
 
     return `<!DOCTYPE html>

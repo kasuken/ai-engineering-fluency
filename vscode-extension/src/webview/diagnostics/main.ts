@@ -119,6 +119,15 @@ type DiagnosticsData = {
   sessionFolders?: SessionFolder[];
   displaySettings?: DisplaySettings;
   toolCallStats?: { total: number; byTool: { [key: string]: number }; outputTokensByTool?: { [key: string]: number } } | null;
+  toolFamilies?: ToolFamilyConfig[];
+};
+
+type ToolFamilyConfig = {
+  id: string;
+  name: string;
+  builtIn: string[];
+  alternatives: string[];
+  description?: string;
 };
 
 type DiagnosticsViewState = {
@@ -159,6 +168,7 @@ let hideEmptySessions = true; // hide sessions with 0 interactions by default
 // Tool analysis table sort state
 let toolSortColumn: "tool" | "calls" | "total" | "avg" = "avg";
 let toolSortDir: "asc" | "desc" = "desc";
+let storedToolFamilies: ToolFamilyConfig[] | undefined;
 
 // Render state (promoted to module level so all setup functions can be top-level)
 let storedDetailedFiles: SessionFileDetails[] = [];
@@ -1229,22 +1239,17 @@ function reRenderTable(): void {
 }
 
 function reRenderToolAnalysisTable(): void {
-  const table = document.getElementById("tool-analysis-table");
-  if (!table) { return; }
-  const encoded = table.getAttribute("data-rows");
-  if (!encoded) { return; }
-  const rows: ToolAnalysisRow[] = JSON.parse(decodeURIComponent(encoded));
-  const tbody = table.querySelector("tbody");
-  if (tbody) { tbody.innerHTML = renderToolAnalysisRows(rows); }
-  const thead = table.querySelector("thead");
-  if (thead) {
-    thead.innerHTML = `<tr>
-<th class="tool-sortable" data-sort="tool">Tool${getToolSortIndicator("tool")}</th>
-<th class="tool-sortable" data-sort="calls">Calls${getToolSortIndicator("calls")}</th>
-<th class="tool-sortable" data-sort="total">Total Output Tokens${getToolSortIndicator("total")}</th>
-<th class="tool-sortable" data-sort="avg">Avg Tokens / Call${getToolSortIndicator("avg")}</th>
-</tr>`;
-  }
+  document.querySelectorAll<HTMLElement>(".tool-analysis-table").forEach(table => {
+    const encoded = table.getAttribute("data-rows");
+    if (!encoded) { return; }
+    const rows: ToolAnalysisRow[] = JSON.parse(decodeURIComponent(encoded));
+    const baselineRaw = table.getAttribute("data-baseline");
+    const baseline = baselineRaw ? parseFloat(baselineRaw) : NaN;
+    const tbody = table.querySelector("tbody");
+    if (tbody) { tbody.innerHTML = renderToolAnalysisRows(rows, baseline); }
+    const thead = table.querySelector("thead");
+    if (thead) { thead.innerHTML = toolAnalysisTheadHtml(); }
+  });
   setupToolAnalysisSortHandlers();
 }
 
@@ -1601,11 +1606,12 @@ function handleDiagnosticDataLoaded(message: DiagMessage): void {
       setupGitHubAuthHandlers();
     }
   }
+  if (message.toolFamilies) { storedToolFamilies = message.toolFamilies as ToolFamilyConfig[]; }
   if (message.toolCallStats !== undefined) {
     const toolAnalysisTab = document.getElementById("tab-tool-analysis");
     if (toolAnalysisTab) {
       const wasActive = toolAnalysisTab.classList.contains("active");
-      const newContent = renderToolAnalysisTab(message.toolCallStats as DiagnosticsData['toolCallStats']);
+      const newContent = renderToolAnalysisTab(message.toolCallStats as DiagnosticsData['toolCallStats'], storedToolFamilies);
       const temp = document.createElement('div');
       temp.innerHTML = newContent;
       const newTab = temp.firstElementChild as HTMLElement | null;
@@ -1901,15 +1907,23 @@ for quick scanning, or as full numbers (e.g. <strong>1,500</strong>, <strong>1,2
 </div>`;
 }
 
-type ToolAnalysisRow = { tool: string; totalTokens: number; calls: number };
+type ToolAnalysisRow = { tool: string; totalTokens: number; calls: number; isBuiltIn: boolean };
 
 function getToolSortIndicator(col: typeof toolSortColumn): string {
   if (toolSortColumn !== col) { return ' <span class="sort-hint">↕</span>'; }
   return toolSortDir === "desc" ? " ▼" : " ▲";
 }
 
-function renderToolAnalysisRows(rows: ToolAnalysisRow[]): string {
-  const sorted = [...rows].sort((a, b) => {
+/** Compute pooled avg tokens/call across a set of rows (built-in baseline). Returns NaN if no data. */
+function pooledAvg(rows: ToolAnalysisRow[]): number {
+  const totalCalls = rows.reduce((s, r) => s + r.calls, 0);
+  const totalTokens = rows.reduce((s, r) => s + r.totalTokens, 0);
+  return totalCalls > 0 ? totalTokens / totalCalls : NaN;
+}
+
+/** Sort rows by the current toolSortColumn/toolSortDir. */
+function sortToolRows(rows: ToolAnalysisRow[]): ToolAnalysisRow[] {
+  return [...rows].sort((a, b) => {
     let aVal: number | string, bVal: number | string;
     switch (toolSortColumn) {
       case "tool": aVal = a.tool.toLowerCase(); bVal = b.tool.toLowerCase(); break;
@@ -1921,13 +1935,70 @@ function renderToolAnalysisRows(rows: ToolAnalysisRow[]): string {
     if (aVal > bVal) { return toolSortDir === "desc" ? -1 : 1; }
     return 0;
   });
-  return sorted.map(r => {
-    const avg = r.calls > 0 ? Math.round(r.totalTokens / r.calls) : 0;
-    return `<tr><td>${escapeHtml(r.tool)}</td><td>${escapeHtml(String(r.calls))}</td><td>${formatTokenCount(r.totalTokens)}</td><td>${formatTokenCount(avg)}</td></tr>`;
-  }).join('');
 }
 
-function renderToolAnalysisTab(toolCallStats: DiagnosticsData['toolCallStats']): string {
+function renderToolRow(r: ToolAnalysisRow, builtInBaseline: number): string {
+  const avg = r.calls > 0 ? Math.round(r.totalTokens / r.calls) : 0;
+  let ratioHtml = '<td class="tool-ratio">—</td>';
+  if (!r.isBuiltIn && !isNaN(builtInBaseline) && builtInBaseline > 0 && r.calls > 0) {
+    const ratio = (r.totalTokens / r.calls) / builtInBaseline;
+    const pct = Math.round(ratio * 100);
+    const cls = ratio < 0.85 ? 'ratio-better' : ratio > 1.15 ? 'ratio-worse' : 'ratio-neutral';
+    ratioHtml = `<td class="tool-ratio ${cls}" title="${pct}% of built-in average">${pct}%</td>`;
+  } else if (r.isBuiltIn) {
+    ratioHtml = '<td class="tool-ratio tool-builtin-label">baseline</td>';
+  }
+  const badge = r.isBuiltIn ? ' <span class="tool-type-badge built-in">built-in</span>' : ' <span class="tool-type-badge alternative">alt</span>';
+  return `<tr><td>${escapeHtml(r.tool)}${badge}</td><td>${escapeHtml(String(r.calls))}</td><td>${formatTokenCount(r.totalTokens)}</td><td>${formatTokenCount(avg)}</td>${ratioHtml}</tr>`;
+}
+
+function renderToolAnalysisRows(rows: ToolAnalysisRow[], builtInBaseline: number = NaN): string {
+  return sortToolRows(rows).map(r => renderToolRow(r, builtInBaseline)).join('');
+}
+
+/** Thead HTML shared across initial render and re-render. */
+function toolAnalysisTheadHtml(): string {
+  return `<tr>
+<th class="tool-sortable" data-sort="tool">Tool${getToolSortIndicator("tool")}</th>
+<th class="tool-sortable" data-sort="calls">Calls${getToolSortIndicator("calls")}</th>
+<th class="tool-sortable" data-sort="total">Total Output Tokens${getToolSortIndicator("total")}</th>
+<th class="tool-sortable" data-sort="avg">Avg Tokens / Call${getToolSortIndicator("avg")}</th>
+<th>vs Built-in</th>
+</tr>`;
+}
+
+/** Render one family section. Returns empty string if the family has no data. */
+function renderToolFamilySection(
+  family: ToolFamilyConfig,
+  outputTokensByTool: { [key: string]: number },
+  byTool: { [key: string]: number },
+  assignedTools: Set<string>
+): { html: string; rows: ToolAnalysisRow[] } {
+  const buildRows = (names: string[], isBuiltIn: boolean): ToolAnalysisRow[] =>
+    names
+      .filter(t => outputTokensByTool[t] !== undefined && (byTool[t] || 0) > 0 && !assignedTools.has(t))
+      .map(t => { assignedTools.add(t); return { tool: t, totalTokens: outputTokensByTool[t], calls: byTool[t] || 0, isBuiltIn }; });
+
+  const builtInRows = buildRows(family.builtIn, true);
+  const altRows = buildRows(family.alternatives, false);
+  const allRows = [...builtInRows, ...altRows];
+  if (allRows.length === 0) { return { html: '', rows: [] }; }
+
+  const baseline = pooledAvg(builtInRows);
+  const encodedRows = encodeURIComponent(JSON.stringify(allRows));
+  const desc = family.description ? ` <span class="hint">${escapeHtml(family.description)}</span>` : '';
+  const html = `
+<div class="tool-family-section">
+<h4 class="tool-family-heading">${escapeHtml(family.name)}${desc}</h4>
+<table class="session-table tool-analysis-table" data-rows="${encodedRows}" data-baseline="${isNaN(baseline) ? '' : String(baseline)}">
+<thead>${toolAnalysisTheadHtml()}</thead>
+<tbody>${renderToolAnalysisRows(allRows, baseline)}</tbody>
+</table>
+</div>`;
+  return { html, rows: allRows };
+}
+
+function renderToolAnalysisTab(toolCallStats: DiagnosticsData['toolCallStats'], families?: ToolFamilyConfig[]): string {
   if (!toolCallStats || !toolCallStats.outputTokensByTool || Object.keys(toolCallStats.outputTokensByTool).length === 0) {
     return `<div id="tab-tool-analysis" class="tab-content">
 <div class="info-box">
@@ -1938,24 +2009,38 @@ function renderToolAnalysisTab(toolCallStats: DiagnosticsData['toolCallStats']):
   }
   const outputTokensByTool = toolCallStats.outputTokensByTool;
   const byTool = toolCallStats.byTool;
-  const rows: ToolAnalysisRow[] = Object.entries(outputTokensByTool)
-    .map(([tool, totalTokens]) => ({ tool, totalTokens, calls: byTool[tool] || 0 }))
-    .filter(r => r.calls > 0);
-  const encodedRows = encodeURIComponent(JSON.stringify(rows));
+  const assignedTools = new Set<string>();
+  let sectionsHtml = '';
+
+  if (families && families.length > 0) {
+    for (const family of families) {
+      const { html } = renderToolFamilySection(family, outputTokensByTool, byTool, assignedTools);
+      sectionsHtml += html;
+    }
+  }
+
+  // Remaining tools not in any family
+  const otherRows: ToolAnalysisRow[] = Object.entries(outputTokensByTool)
+    .filter(([t]) => !assignedTools.has(t) && (byTool[t] || 0) > 0)
+    .map(([t, tokens]) => ({ tool: t, totalTokens: tokens, calls: byTool[t] || 0, isBuiltIn: false }));
+  if (otherRows.length > 0) {
+    const encodedOther = encodeURIComponent(JSON.stringify(otherRows));
+    sectionsHtml += `
+<div class="tool-family-section">
+<h4 class="tool-family-heading">Other Tools</h4>
+<table class="session-table tool-analysis-table" data-rows="${encodedOther}" data-baseline="">
+<thead>${toolAnalysisTheadHtml()}</thead>
+<tbody>${renderToolAnalysisRows(otherRows, NaN)}</tbody>
+</table>
+</div>`;
+  }
+
   return `<div id="tab-tool-analysis" class="tab-content">
 <div class="info-box">
 <div class="info-box-title">🔧 Tool Output Token Analysis</div>
-<div>Tokens produced by each tool's output over the last 30 days. Click column headers to sort.</div>
+<div>Tokens produced by each tool's output over the last 30 days. Tools are grouped by family. <strong>vs Built-in</strong> shows how an alternative compares to the pooled baseline — green is more token-efficient. Click column headers to sort within each group. Configure families via <code>aiEngineeringFluency.toolFamilies</code> in VS Code settings.</div>
 </div>
-<table class="session-table" id="tool-analysis-table" data-rows="${encodedRows}">
-<thead><tr>
-<th class="tool-sortable" data-sort="tool">Tool${getToolSortIndicator("tool")}</th>
-<th class="tool-sortable" data-sort="calls">Calls${getToolSortIndicator("calls")}</th>
-<th class="tool-sortable" data-sort="total">Total Output Tokens${getToolSortIndicator("total")}</th>
-<th class="tool-sortable" data-sort="avg">Avg Tokens / Call${getToolSortIndicator("avg")}</th>
-</tr></thead>
-<tbody>${renderToolAnalysisRows(rows)}</tbody>
-</table>
+${sectionsHtml}
 </div>`;
 }
 
@@ -2041,7 +2126,7 @@ ${data.isDebugMode ? renderDebugTab(data.globalStateCounters) : ''}
 <div id="tab-path-analyzer" class="tab-content">
 ${renderFolderAnalyzerTab()}
 </div>
-${renderToolAnalysisTab(data.toolCallStats)}
+${renderToolAnalysisTab(data.toolCallStats, data.toolFamilies)}
 </div>
 `;
 }
@@ -2058,6 +2143,7 @@ function renderLayout(data: DiagnosticsData): void {
   isLoading = detailedFiles.length === 0;
   currentBackendInfo = data.backendStorageInfo;
   currentGithubAuth = data.githubAuth;
+  if (data.toolFamilies) { storedToolFamilies = data.toolFamilies; }
 
   const reportIsLoading = data.report === LOADING_PLACEHOLDER;
   const escapedReport = reportIsLoading
