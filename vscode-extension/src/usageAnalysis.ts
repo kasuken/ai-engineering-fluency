@@ -1746,6 +1746,18 @@ function _asuApplyToolLoc(pending: { toolName: string; args: Record<string, stri
 	analysis.editScope!.languageUsage[ext].linesRemoved += linesRemoved;
 }
 
+/** Extract plain text from a tool result content value (string or content-block array). */
+function _asuExtractToolResultText(content: unknown): string {
+	if (typeof content === 'string') { return content; }
+	if (Array.isArray(content)) {
+		return content
+			.filter((b: any) => b?.type === 'text' && typeof b.text === 'string')
+			.map((b: any) => b.text as string)
+			.join('');
+	}
+	return '';
+}
+
 /** Handle tool.execution_complete — applies LOC tracking for edit/create and counts output tokens for all non-MCP tools. */
 function _asuHandleToolComplete(event: any, cliState: AsuCliState, analysis: SessionUsageAnalysis): void {
 	const { toolCallId, success, result } = event.data ?? {};
@@ -1755,18 +1767,12 @@ function _asuHandleToolComplete(event: any, cliState: AsuCliState, analysis: Ses
 	if (success && (pending.toolName === 'edit' || pending.toolName === 'create')) {
 		_asuApplyToolLoc(pending, cliState, analysis);
 	}
-	if (result?.content && !isMcpTool(pending.toolName)) {
-		const content = result.content;
-		const resultText = typeof content === 'string' ? content
-			: Array.isArray(content)
-				? content.filter((b: any) => b?.type === 'text' && typeof b.text === 'string').map((b: any) => b.text as string).join('')
-				: '';
-		if (resultText) {
-			const tokens = estimateTokensFromText(resultText);
-			if (!analysis.toolCalls.outputTokensByTool) { analysis.toolCalls.outputTokensByTool = {}; }
-			analysis.toolCalls.outputTokensByTool[pending.toolName] = (analysis.toolCalls.outputTokensByTool[pending.toolName] || 0) + tokens;
-		}
-	}
+	if (!result?.content || isMcpTool(pending.toolName)) { return; }
+	const resultText = _asuExtractToolResultText(result.content);
+	if (!resultText) { return; }
+	const tokens = estimateTokensFromText(resultText);
+	if (!analysis.toolCalls.outputTokensByTool) { analysis.toolCalls.outputTokensByTool = {}; }
+	analysis.toolCalls.outputTokensByTool[pending.toolName] = (analysis.toolCalls.outputTokensByTool[pending.toolName] || 0) + tokens;
 }
 
 /** Handle tool.execution_start / tool.execution_complete for CLI LOC tracking. */
