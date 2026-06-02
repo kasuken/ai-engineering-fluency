@@ -12,13 +12,13 @@ import type { IEcosystemAdapter } from '../../vscode-extension/src/ecosystemAdap
 import { isMcpTool, extractMcpServerName } from '../../vscode-extension/src/workspaceHelpers';
 import { resolveFileUri } from '../../vscode-extension/src/workspacePathResolver';
 import { parseSessionFileContent } from '../../vscode-extension/src/sessionParser';
-import { estimateTokensFromText, getModelFromRequest, isJsonlContent, estimateTokensFromJsonlSession, calculateEstimatedCost } from '../../vscode-extension/src/tokenEstimation';
+import { estimateTokensFromText, getModelFromRequest, isJsonlContent, estimateTokensFromJsonlSession, calculateEstimatedCost, extractAllTokensFromDebugLog } from '../../vscode-extension/src/tokenEstimation';
 import { extractDailyFractions } from '../../vscode-extension/src/dailyAttribution';
 import { toLocalDayKey } from '../../vscode-extension/src/utils/dayKeys';
 import { isJetBrainsSessionPath } from '../../vscode-extension/src/adapters/adapterPredicates';
 import { parseJetBrainsPartition } from '../../vscode-extension/src/jetbrains';
 import type { DetailedStats, ModelUsage, UsageAnalysisStats, WorkspaceCustomizationMatrix } from '../../vscode-extension/src/types';
-import { analyzeSessionUsage, mergeUsageAnalysis } from '../../vscode-extension/src/usageAnalysis';
+import { analyzeSessionUsage, mergeUsageAnalysis, getModelUsageFromSession } from '../../vscode-extension/src/usageAnalysis';
 import { withErrorRecovery } from '../../vscode-extension/src/utils/errors';
 import * as vscodeStub from './vscode-stub';
 import { loadCache, saveCache, disableCache, getCached, setCached, getCacheStats } from './cliCache';
@@ -210,6 +210,51 @@ async function statSessionFile(filePath: string): Promise<fs.Stats> {
 }
 
 /**
+ * Read token counts from a Copilot Chat debug log file for a given session file.
+ *
+ * Agent-mode sessions make multiple LLM API calls per user turn. Only the last
+ * call's tokens are stored in the chat session file; the debug log records every
+ * call. Using debug log data gives the true session total, matching VS Code's behavior.
+ *
+ * Returns null if no debug log exists or if no llm_request events are found.
+ */
+async function readDebugLogTokensForSession(sessionFilePath: string, verbose = false): Promise<{
+	inputTokens: number; outputTokens: number; cachedTokens: number;
+	modelBreakdown: Record<string, { inputTokens: number; outputTokens: number; cachedTokens: number }>;
+} | null> {
+	const sessionId = path.basename(sessionFilePath, path.extname(sessionFilePath));
+	if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(sessionId)) { return null; }
+	
+	// Normalize to forward slashes for consistent regex matching
+	const norm = sessionFilePath.replace(/\\/g, '/');
+	const wsHashMatch = norm.match(/^(.*\/workspaceStorage\/[^/]+)\//);
+	if (!wsHashMatch) { return null; }
+	
+	// Use the normalized match length to extract from the normalized path, then convert back
+	const normalizedHashDir = wsHashMatch[1];
+	const workspaceHashDir = normalizedHashDir.replace(/\//g, '\\');
+	
+	const extensionFolders = ['GitHub.copilot-chat', 'github.copilot-chat', 'GitHub.copilot', 'github.copilot'];
+	for (const extFolder of extensionFolders) {
+		const debugLogPath = path.join(workspaceHashDir, extFolder, 'debug-logs', sessionId, 'main.jsonl');
+		try {
+			const content = await fs.promises.readFile(debugLogPath, 'utf8');
+			const result = extractAllTokensFromDebugLog(content);
+			if (result) {
+				if (verbose) {
+					console.error(`  ✓ Found debug log: ${sessionId} (tokens: ${result.inputTokens + result.outputTokens})`);
+				}
+				return result;
+			}
+		} catch { /* file doesn't exist — try next variant */ }
+	}
+	if (verbose) {
+		console.error(`  ✗ No debug log found: ${sessionId}`);
+	}
+	return null;
+}
+
+/**
  * Extract per-UTC-day fractions from session content using interaction timestamps.
  * Fractions sum to 1.0. Falls back to { [fallbackDateKey]: 1.0 } when no timestamps found.
  *
@@ -225,7 +270,7 @@ async function statSessionFile(filePath: string): Promise<fs.Stats> {
 /**
  * Process a single session file and extract its data.
  */
-export async function processSessionFile(filePath: string): Promise<SessionData | null> {
+export async function processSessionFile(filePath: string, verbose = false): Promise<SessionData | null> {
 	try {
 		const stats = await statSessionFile(filePath);
 
@@ -300,6 +345,20 @@ export async function processSessionFile(filePath: string): Promise<SessionData 
 				}
 			}
 
+			// Delta-format JSONL sessions (VS Code chat) return empty modelUsage from DeltaTokenStrategy.
+			// Use getModelUsageFromSession to reconstruct per-model usage from request data,
+			// matching VS Code's _gmusProcessDeltaRequests path so cost is calculated consistently.
+			if (Object.keys(fileModelUsage).length === 0 && !isJetBrainsSessionPath(filePath)) {
+				const supplemented = await getModelUsageFromSession(
+					{ warn, tokenEstimators, modelPricing, ecosystems: getEcosystems() },
+					filePath,
+					content
+				);
+				if (Object.keys(supplemented).length > 0) {
+					fileModelUsage = supplemented;
+				}
+			}
+
 			// Count interactions from JSONL
 			const lines = content.trim().split('\n');
 			for (const line of lines) {
@@ -327,6 +386,22 @@ export async function processSessionFile(filePath: string): Promise<SessionData 
 		}
 
 		const dailyFractions = extractDailyFractions(content, isJsonl, stats.mtime);
+
+		// Supplement with debug log tokens when available.
+		// Agent-mode sessions make multiple LLM API calls per turn; only the last
+		// call's tokens are stored in the session file. Debug logs record every call,
+		// so they give the true session total — matching VS Code's behavior.
+		const debugLogTokens = await readDebugLogTokensForSession(filePath, verbose);
+		if (debugLogTokens && (debugLogTokens.inputTokens + debugLogTokens.outputTokens) > 0) {
+			tokens = debugLogTokens.inputTokens + debugLogTokens.outputTokens;
+			actualTokens = tokens;
+			if (Object.keys(debugLogTokens.modelBreakdown).length > 0) {
+				fileModelUsage = {};
+				for (const [model, bd] of Object.entries(debugLogTokens.modelBreakdown)) {
+					fileModelUsage[model] = { inputTokens: bd.inputTokens, outputTokens: bd.outputTokens, ...(bd.cachedTokens > 0 ? { cachedReadTokens: bd.cachedTokens } : {}) };
+				}
+			}
+		}
 
 		const sessionData: SessionData = {
 			file: filePath,
@@ -500,7 +575,7 @@ export async function calculateUsageAnalysisStats(sessionFiles: string[]): Promi
  * Returns `{ labels, days }` where labels are sorted YYYY-MM-DD strings (UTC) and
  * days are the corresponding aggregated stats.
  */
-export async function calculateDailyStats(sessionFiles: string[]): Promise<{
+export async function calculateDailyStats(sessionFiles: string[], verbose = false): Promise<{
 	labels: string[];
 	days: DailyEntry[];
 	allDaysMap: Map<string, DailyEntry>;
@@ -522,7 +597,7 @@ export async function calculateDailyStats(sessionFiles: string[]): Promise<{
 	// Full historical map (all time, no age filter) for weekly/monthly chart periods
 	const allDaysMap = new Map<string, DailyEntry>();
 
-	const sessionResults = await runWithConcurrency(sessionFiles, async (file) => processSessionFile(file));
+	const sessionResults = await runWithConcurrency(sessionFiles, async (file) => processSessionFile(file, verbose));
 
 	for (const data of sessionResults) {
 		if (!data || data.tokens === 0 || data.interactions === 0) { continue; }

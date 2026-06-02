@@ -11,7 +11,7 @@ import type { SessionData } from './helpers';
 import { CliCachePolicy } from '../../vscode-extension/src/cachePolicy';
 
 /** Bump this when the SessionData shape changes to force a full re-parse. */
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5; // Read debug log tokens for agent-mode sessions
 
 /** Maximum number of entries to keep in the cache file. */
 const MAX_CACHE_ENTRIES = 2000;

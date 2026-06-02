@@ -324,6 +324,17 @@
         "GPT-4o Mini"
       ]
     },
+    "gpt-4o-mini-2024-07-18": {
+      "inputCostPerMillion": 0.15,
+      "outputCostPerMillion": 0.6,
+      "cachedInputCostPerMillion": 0.075,
+      "category": "GPT-4 models",
+      "tier": "standard",
+      "multiplier": 0,
+      "displayNames": [
+        "GPT-4o-mini (2024-07-18)"
+      ]
+    },
     "gpt-4-turbo": {
       "inputCostPerMillion": 10.0,
       "outputCostPerMillion": 30.0,
@@ -418,6 +429,26 @@
         "category": "Versatile"
       }
     },
+    "claude-sonnet-4-6": {
+      "inputCostPerMillion": 3.0,
+      "outputCostPerMillion": 15.0,
+      "cachedInputCostPerMillion": 0.3,
+      "cacheCreationCostPerMillion": 3.75,
+      "category": "Claude models (Anthropic)",
+      "tier": "standard",
+      "multiplier": 1.0,
+      "displayNames": [
+        "Claude Sonnet 4.6 (alternate format)"
+      ],
+      "copilotPricing": {
+        "inputCostPerMillion": 3.0,
+        "cachedInputCostPerMillion": 0.3,
+        "cacheCreationCostPerMillion": 3.75,
+        "outputCostPerMillion": 15.0,
+        "releaseStatus": "GA",
+        "category": "Versatile"
+      }
+    },
     "claude-haiku": {
       "inputCostPerMillion": 0.25,
       "outputCostPerMillion": 1.25,
@@ -440,6 +471,26 @@
       "multiplier": 0.33,
       "displayNames": [
         "Claude Haiku 4.5"
+      ],
+      "copilotPricing": {
+        "inputCostPerMillion": 1.0,
+        "cachedInputCostPerMillion": 0.1,
+        "cacheCreationCostPerMillion": 1.25,
+        "outputCostPerMillion": 5.0,
+        "releaseStatus": "GA",
+        "category": "Versatile"
+      }
+    },
+    "claude-haiku-4-5-20251001": {
+      "inputCostPerMillion": 1.0,
+      "outputCostPerMillion": 5.0,
+      "cachedInputCostPerMillion": 0.1,
+      "cacheCreationCostPerMillion": 1.25,
+      "category": "Claude models (Anthropic)",
+      "tier": "standard",
+      "multiplier": 0.33,
+      "displayNames": [
+        "Claude Haiku 4.5 (2025-10-01)"
       ],
       "copilotPricing": {
         "inputCostPerMillion": 1.0,
@@ -844,6 +895,16 @@
       ]
     },
     "mistral-medium-3-5": {
+      "inputCostPerMillion": 1.5,
+      "outputCostPerMillion": 7.5,
+      "category": "Mistral models",
+      "tier": "unknown",
+      "multiplier": 1,
+      "displayNames": [
+        "Mistral Medium 3.5"
+      ]
+    },
+    "mistral-medium-3.5": {
       "inputCostPerMillion": 1.5,
       "outputCostPerMillion": 7.5,
       "category": "Mistral models",
