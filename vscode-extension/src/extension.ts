@@ -3363,6 +3363,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 		firstInteraction: string | null;
 		lastInteraction: string | null;
 		dailyInteractions: { [localDayKey: string]: number };
+		dailyFractions?: Record<string, number>;
 	}> {
 		let title: string | undefined;
 		const timestamps: number[] = [];
@@ -3372,7 +3373,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 			const eco = this.findEcosystem(sessionFile);
 			if (eco) {
 				const meta = await eco.getMeta(sessionFile);
-				return { ...meta, dailyInteractions: {} };
+				const dailyFractions = eco.getDailyFractions ? await eco.getDailyFractions(sessionFile) : undefined;
+				return { ...meta, dailyInteractions: {}, ...(dailyFractions ? { dailyFractions } : {}) };
 			}
 
 			// Handle Windsurf virtual sessions
@@ -3636,12 +3638,25 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	private computeDailyRollups(
-		sessionMeta: { firstInteraction: string | null; dailyInteractions: { [localDayKey: string]: number } },
+		sessionMeta: { firstInteraction: string | null; dailyInteractions: { [localDayKey: string]: number }; dailyFractions?: Record<string, number> },
 		tokenResult: { tokens: number; actualTokens?: number; thinkingTokens?: number },
 		modelUsage: ModelUsage,
 		interactions: number
 	): { dailyRollups: { [localDayKey: string]: DailyRollupEntry }; totalInteractions: number } {
 		const dailyRollups: { [localDayKey: string]: DailyRollupEntry } = {};
+
+		// Prefer pre-computed fractions from ecosystem adapters (e.g. getDailyFractions()),
+		// which have accurate per-request timestamps. Fall back to dailyInteractions counts.
+		if (sessionMeta.dailyFractions && Object.keys(sessionMeta.dailyFractions).length > 0) {
+			const totalFracInteractions = Math.max(1, interactions);
+			for (const [dayKey, fraction] of Object.entries(sessionMeta.dailyFractions)) {
+				const dayModelUsage = this.scaledModelUsage(modelUsage, fraction);
+				const dayInteractions = Math.max(1, Math.round(totalFracInteractions * fraction));
+				dailyRollups[dayKey] = { tokens: Math.round(tokenResult.tokens * fraction), actualTokens: Math.round((tokenResult.actualTokens || 0) * fraction), thinkingTokens: Math.round((tokenResult.thinkingTokens || 0) * fraction), cachedReadTokens: 0, interactions: dayInteractions, modelUsage: dayModelUsage };
+			}
+			return { dailyRollups, totalInteractions: totalFracInteractions };
+		}
+
 		const dailyInteractionMap = sessionMeta.dailyInteractions;
 		const totalInteractions = Object.values(dailyInteractionMap).reduce((a, b) => a + b, 0);
 

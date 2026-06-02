@@ -9,6 +9,7 @@ import { calculateEstimatedCost } from '../../vscode-extension/src/tokenEstimati
 import { normalizePathForComparison } from '../../vscode-extension/src/workspaceHelpers';
 import { createEmptyContextRefs } from '../../vscode-extension/src/tokenEstimation';
 import type { ModelUsage, ModelPricing, PeriodStats, UsageAnalysisPeriod } from '../../vscode-extension/src/types';
+export type { PeriodStats, UsageAnalysisPeriod } from '../../vscode-extension/src/types';
 
 /** Type alias for a single model pricing entry from modelPricing.json. */
 export type ModelPricingEntry = ModelPricing;
@@ -148,6 +149,12 @@ export function aggregateIntoPeriod(period: PeriodStats, data: SessionData, frac
 		}
 		period.modelUsage[model].inputTokens += Math.round(usage.inputTokens * fraction);
 		period.modelUsage[model].outputTokens += Math.round(usage.outputTokens * fraction);
+		if (usage.cachedReadTokens !== undefined) {
+			period.modelUsage[model].cachedReadTokens = (period.modelUsage[model].cachedReadTokens ?? 0) + Math.round(usage.cachedReadTokens * fraction);
+		}
+		if (usage.cacheCreationTokens !== undefined) {
+			period.modelUsage[model].cacheCreationTokens = (period.modelUsage[model].cacheCreationTokens ?? 0) + Math.round(usage.cacheCreationTokens * fraction);
+		}
 	}
 
 	// Track interactions proportionally for the running average
@@ -270,7 +277,7 @@ export function buildChartPayload(labels: string[], days: DailyEntry[], allDaysM
 		const totalTokens = tokensData.reduce((a, b) => a + b, 0);
 		const totalSessions = sessionsData.reduce((a, b) => a + b, 0);
 		const periodCount = buckets.length;
-		const costData = entries.map(e => calculateEstimatedCost(e.modelUsage, modelPricing));
+		const costData = entries.map(e => calculateEstimatedCost(e.modelUsage, modelPricing, 'copilot'));
 		const totalCost = costData.reduce((a, b) => a + b, 0);
 		const avgCostPerPeriod = periodCount > 0 ? totalCost / periodCount : 0;
 		return { labels: bLabels, tokensData, sessionsData, modelDatasets, editorDatasets, repositoryDatasets: [], periodCount, totalTokens, totalSessions, avgPerPeriod: periodCount > 0 ? Math.round(totalTokens / periodCount) : 0, costData, totalCost, avgCostPerPeriod };
@@ -283,6 +290,12 @@ export function buildChartPayload(labels: string[], days: DailyEntry[], allDaysM
 			if (!target.modelUsage[m]) { target.modelUsage[m] = { inputTokens: 0, outputTokens: 0 }; }
 			target.modelUsage[m].inputTokens += u.inputTokens;
 			target.modelUsage[m].outputTokens += u.outputTokens;
+			if (u.cachedReadTokens !== undefined) {
+				target.modelUsage[m].cachedReadTokens = (target.modelUsage[m].cachedReadTokens ?? 0) + u.cachedReadTokens;
+			}
+			if (u.cacheCreationTokens !== undefined) {
+				target.modelUsage[m].cacheCreationTokens = (target.modelUsage[m].cacheCreationTokens ?? 0) + u.cacheCreationTokens;
+			}
 		}
 		for (const [e, u] of Object.entries(src.editorUsage)) {
 			if (!target.editorUsage[e]) { target.editorUsage[e] = { tokens: 0, sessions: 0 }; }
