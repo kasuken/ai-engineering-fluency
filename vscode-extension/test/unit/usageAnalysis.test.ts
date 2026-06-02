@@ -1342,11 +1342,11 @@ test('mergeUsageAnalysis: merges outputTokensByTool from multiple tools', () => 
     assert.equal(period.toolCalls.outputTokensByTool?.['edit'], 50);
 });
 
-test('analyzeSessionUsage: CLI JSONL tool.result with string content accumulates outputTokensByTool', async () => {
+test('analyzeSessionUsage: CLI JSONL tool.execution_complete with string content accumulates outputTokensByTool', async () => {
     const events = [
         { type: 'session.start', data: { selectedModel: 'claude-sonnet-4.5' }, timestamp: '2026-05-01T10:00:00Z' },
-        { type: 'tool.call', data: { toolName: 'read' } },
-        { type: 'tool.result', data: { toolName: 'read', result: { content: 'hello world this is file content' } } },
+        { type: 'tool.execution_start', data: { toolCallId: 'tc1', toolName: 'read', arguments: { path: '/foo' } } },
+        { type: 'tool.execution_complete', data: { toolCallId: 'tc1', success: true, result: { content: 'hello world this is file content' } } },
     ];
     const content = events.map(e => JSON.stringify(e)).join('\n');
     const deps = makeMockDeps();
@@ -1356,14 +1356,15 @@ test('analyzeSessionUsage: CLI JSONL tool.result with string content accumulates
     assert.ok((result.toolCalls.outputTokensByTool?.['read'] ?? 0) > 0, 'read tool should have output tokens');
 });
 
-test('analyzeSessionUsage: CLI JSONL tool.result with content array accumulates outputTokensByTool', async () => {
+test('analyzeSessionUsage: CLI JSONL tool.execution_complete with content array accumulates outputTokensByTool', async () => {
     const events = [
         { type: 'session.start', data: { selectedModel: 'claude-sonnet-4.5' }, timestamp: '2026-05-01T10:00:00Z' },
-        { type: 'tool.call', data: { toolName: 'search' } },
+        { type: 'tool.execution_start', data: { toolCallId: 'tc2', toolName: 'search', arguments: { query: 'foo' } } },
         {
-            type: 'tool.result',
+            type: 'tool.execution_complete',
             data: {
-                toolName: 'search',
+                toolCallId: 'tc2',
+                success: true,
                 result: {
                     content: [
                         { type: 'text', text: 'result one' },
@@ -1381,11 +1382,11 @@ test('analyzeSessionUsage: CLI JSONL tool.result with content array accumulates 
     assert.ok((result.toolCalls.outputTokensByTool?.['search'] ?? 0) > 0, 'search tool output tokens should be > 0');
 });
 
-test('analyzeSessionUsage: tool.result without content does not set outputTokensByTool', async () => {
+test('analyzeSessionUsage: tool.execution_complete without content does not set outputTokensByTool', async () => {
     const events = [
         { type: 'session.start', data: { selectedModel: 'claude-sonnet-4.5' }, timestamp: '2026-05-01T10:00:00Z' },
-        { type: 'tool.call', data: { toolName: 'run_in_terminal' } },
-        { type: 'tool.result', data: { toolName: 'run_in_terminal', result: {} } },
+        { type: 'tool.execution_start', data: { toolCallId: 'tc3', toolName: 'run_in_terminal', arguments: {} } },
+        { type: 'tool.execution_complete', data: { toolCallId: 'tc3', success: true, result: {} } },
     ];
     const content = events.map(e => JSON.stringify(e)).join('\n');
     const deps = makeMockDeps();

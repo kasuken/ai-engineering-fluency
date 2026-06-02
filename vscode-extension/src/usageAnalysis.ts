@@ -1680,32 +1680,10 @@ function _asuProcessCliEvents(event: any, cliState: AsuCliState, analysis: Sessi
 
 /** Handle tool.call / tool.result / tool.execution_start events. */
  
-/** Extract plain text from a CLI tool.result event's content (string or content-block array). */
-function _asuExtractToolResultText(event: any): string {
-	const content = event.data?.result?.content;
-	if (!content) { return ''; }
-	if (typeof content === 'string') { return content; }
-	if (Array.isArray(content)) {
-		return content
-			.filter((block: any) => block?.type === 'text' && typeof block.text === 'string')
-			.map((block: any) => block.text as string)
-			.join('');
-	}
-	return '';
-}
-
 function _asuHandleToolCallEvent(event: any, analysis: SessionUsageAnalysis, toolNameMap: { [key: string]: string }): void {
 	if (event.type !== 'tool.call' && event.type !== 'tool.result' && event.type !== 'tool.execution_start') { return; }
 	const toolName = event.data?.toolName || event.toolName || 'unknown';
 	recordToolOrMcpInvocation(toolName, analysis, toolNameMap);
-	if (event.type === 'tool.result' && !isMcpTool(toolName)) {
-		const resultText = _asuExtractToolResultText(event);
-		if (resultText) {
-			const tokens = estimateTokensFromText(resultText);
-			if (!analysis.toolCalls.outputTokensByTool) { analysis.toolCalls.outputTokensByTool = {}; }
-			analysis.toolCalls.outputTokensByTool[toolName] = (analysis.toolCalls.outputTokensByTool[toolName] || 0) + tokens;
-		}
-	}
 }
 
 /** Handle mcp.tool.call events and events with data.mcpServer set. */
@@ -1742,11 +1720,11 @@ function _asuEnsureEditScope(analysis: SessionUsageAnalysis): void {
 	}
 }
 
-/** Handle tool.execution_start for CLI LOC tracking — stores pending tool call args. */
+/** Handle tool.execution_start — stores pending tool call info for all tools (LOC + output token tracking). */
 function _asuHandleToolStart(event: any, cliState: AsuCliState): void {
 	const { toolCallId, toolName, arguments: args } = event.data ?? {};
-	if (toolCallId && (toolName === 'edit' || toolName === 'create') && args) {
-		cliState.pendingToolCalls.set(toolCallId, { toolName, args });
+	if (toolCallId && toolName) {
+		cliState.pendingToolCalls.set(toolCallId, { toolName, args: args ?? {} });
 	}
 }
 
@@ -1768,12 +1746,27 @@ function _asuApplyToolLoc(pending: { toolName: string; args: Record<string, stri
 	analysis.editScope!.languageUsage[ext].linesRemoved += linesRemoved;
 }
 
-/** Handle tool.execution_complete for CLI LOC tracking — applies LOC on success. */
+/** Handle tool.execution_complete — applies LOC tracking for edit/create and counts output tokens for all non-MCP tools. */
 function _asuHandleToolComplete(event: any, cliState: AsuCliState, analysis: SessionUsageAnalysis): void {
-	const { toolCallId, success } = event.data ?? {};
+	const { toolCallId, success, result } = event.data ?? {};
 	const pending = toolCallId ? cliState.pendingToolCalls.get(toolCallId) : undefined;
 	if (toolCallId) { cliState.pendingToolCalls.delete(toolCallId); }
-	if (pending && success) { _asuApplyToolLoc(pending, cliState, analysis); }
+	if (!pending) { return; }
+	if (success && (pending.toolName === 'edit' || pending.toolName === 'create')) {
+		_asuApplyToolLoc(pending, cliState, analysis);
+	}
+	if (result?.content && !isMcpTool(pending.toolName)) {
+		const content = result.content;
+		const resultText = typeof content === 'string' ? content
+			: Array.isArray(content)
+				? content.filter((b: any) => b?.type === 'text' && typeof b.text === 'string').map((b: any) => b.text as string).join('')
+				: '';
+		if (resultText) {
+			const tokens = estimateTokensFromText(resultText);
+			if (!analysis.toolCalls.outputTokensByTool) { analysis.toolCalls.outputTokensByTool = {}; }
+			analysis.toolCalls.outputTokensByTool[pending.toolName] = (analysis.toolCalls.outputTokensByTool[pending.toolName] || 0) + tokens;
+		}
+	}
 }
 
 /** Handle tool.execution_start / tool.execution_complete for CLI LOC tracking. */
