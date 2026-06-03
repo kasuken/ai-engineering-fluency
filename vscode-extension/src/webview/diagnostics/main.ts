@@ -374,6 +374,9 @@ function getEditorBadgeClass(editor: string): string {
   if (lower.includes("crush")) {
     return "editor-badge editor-badge-crush";
   }
+  if (lower.includes("pi")) {
+    return "editor-badge editor-badge-pi";
+  }
   return "editor-badge";
 }
 
@@ -385,6 +388,7 @@ function getEditorIcon(editor: string): string {
     ['gemini', '💎'], ['crush', '🩷'], ['opencode', '🟢'],
     ['cursor', '🖱️'], ['insiders', '💚'], ['vscodium', '🔵'],
     ['windsurf', '🏄'], ['vs code', '💙'], ['vscode', '💙'],
+    ['pi', 'π'],
   ];
   return ICONS.find(([key]) => lower.includes(key))?.[1] ?? '📝';
 }
@@ -2235,4 +2239,5 @@ async function bootstrap(): Promise<void> {
 }
 
 void bootstrap();
+
 
