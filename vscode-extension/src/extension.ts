@@ -452,6 +452,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private _githubSignedOutByUser: boolean = false;
 	/** Resolved Copilot plan details fetched from copilot_internal/user after sign-in. */
 	private _copilotPlanResolved: { planId: string; planName: string; monthlyAiCreditsUsd: number; monthlyPremiumRequests: number | null } | undefined;
+	/** Quota entitlements from copilot_internal/user response (e.g., premium_interactions entitlement). */
+	private _copilotQuotaEntitlements: { premium_interactions?: number; completions?: number } = {};
 
 	// Cached PR stats result for the repos tab
 	private _lastRepoPrStats?: RepoPrStatsResult;
@@ -1685,6 +1687,13 @@ class CopilotTokenTracker implements vscode.Disposable {
 			for (const [key, snapshot] of Object.entries(planInfo.quota_snapshots)) {
 				const qs = snapshot as any;
 				if (typeof qs === 'object' && qs !== null) {
+					// Capture entitlements for use in budget fallback
+					if (key === 'premium_interactions' && qs.entitlement != null) {
+						this._copilotQuotaEntitlements.premium_interactions = qs.entitlement;
+					} else if (key === 'completions' && qs.entitlement != null) {
+						this._copilotQuotaEntitlements.completions = qs.entitlement;
+					}
+
 					const parts: string[] = [];
 					if (qs.quota_id != null)              parts.push(`id=${qs.quota_id}`);
 					if (qs.entitlement != null)          parts.push(`entitlement=${qs.entitlement}`);
@@ -2648,10 +2657,15 @@ class CopilotTokenTracker implements vscode.Disposable {
 	}
 
 	/** Returns the effective monthly budget: the explicitly configured value if set, otherwise falls back
-	 *  to the monthly AI credits included with the user's Copilot plan (derived from license info). */
+	 *  to the monthly AI credits included with the user's Copilot plan, or the premium_interactions
+	 *  quota entitlement from the API if available. */
 	private getEffectiveMonthlyBudget(): number {
 		const configured = this.getMonthlyBudgetSetting();
 		if (configured > 0) { return configured; }
+		// Fall back to quota entitlement (premium_interactions) if available, then to plan credits
+		if (this._copilotQuotaEntitlements.premium_interactions) {
+			return this._copilotQuotaEntitlements.premium_interactions;
+		}
 		return this._copilotPlanResolved?.monthlyAiCreditsUsd ?? 0;
 	}
 
@@ -7823,6 +7837,7 @@ ${this.getLoadingHtmlScript()}
       cacheInfo, backendStorageInfo,
       backendConfigured: this.isBackendConfigured(), isDebugMode, globalStateCounters,
       displaySettings: { showTokens: this.getStatusBarShowTokensSetting(), showCost: this.getStatusBarShowCostSetting(), monthlyBudget: this.getMonthlyBudgetSetting() },
+      quotaEntitlements: this._copilotQuotaEntitlements,
       toolCallStats: this.lastUsageAnalysisStats?.last30Days?.toolCalls ?? null,
       toolFamilies: getToolFamilies(),
     }).replace(/</g, "\\u003c");
