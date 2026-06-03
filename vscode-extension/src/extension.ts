@@ -1687,16 +1687,16 @@ class CopilotTokenTracker implements vscode.Disposable {
 			for (const [key, snapshot] of Object.entries(planInfo.quota_snapshots)) {
 				const qs = snapshot as any;
 				if (typeof qs === 'object' && qs !== null) {
-					// Capture entitlements for use in budget fallback
+					// Capture entitlements (in cents) for use in budget fallback, convert to dollars
 					if (key === 'premium_interactions' && qs.entitlement != null) {
-						this._copilotQuotaEntitlements.premium_interactions = qs.entitlement;
+						this._copilotQuotaEntitlements.premium_interactions = qs.entitlement / 100;
 					} else if (key === 'completions' && qs.entitlement != null) {
-						this._copilotQuotaEntitlements.completions = qs.entitlement;
+						this._copilotQuotaEntitlements.completions = qs.entitlement / 100;
 					}
 
 					const parts: string[] = [];
 					if (qs.quota_id != null)              parts.push(`id=${qs.quota_id}`);
-					if (qs.entitlement != null)          parts.push(`entitlement=${qs.entitlement}`);
+					if (qs.entitlement != null)          parts.push(`entitlement=${qs.entitlement} cents ($${(qs.entitlement / 100).toFixed(2)})`);
 					if (qs.unlimited != null)            parts.push(`unlimited=${qs.unlimited}`);
 					if (qs.quota_remaining != null)      parts.push(`remaining=${qs.quota_remaining}`);
 					if (qs.percent_remaining != null)    parts.push(`${qs.percent_remaining}%`);

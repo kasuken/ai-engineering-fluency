@@ -1901,7 +1901,7 @@ Set a monthly AI spend budget in USD to get visual alerts on the status bar. The
 <p class="hint">Budget coloring uses the current calendar month's estimated cost. Set to 0 to disable.</p>
 ${
   data.quotaEntitlements && data.quotaEntitlements.premium_interactions
-    ? `<p class="hint" style="color: #90ee90;"><strong>ℹ️ API-driven budget:</strong> Your premium_interactions quota entitlement is <strong>$${data.quotaEntitlements.premium_interactions}</strong>/month. If the budget above is 0 or empty, this API value will be used as your effective budget.</p>`
+    ? `<p class="hint" style="color: #90ee90;"><strong>ℹ️ API-driven budget:</strong> Your premium_interactions quota entitlement is <strong>$${data.quotaEntitlements.premium_interactions.toFixed(2)}</strong>/month. If the budget above is 0 or empty, this API value will be used as your effective budget.</p>`
     : ''
 }
 </div>
@@ -1912,11 +1912,11 @@ ${
     ? `<p>
 ${
       data.quotaEntitlements.premium_interactions
-        ? `<strong>Premium Interactions:</strong> $${data.quotaEntitlements.premium_interactions}/month<br/>`
+        ? `<strong>Premium Interactions:</strong> $${data.quotaEntitlements.premium_interactions.toFixed(2)}/month<br/>`
         : ''
 }${
       data.quotaEntitlements.completions
-        ? `<strong>Completions:</strong> $${data.quotaEntitlements.completions}/month<br/>`
+        ? `<strong>Completions:</strong> $${data.quotaEntitlements.completions.toFixed(2)}/month<br/>`
         : ''
 }
     </p>`
