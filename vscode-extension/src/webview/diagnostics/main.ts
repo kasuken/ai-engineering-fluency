@@ -374,7 +374,8 @@ function getEditorBadgeClass(editor: string): string {
   if (lower.includes("crush")) {
     return "editor-badge editor-badge-crush";
   }
-  if (lower.includes("pi")) {
+  // Exact match required: 'copilot' contains the substring 'pi' and would false-positive.
+  if (lower === 'pi') {
     return "editor-badge editor-badge-pi";
   }
   return "editor-badge";
@@ -387,9 +388,11 @@ function getEditorIcon(editor: string): string {
     ['visual studio', '🪟'], ['mistral', '🔥'], ['antigravity', '🚀'],
     ['gemini', '💎'], ['crush', '🩷'], ['opencode', '🟢'],
     ['cursor', '🖱️'], ['insiders', '💚'], ['vscodium', '🔵'],
-    ['windsurf', '🏄'], ['vs code', '💙'], ['vscode', '💙'],
+    ['windsurf', '🏄'], ['copilot', '🤖'], ['vs code', '💙'], ['vscode', '💙'],
     ['pi', 'π'],
   ];
+  // 'copilot' contains the substring 'pi', so use exact match for Pi.
+  if (lower === 'pi') { return 'π'; }
   return ICONS.find(([key]) => lower.includes(key))?.[1] ?? '📝';
 }
 
