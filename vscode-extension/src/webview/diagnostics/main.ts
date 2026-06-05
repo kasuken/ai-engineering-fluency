@@ -1675,8 +1675,86 @@ function handleDiagnosticDataError(message: DiagMessage): void {
   }
 }
 
+function sanitizeNumericRecord(input: unknown): Record<string, number> {
+  if (!input || typeof input !== "object") {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(input as Record<string, unknown>).map(([key, value]) => [key, Number(value ?? 0) || 0]),
+  );
+}
+
+function sanitizeDetailedSessionFiles(input: unknown): SessionFileDetails[] {
+  if (!Array.isArray(input)) {
+    return [];
+  }
+
+  return input.map((item) => {
+    const sf = (item ?? {}) as Record<string, unknown>;
+    const contextRefs = (sf.contextReferences ?? {}) as Record<string, unknown>;
+    const parentInfo = sf.parentInfo && typeof sf.parentInfo === "object"
+      ? (sf.parentInfo as Record<string, unknown>)
+      : undefined;
+
+    const childInfo = Array.isArray(sf.childInfo)
+      ? sf.childInfo
+        .filter((child): child is Record<string, unknown> => !!child && typeof child === "object")
+        .map((child) => ({
+          uuid: String(child.uuid ?? ""),
+          name: String(child.name ?? ""),
+          sessionFile: child.sessionFile == null ? undefined : String(child.sessionFile),
+        }))
+      : undefined;
+
+    return {
+      file: String(sf.file ?? sf.sessionFile ?? ""),
+      editorSource: String(sf.editorSource ?? ""),
+      editorRoot: sf.editorRoot == null ? undefined : String(sf.editorRoot),
+      editorName: sf.editorName == null ? undefined : String(sf.editorName),
+      title: sf.title == null ? undefined : String(sf.title),
+      repository: sf.repository == null ? undefined : String(sf.repository),
+      size: Number(sf.size ?? 0) || 0,
+      modified: String(sf.modified ?? ""),
+      tokens: Number(sf.tokens ?? 0) || 0,
+      interactions: Number(sf.interactions ?? 0) || 0,
+      firstInteraction: sf.firstInteraction == null ? null : String(sf.firstInteraction),
+      lastInteraction: sf.lastInteraction == null ? null : String(sf.lastInteraction),
+      contextReferences: {
+        file: Number(contextRefs.file ?? 0) || 0,
+        symbol: Number(contextRefs.symbol ?? 0) || 0,
+        selection: Number(contextRefs.selection ?? 0) || 0,
+        implicitSelection: Number(contextRefs.implicitSelection ?? 0) || 0,
+        codebase: Number(contextRefs.codebase ?? 0) || 0,
+        workspace: Number(contextRefs.workspace ?? 0) || 0,
+        terminal: Number(contextRefs.terminal ?? 0) || 0,
+        vscode: Number(contextRefs.vscode ?? 0) || 0,
+        terminalLastCommand: Number(contextRefs.terminalLastCommand ?? 0) || 0,
+        terminalSelection: Number(contextRefs.terminalSelection ?? 0) || 0,
+        clipboard: Number(contextRefs.clipboard ?? 0) || 0,
+        changes: Number(contextRefs.changes ?? 0) || 0,
+        outputPanel: Number(contextRefs.outputPanel ?? 0) || 0,
+        problemsPanel: Number(contextRefs.problemsPanel ?? 0) || 0,
+        pullRequest: Number(contextRefs.pullRequest ?? 0) || 0,
+        byKind: sanitizeNumericRecord(contextRefs.byKind),
+        copilotInstructions: Number(contextRefs.copilotInstructions ?? 0) || 0,
+        agentsMd: Number(contextRefs.agentsMd ?? 0) || 0,
+        byPath: sanitizeNumericRecord(contextRefs.byPath),
+      },
+      parentInfo: parentInfo
+        ? {
+            uuid: String(parentInfo.uuid ?? ""),
+            name: String(parentInfo.name ?? ""),
+            sessionFile: parentInfo.sessionFile == null ? undefined : String(parentInfo.sessionFile),
+          }
+        : undefined,
+      childInfo,
+      totalChildCount: sf.totalChildCount == null ? undefined : Number(sf.totalChildCount),
+    } as SessionFileDetails;
+  });
+}
+
 function handleSessionFilesLoaded(message: DiagMessage): void {
-  storedDetailedFiles = message.detailedSessionFiles;
+  storedDetailedFiles = sanitizeDetailedSessionFiles(message.detailedSessionFiles);
   isLoading = false;
 
   const sessionsTab = document.querySelector('.tab[data-tab="sessions"]');
@@ -2242,5 +2320,3 @@ async function bootstrap(): Promise<void> {
 }
 
 void bootstrap();
-
-
