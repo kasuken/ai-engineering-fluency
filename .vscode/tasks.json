@@ -17,7 +17,7 @@
       "presentation": {
         "reveal": "always"
       },
-      "problemMatcher": []
+      "problemMatcher": ["$tsc", "$eslint-stylish"]
     },
     {
       "label": "esbuild",
