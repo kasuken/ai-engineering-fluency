@@ -84,7 +84,44 @@ type UsageAnalysisStats = {
 	todaySessions?: TodaySessionSummary[];
 	use24HourTime?: boolean;
 	insights?: EvaluatedInsight[];
+	curationAnalysis?: ToolCurationAnalysis | null;
 };
+
+// ── Tool Curation types ──────────────────────────────────────────────────────
+// These mirror the interfaces in vscode-extension/src/types.ts.
+// They must be kept in sync manually because the webview bundle cannot import
+// extension-side TypeScript modules directly.
+
+type AvailableToolSource = 'builtin' | 'mcp' | 'extension' | 'skill';
+
+interface AvailableToolEntry {
+	name: string;
+	description: string;
+	source: AvailableToolSource;
+	server?: string;
+	extensionId?: string;
+	skillPath?: string;
+	configFiles?: string[];
+	enabled?: boolean;
+	extensionActive?: boolean;
+}
+
+interface ToolCurationRecommendation {
+	type: 'disable-mcp-server' | 'disable-extension' | 'refine-skill' | 'remove-skill';
+	target: string;
+	reason: string;
+	estimatedTokenSavings?: number;
+}
+
+interface ToolCurationAnalysis {
+	windowDays: number;
+	availableTools: AvailableToolEntry[];
+	usedTools: { name: string; count: number }[];
+	unusedTools: AvailableToolEntry[];
+	underusedMcpServers: { server: string; availableToolCount: number; usedToolCount: number; configFiles?: string[]; extensionId?: string; enabled?: boolean; extensionActive?: boolean }[];
+	estimatedPromptBloat: { totalTokens: number; byServer: Record<string, number> };
+	recommendations: ToolCurationRecommendation[];
+}
 
 declare function acquireVsCodeApi<TState = unknown>(): {
 	postMessage: (message: unknown) => void;
@@ -195,6 +232,9 @@ let currentWorkspacePaths: string[] = [];
 let activeTab = 'activity';
 let loadingTimeoutId: ReturnType<typeof setTimeout> | null = null;
 let currentInsights: EvaluatedInsight[] = [];
+// Persisted across stats refreshes so the curation section doesn't disappear
+// when a periodic updateStats message omits curationAnalysis.
+let currentCurationAnalysis: ToolCurationAnalysis | null = null;
 
 function clearLoadingTimeout(): void {
 	if (loadingTimeoutId !== null) {
@@ -912,6 +952,23 @@ function sanitizeStats(raw: any): UsageAnalysisStats | null {
 			sanitized.insights = sanitizeInsights(raw.insights);
 		}
 
+		// Pass through curationAnalysis (already structured server-side).
+		// Normalize required array/object fields so rendering paths don't throw on partial payloads.
+		if (raw.curationAnalysis && typeof raw.curationAnalysis === 'object') {
+			const ca = raw.curationAnalysis as Partial<ToolCurationAnalysis>;
+			sanitized.curationAnalysis = {
+				windowDays: typeof ca.windowDays === 'number' ? ca.windowDays : 30,
+				availableTools: Array.isArray(ca.availableTools) ? ca.availableTools : [],
+				usedTools: Array.isArray(ca.usedTools) ? ca.usedTools : [],
+				unusedTools: Array.isArray(ca.unusedTools) ? ca.unusedTools : [],
+				underusedMcpServers: Array.isArray(ca.underusedMcpServers) ? ca.underusedMcpServers : [],
+				estimatedPromptBloat: ca.estimatedPromptBloat && typeof ca.estimatedPromptBloat === 'object'
+					? ca.estimatedPromptBloat
+					: { totalTokens: 0, byServer: {} },
+				recommendations: Array.isArray(ca.recommendations) ? ca.recommendations : [],
+			};
+		}
+
 		return sanitized;
 	} catch {
 		return null;
@@ -1551,6 +1608,254 @@ function buildMcpToolsSectionHtml(
 		</div>`;
 }
 
+function buildCurationSummaryHtml(availableTools: AvailableToolEntry[], unusedTools: AvailableToolEntry[], bloat: ToolCurationAnalysis['estimatedPromptBloat']): string {
+	const usedCount = availableTools.length - unusedTools.length;
+	const severityColor = unusedTools.length > 0 ? 'rgba(251,191,36,0.12)' : 'rgba(74,222,128,0.12)';
+	const severityBorder = unusedTools.length > 0 ? 'rgba(251,191,36,0.4)' : 'rgba(74,222,128,0.4)';
+	const unusedColor = unusedTools.length > 0 ? '#fbbf24' : '#4ade80';
+	const totalBloat = bloat.totalTokens;
+	const skillBloat = bloat.byServer['skill'] ?? 0;
+	const builtinBloat = bloat.byServer['builtin'] ?? 0;
+	const mcpBloat = totalBloat - skillBloat - builtinBloat;
+	const fmt = (n: number) => n >= 1000 ? `~${Math.round(n / 1000)}K` : `~${n}`;
+	const actionableBloat = mcpBloat + skillBloat;
+	const actionableParts: string[] = [];
+	if (mcpBloat > 0) { actionableParts.push(`${fmt(mcpBloat)} MCP`); }
+	if (skillBloat > 0) { actionableParts.push(`${fmt(skillBloat)} skills`); }
+	return `<div style="display:flex; gap:16px; flex-wrap:wrap; margin:12px 0;">
+		<div style="background:var(--bg-tertiary); border:1px solid var(--border-color); border-radius:6px; padding:10px 16px; min-width:120px; text-align:center;">
+			<div style="font-size:20px; font-weight:700; color:var(--text-primary);">${formatNumber(availableTools.length)}</div>
+			<div style="font-size:11px; color:var(--text-primary); opacity:0.75;">Available</div>
+		</div>
+		<div style="background:var(--bg-tertiary); border:1px solid var(--border-color); border-radius:6px; padding:10px 16px; min-width:120px; text-align:center;">
+			<div style="font-size:20px; font-weight:700; color:#4ade80;">${formatNumber(usedCount)}</div>
+			<div style="font-size:11px; color:var(--text-primary); opacity:0.75;">Used</div>
+		</div>
+		<div style="background:${severityColor}; border:1px solid ${severityBorder}; border-radius:6px; padding:10px 16px; min-width:120px; text-align:center;">
+			<div style="font-size:20px; font-weight:700; color:${unusedColor};">${formatNumber(unusedTools.length)}</div>
+			<div style="font-size:11px; color:var(--text-primary); opacity:0.75;">Unused</div>
+		</div>
+		${actionableBloat > 0 ? `<div style="background:rgba(239,68,68,0.1); border:1px solid rgba(239,68,68,0.3); border-radius:6px; padding:10px 16px; min-width:140px; text-align:center;" title="Overhead you can reduce by disabling unused MCP servers or removing unused skills">
+			<div style="font-size:20px; font-weight:700; color:#f87171;">${fmt(actionableBloat)}</div>
+			<div style="font-size:11px; color:var(--text-primary); opacity:0.75;">Actionable overhead</div>
+			${actionableParts.length > 0 ? `<div style="font-size:10px; color:var(--text-secondary); margin-top:2px;">${escapeHtml(actionableParts.join(' + '))}</div>` : ''}
+		</div>` : ''}
+		${builtinBloat > 0 ? `<div style="background:var(--bg-tertiary); border:1px solid var(--border-color); border-radius:6px; padding:10px 16px; min-width:140px; text-align:center; opacity:0.7;" title="Overhead from VS Code built-in tools — cannot be disabled">
+			<div style="font-size:20px; font-weight:700; color:var(--text-secondary);">${fmt(builtinBloat)}</div>
+			<div style="font-size:11px; color:var(--text-primary); opacity:0.75;">Built-in overhead</div>
+			<div style="font-size:10px; color:var(--text-secondary); margin-top:2px;">not actionable</div>
+		</div>` : ''}
+	</div>`;
+}
+
+function buildUnusedMcpHtml(underusedMcpServers: ToolCurationAnalysis['underusedMcpServers'], bloat: ToolCurationAnalysis['estimatedPromptBloat'], windowDays: number): string {
+	// Show all servers, zero-usage first, then partially used, then fully used.
+	const allServers = [...underusedMcpServers].sort((a, b) => {
+		// Sort key: zero-usage → partial-usage → fully-used
+		const aKey = a.usedToolCount === 0 ? 0 : a.usedToolCount < a.availableToolCount ? 1 : 2;
+		const bKey = b.usedToolCount === 0 ? 0 : b.usedToolCount < b.availableToolCount ? 1 : 2;
+		return aKey !== bKey ? aKey - bKey : a.usedToolCount - b.usedToolCount;
+	});
+	if (allServers.length === 0) { return ''; }
+	const toggleId = 'mcp-hide-used-toggle';
+	/** Derive a human-readable scope label from a server's config files / extension id. */
+	function mcpSourceLabel(s: typeof allServers[0]): string {
+		if (s.extensionId) { return 'Extension'; }
+		if (!s.configFiles || s.configFiles.length === 0) { return 'Settings'; }
+		const labels = new Set<string>();
+		for (const f of s.configFiles) {
+			const p = f.replace(/\\/g, '/');
+			if (p.includes('/.vscode/')) { labels.add('Workspace'); }
+			else if (p.includes('/.vs/')) { labels.add('Workspace (VS)'); }
+			else if (p.includes('/.cursor/')) { labels.add('Workspace (Cursor)'); }
+			else if (p.endsWith('/.mcp.json')) {
+				// Could be workspace root or user home — show last 2 segments as hint
+				const parts = p.split('/');
+				labels.add(parts.slice(-2).join('/'));
+			} else {
+				labels.add('Config file');
+			}
+		}
+		return [...labels].join(', ');
+	}
+
+	const rows = allServers.map(s => {
+		const b = bloat.byServer[s.server] ?? 0;
+		const sourceLabel = mcpSourceLabel(s);
+		const sourceTip = s.configFiles?.join('\n') ?? s.extensionId ?? '';
+		let sourceOpenBtn = '';
+		if (s.configFiles && s.configFiles.length === 1) {
+			sourceOpenBtn = ` <button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(s.configFiles[0])}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open ${escapeHtml(s.configFiles[0])}">open</button>`;
+		} else if (s.configFiles && s.configFiles.length > 1) {
+			sourceOpenBtn = ` <button class="curation-file-btn" data-command="openFileFromList" data-paths="${escapeHtml(JSON.stringify(s.configFiles))}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="${escapeHtml(sourceTip)}">open</button>`;
+		} else if (s.extensionId) {
+			sourceOpenBtn = ` <button class="curation-file-btn" data-command="manageExtension" data-extension-id="${escapeHtml(s.extensionId)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open Extensions view for ${escapeHtml(s.extensionId)}">open</button>`;
+		} else {
+			// Configured via VS Code UI settings — search the marketplace for MCP extensions
+			sourceOpenBtn = ` <button class="curation-file-btn" data-command="searchMcpExtensions" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Browse MCP extensions in the marketplace">open</button>`;
+		}
+		let actionCell: string;
+		if (s.extensionId) {
+			actionCell = `<button class="curation-file-btn" data-command="manageExtension" data-extension-id="${escapeHtml(s.extensionId)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open the Extensions view for ${escapeHtml(s.extensionId)} (disable or uninstall to reclaim prompt budget)">Manage Extension</button>`;
+		} else if (!s.configFiles || s.configFiles.length === 0) {
+			actionCell = `<button class="curation-file-btn" data-command="openToolPicker" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open VS Code tool selection menu">Change Tools</button>`;
+		} else if (s.configFiles.length === 1) {
+			actionCell = `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(s.configFiles[0])}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open ${escapeHtml(s.configFiles[0])}">Change Tools</button>`;
+		} else {
+			actionCell = `<button class="curation-file-btn" data-command="openFileFromList" data-paths="${escapeHtml(JSON.stringify(s.configFiles))}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Defined in ${s.configFiles.length} config files">Change Tools</button>`;
+		}
+		const notConnected = s.availableToolCount === 0;
+		return `<tr class="${s.usedToolCount > 0 ? 'mcp-has-usage' : ''}">
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${escapeHtml(s.server)}</td>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;" title="${escapeHtml(sourceTip)}">${escapeHtml(sourceLabel)}${sourceOpenBtn}</td>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${notConnected ? '<em style="color:var(--text-secondary)">not connected</em>' : s.availableToolCount}</td>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${notConnected ? '—' : s.usedToolCount}</td>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${b > 0 ? `~${b.toLocaleString()} tokens` : '—'}</td>
+			<td style="padding:5px 8px; font-size:12px;">${actionCell}</td>
+		</tr>`;
+	}).join('');
+	// Find the best config file to link in the tip — prefer .vscode/mcp.json, then any file.
+	const allConfigFiles = [...new Set(
+		allServers.filter(s => !s.extensionId).flatMap(s => s.configFiles ?? [])
+	)];
+	const preferredFile = allConfigFiles.find(f => f.replace(/\\/g, '/').endsWith('.vscode/mcp.json'))
+		?? allConfigFiles[0];
+	let mcpJsonLink: string;
+	if (preferredFile) {
+		const displayName = preferredFile.replace(/\\/g, '/').split('/').slice(-3).join('/');
+		mcpJsonLink = `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(preferredFile)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="${escapeHtml(preferredFile)}">${escapeHtml(displayName)}</button>`;
+	} else {
+		mcpJsonLink = `<code>.vscode/mcp.json</code>`;
+	}
+	const usedCount = allServers.filter(s => s.usedToolCount > 0).length;
+	const unusedCount = allServers.length - usedCount;
+	// Pure CSS checkbox trick: input and .mcp-table-wrap are siblings inside <details>;
+	// the :checked ~ sibling combinator works without any JS (inline handlers are CSP-blocked).
+	return `<details style="margin-top:12px;" open>
+		<summary style="cursor:pointer; font-size:13px; font-weight:600; color:var(--text-primary); padding:6px 0;">
+			🔌 MCP Servers in Last ${windowDays} Days (${allServers.length})
+		</summary>
+		<style>#mcp-hide-toggle:checked ~ .mcp-table-wrap .mcp-has-usage { display: none; }</style>
+		<div style="display:flex; align-items:center; gap:6px; margin:6px 0;">
+			<input type="checkbox" id="mcp-hide-toggle" checked style="margin:0; cursor:pointer; flex-shrink:0;">
+			<label for="mcp-hide-toggle" style="font-size:12px; color:var(--text-primary); cursor:pointer; user-select:none;">Hide servers with usage</label>
+			<span style="font-size:11px; color:var(--text-secondary);">${unusedCount} with no usage · ${usedCount} with usage</span>
+		</div>
+		<div class="mcp-table-wrap" style="margin-top:8px; overflow-x:auto;">
+			<table style="width:100%; border-collapse:collapse; font-size:12px;">
+				<thead><tr style="border-bottom:1px solid var(--border-color);">
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Server</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Source</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Tools Available</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Tools Used</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Est. Overhead</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Action</th>
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table>
+			<div style="margin-top:8px; font-size:11px; color:var(--text-secondary);">💡 Open ${mcpJsonLink} to disable file-configured servers, or use <em>Manage Extension</em> to disable or uninstall an MCP-providing extension. (VS Code does not expose per-server picker state to extensions, so servers you disabled in the chat tool picker may still appear here.)</div>
+		</div>
+	</details>`;
+}
+
+function buildUnusedSkillsHtml(unusedSkills: AvailableToolEntry[]): string {
+	if (unusedSkills.length === 0) { return ''; }
+	const rows = unusedSkills.map(s => {
+		const skillFile = s.configFiles?.[0];
+		const viewLink = skillFile
+			? `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(skillFile)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:12px;text-decoration:underline;" title="Open ${escapeHtml(skillFile)}">View skill def.</button>`
+			: '—';
+		// Derive a human-readable source label from the skillPath / configFiles.
+		// skillPath is workspace-relative (e.g. ".github/skills/pdf/SKILL.md");
+		// user-scope paths have no workspace-relative path (s.skillPath starts with HOME).
+		let sourceLabel = '—';
+		if (s.skillPath) {
+			if (s.skillPath.startsWith('.github/skills')) { sourceLabel = 'Workspace (.github)'; }
+			else if (s.skillPath.startsWith('.claude/skills')) { sourceLabel = 'Workspace (.claude)'; }
+			else if (s.skillPath.startsWith('.agents/skills')) { sourceLabel = 'Workspace (.agents)'; }
+			else { sourceLabel = 'User (~)'; }
+		}
+		// Estimate per-skill prompt token overhead using the same formula as the backend
+		// (name + description + ~10 chars of JSON framing, divided by 4 chars/token).
+		const estTokens = Math.round((s.name.length + s.description.length + 10) / 4);
+		const overheadCell = `~${estTokens.toLocaleString()} tokens`;
+		return `<tr>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${escapeHtml(s.name)}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${sourceLabel}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(s.description)}">${escapeHtml(s.description)}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${overheadCell}</td>
+		<td style="padding:5px 8px; font-size:12px; white-space:nowrap;">${viewLink}</td>
+	</tr>`;
+	}).join('');
+	return `<details style="margin-top:8px;" open>
+		<summary style="cursor:pointer; font-size:13px; font-weight:600; color:var(--text-primary); padding:6px 0;">
+			📚 Unused Skills (${unusedSkills.length})
+		</summary>
+		<div style="margin-top:8px; overflow-x:auto;">
+			<table style="width:100%; border-collapse:collapse; font-size:12px;">
+				<thead><tr style="border-bottom:1px solid var(--border-color);">
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Skill</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Source</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Description</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Est. Overhead</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">View</th>
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table>
+			<div style="margin-top:8px; font-size:11px; color:var(--text-secondary);">💡 Est. overhead is per agent interaction (skill descriptions appear in every prompt). Update skill descriptions so Copilot selects them, or remove skills that are no longer needed.</div>
+		</div>
+	</details>`;
+}
+
+function buildBuiltinToolsHtml(builtinTools: AvailableToolEntry[], bloat: ToolCurationAnalysis['estimatedPromptBloat']): string {
+	if (builtinTools.length === 0) { return ''; }
+	const builtinBloat = bloat.byServer['builtin'] ?? 0;
+	const rows = builtinTools.map(t => {
+		const overhead = Math.round((t.name.length + (t.description?.length ?? 0) + 10) / 4);
+		return `<tr>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${escapeHtml(t.name)}</td>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; max-width:400px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(t.description ?? '')}">${escapeHtml(t.description ?? '—')}</td>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">~${overhead} tokens</td>
+		</tr>`;
+	}).join('');
+	const fmt = (n: number) => n >= 1000 ? `~${Math.round(n / 1000)}K` : `~${n}`;
+	return `<details style="margin-top:12px;">
+		<summary style="cursor:pointer; font-size:13px; font-weight:600; color:var(--text-primary); padding:6px 0;">
+			🔧 Built-in VS Code Tools (${builtinTools.length}) — ${fmt(builtinBloat)} tokens overhead, not actionable
+		</summary>
+		<div style="margin-top:8px; overflow-x:auto;">
+			<table style="width:100%; border-collapse:collapse; font-size:12px;">
+				<thead><tr style="border-bottom:1px solid var(--border-color);">
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Tool</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Description</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Est. Overhead</th>
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table>
+			<div style="margin-top:8px; font-size:11px; color:var(--text-secondary);">💡 These tools are provided by VS Code itself and cannot be disabled. They are excluded from the actionable overhead total above.</div>
+		</div>
+	</details>`;
+}
+
+function buildCurationSectionHtml(curation: ToolCurationAnalysis | null | undefined): string {
+	if (!curation || curation.availableTools.length === 0) { return ''; }
+
+	const { availableTools, unusedTools, underusedMcpServers, estimatedPromptBloat, windowDays } = curation;
+	const unusedSkills = unusedTools.filter(t => t.source === 'skill');
+	const builtinTools = availableTools.filter(t => t.source === 'builtin');
+
+	return `
+		<!-- Tool Curation Section -->
+		<div id="section-tool-curation" class="section">
+			<div class="section-title"><span>✂️</span><span>Tool Curation</span></div>
+			<div class="section-subtitle" style="color:var(--text-primary); opacity:0.75;">Compare available tools against actual usage to reduce prompt overhead (last ${windowDays} days)</div>
+			${buildCurationSummaryHtml(availableTools, unusedTools, estimatedPromptBloat)}
+			${buildUnusedMcpHtml(underusedMcpServers, estimatedPromptBloat, windowDays)}
+			${buildBuiltinToolsHtml(builtinTools, estimatedPromptBloat)}
+			${buildUnusedSkillsHtml(unusedSkills)}
+		</div>`;
+}
+
 function buildReposAndAgentTabPanelsHtml(): string {
 	return `
 		<div id="tab-panel-repos" class="tab-panel"${activeTab !== 'repos' ? ' style="display:none"' : ''}>
@@ -1721,6 +2026,34 @@ function refreshInsightsPanel(insights: EvaluatedInsight[]): void {
 	container.innerHTML = forYouSection + allSection;
 	wireInsightCardButtons();
 	updateTabButtonCount(insights);
+}
+
+function wireCurationButtons(): void {
+	const section = document.getElementById('section-tool-curation');
+	if (!section) { return; }
+	section.querySelectorAll<HTMLButtonElement>('.curation-file-btn').forEach(btn => {
+		btn.addEventListener('click', () => {
+			const command = btn.getAttribute('data-command');
+			if (!command) { return; }
+			if (command === 'openFile') {
+				const filePath = btn.getAttribute('data-path');
+				if (filePath) { vscode.postMessage({ command: 'openFile', path: filePath }); }
+			} else if (command === 'openFileFromList') {
+				const pathsJson = btn.getAttribute('data-paths');
+				if (pathsJson) {
+					try {
+						const paths = JSON.parse(pathsJson) as string[];
+						vscode.postMessage({ command: 'openFileFromList', paths });
+					} catch { /* ignore malformed JSON */ }
+				}
+			} else if (command === 'manageExtension') {
+				const extensionId = btn.getAttribute('data-extension-id');
+				if (extensionId) { vscode.postMessage({ command: 'manageExtension', extensionId }); }
+			} else {
+				vscode.postMessage({ command });
+			}
+		});
+	});
 }
 
 function wireInsightCardButtons(): void {
@@ -2085,6 +2418,7 @@ function buildToolsTabPanelHtml(
 			</div>
 
 			${buildMcpToolsSectionHtml(stats, allMcpToolKeys, allMcpServerKeys)}
+			${buildCurationSectionHtml(currentCurationAnalysis ?? stats.curationAnalysis)}
 			<!-- Multi-Model Usage Section -->
 			<div class="section">
 				<div class="section-title"><span>🔀</span><span>Multi-Model Usage</span></div>
@@ -2115,6 +2449,10 @@ function renderLayout(stats: UsageAnalysisStats): void {
 	}
 	if (Array.isArray(stats.currentWorkspacePaths)) {
 		currentWorkspacePaths = stats.currentWorkspacePaths;
+	}
+	// Persist curation analysis across refreshes — periodic updateStats may omit it
+	if (stats.curationAnalysis) {
+		currentCurationAnalysis = stats.curationAnalysis;
 	}
 
 	const customizationHtml = buildCustomizationSectionHtml(matrix);
@@ -2153,6 +2491,7 @@ function renderLayout(stats: UsageAnalysisStats): void {
 
 	wireNavigationButtons();
 	wireRepositoryButtons();
+	wireCurationButtons();
 	renderRepositoryHygienePanels();
 	setupTabs();
 	wireCopyButtons();
@@ -2331,8 +2670,7 @@ function handleUpdateInsights(rawInsights: unknown): void {
 	refreshInsightsPanel(sanitized);
 }
 
-// Listen for messages from the extension
-registerMessageHandler<any>((message) => {
+function handleExtensionMessage(message: any): void {
 	switch (message.command) {
 		case 'repoAnalysisResults':
 			displayRepoAnalysisResults(message.data, message.workspacePath); break;
@@ -2362,13 +2700,25 @@ registerMessageHandler<any>((message) => {
 			break;
 		case 'updateInsights':
 			handleUpdateInsights(message.insights); break;
-		case 'switchTab': {
-			const btn = document.querySelector<HTMLButtonElement>(`.tab-button[data-tab="${String(message.tab)}"]`);
-			btn?.click();
-			break;
+		case 'switchTab':
+			handleSwitchTab(message); break;
+	}
+}
+
+function handleSwitchTab(message: any): void {
+	const btn = document.querySelector<HTMLButtonElement>(`.tab-button[data-tab="${String(message.tab)}"]`);
+	btn?.click();
+	if (message.anchor) {
+		const anchor = document.getElementById(String(message.anchor));
+		if (anchor) {
+			// Use setTimeout to let the tab panel become visible before scrolling
+			setTimeout(() => anchor.scrollIntoView({ behavior: 'smooth', block: 'start' }), 50);
 		}
 	}
-});
+}
+
+// Listen for messages from the extension
+registerMessageHandler<any>((message) => { handleExtensionMessage(message); });
 
 function getWorkspaceName(workspacePath: string): string {
 	const workspace = hygieneMatrixState?.workspaces.find((ws) => ws.workspacePath === workspacePath);
@@ -2858,9 +3208,6 @@ async function bootstrap(): Promise<void> {
 		// Stats will arrive via the updateStats message; the module-level listener will call renderLayout then.
 		return;
 	}
-	console.log('[Usage Analysis] Browser default locale:', Intl.DateTimeFormat().resolvedOptions().locale);
-	console.log('[Usage Analysis] Received locale from extension:', initialData.locale);
-	console.log('[Usage Analysis] Test format 1234567.89 with received locale:', new Intl.NumberFormat(initialData.locale).format(1234567.89));
 	setFormatLocale(initialData.locale);
 	use24HourTime = initialData.use24HourTime !== false;
 	renderLayout(initialData);

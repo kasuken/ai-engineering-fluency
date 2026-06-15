@@ -59,7 +59,18 @@ import type {
   SessionRelationRef,
   EvaluatedInsight,
   InsightStateBag,
+  ToolCurationAnalysis,
 } from './types';
+
+// --- Tool curation ---
+import {
+  enumerateRuntimeTools as _enumerateRuntimeTools,
+  enumerateExtensionMcpServers as _enumerateExtensionMcpServers,
+  buildMcpEntriesFromJson as _buildMcpEntriesFromJson,
+  buildMcpEntriesFromSettings as _buildMcpEntriesFromSettings,
+  discoverSkillEntries as _discoverSkillEntries,
+  analyzeToolCuration as _analyzeToolCuration,
+} from './toolCuration';
 
 // --- Insights engine ---
 import {
@@ -648,6 +659,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 	 * Returns true if the command was recognised and dispatched, false if it is panel-specific.
 	 */
 	private async dispatchSharedCommand(message: { command: string; [key: string]: any }): Promise<boolean> {
+		if (message.command === 'openToolPicker') {
+			this.log(`📨 dispatchSharedCommand received: ${message.command}`);
+		}
 		if (message.command === 'extensionPointAction' && typeof message.buttonId === 'string') {
 			return this.handleExtensionPointAction(message.buttonId);
 		}
@@ -660,9 +674,88 @@ class CopilotTokenTracker implements vscode.Disposable {
 			showDashboard:          () => this.showDashboard(),
 			showEnvironmental:      () => this.showEnvironmental(),
 			showFluencyLevelViewer: () => this.showFluencyLevelViewer(),
+			openFile:               () => {
+				if (typeof message.path === 'string' && message.path) {
+					void vscode.window.showTextDocument(vscode.Uri.file(message.path));
+				}
+			},
+			openToolPicker:         async () => {
+				this.log('🔧 openToolPicker: handler invoked');
+				const allCommands = await vscode.commands.getCommands(true);
+				const configureToolsId = 'workbench.action.chat.configureTools';
+				const hasConfigure = allCommands.includes(configureToolsId);
+				this.log(`🔧 openToolPicker: '${configureToolsId}' registered = ${hasConfigure}`);
+
+				if (!hasConfigure) {
+					// Fallback for older VS Code: open chat panel + notify user
+					this.log('🔧 openToolPicker: command not registered, opening chat panel + notifying user');
+					await vscode.commands.executeCommand('workbench.action.chat.open');
+					void vscode.window.showInformationMessage(
+						'To manage tools, click the Tools (⚙) button in the GitHub Copilot Chat input area.'
+					);
+					return;
+				}
+
+				// ConfigureToolsAction requires:
+				//   1. chat in Agent mode (precondition)
+				//   2. a focused chat widget (chatWidgetService.lastFocusedWidget)
+				// Open + focus chat in agent mode first, then invoke the picker.
+				try {
+					this.log('🔧 openToolPicker: opening chat in agent mode');
+					await vscode.commands.executeCommand('workbench.action.chat.open', { mode: 'agent' });
+				} catch (err) {
+					this.log(`🔧 openToolPicker: chat.open failed: ${err instanceof Error ? err.message : String(err)}`);
+				}
+
+				try {
+					this.log(`🔧 openToolPicker: executing '${configureToolsId}'`);
+					await vscode.commands.executeCommand(configureToolsId);
+					this.log('🔧 openToolPicker: command executed successfully');
+				} catch (err) {
+					this.log(`🔧 openToolPicker: command failed: ${err instanceof Error ? err.message : String(err)}`);
+					void vscode.window.showErrorMessage(
+						`Could not open tool picker: ${err instanceof Error ? err.message : String(err)}`
+					);
+				}
+			},
+			openFileFromList:       async () => {
+				const paths: unknown = message.paths;
+				if (!Array.isArray(paths) || paths.length === 0) { return; }
+				const stringPaths = paths.filter((p): p is string => typeof p === 'string');
+				if (stringPaths.length === 1) {
+					await vscode.window.showTextDocument(vscode.Uri.file(stringPaths[0]));
+					return;
+				}
+				const items = stringPaths.map(p => ({ label: path.basename(path.dirname(p)) + '/' + path.basename(p), description: p, fsPath: p }));
+				const picked = await vscode.window.showQuickPick(items, { title: 'Open MCP config file', placeHolder: 'Select which config file to open' });
+				if (picked) { await vscode.window.showTextDocument(vscode.Uri.file(picked.fsPath)); }
+			},
+			searchMcpExtensions:    () => vscode.commands.executeCommand('workbench.extensions.search', '@tag:mcp'),
+			manageExtension:        async () => {
+				// Open the Extensions view details pane for a specific extension.
+				// VS Code can't tell us whether the user disabled the extension's tools in the chat
+				// tool picker (no public API), so the only honest action we can offer for
+				// extension-contributed MCP servers is "go look at / uninstall the extension".
+				const extensionId = typeof message.extensionId === 'string' ? message.extensionId : '';
+				if (!extensionId) { return; }
+				try {
+					await vscode.commands.executeCommand('extension.open', extensionId);
+				} catch (err) {
+					this.log(`manageExtension: extension.open failed for ${extensionId}: ${err instanceof Error ? err.message : String(err)}`);
+					// Fallback: search the marketplace view for the extension ID
+					await vscode.commands.executeCommand('workbench.extensions.search', `@id:${extensionId}`);
+				}
+			},
 		};
 		const handler = handlers[message.command];
-		if (!handler) { return false; }
+		if (!handler) {
+			// Forward fully-qualified extension commands (e.g. from insight card buttons)
+			if (message.command.startsWith('aiEngineeringFluency.')) {
+				await vscode.commands.executeCommand(message.command);
+				return true;
+			}
+			return false;
+		}
 		await this.dispatch(message.command, handler);
 		return true;
 	}
@@ -2502,6 +2595,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 			missedPotential: stats.missedPotential ?? [],
 			customizationMatrix: stats.customizationMatrix,
 			todaySessions: stats.todaySessions,
+			curationAnalysis: stats.curationAnalysis ?? null,
 		};
 		return _evaluateInsights(ctx, this._insightStateBag, cadenceDays, this._lastInsightNudgeAt);
 	}
@@ -3024,10 +3118,118 @@ class CopilotTokenTracker implements vscode.Disposable {
 			lastUpdated: now,
 			customizationMatrix: this._lastCustomizationMatrix,
 			missedPotential: this._lastMissedPotential || [],
-			todaySessions: todaySessionsList.sort((a, b) => b.interactions - a.interactions)
+			todaySessions: todaySessionsList.sort((a, b) => b.interactions - a.interactions),
+			curationAnalysis: this.computeCurationAnalysis(last30DaysStats),
 		};
 		this.lastUsageAnalysisStats = stats;
 		return stats;
+	}
+
+	/**
+	 * Build a ToolCurationAnalysis from runtime tools + workspace files + recent usage.
+	 * Returns null when there are no available tools to analyse.
+	 */
+	private computeCurationAnalysis(last30Days: UsageAnalysisPeriod): ToolCurationAnalysis | null {
+		try {
+			const windowDays = vscode.workspace.getConfiguration('aiEngineeringFluency').get<number>('curation.timeWindowDays', 30);
+			const workspaceFolderPaths = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
+
+			// Collect available tools: VS Code runtime tools + mcp.json + extension-contributed + settings + skills.
+			const runtimeEntries = _enumerateRuntimeTools(vscode.lm.tools);
+			const mcpEntries = _buildMcpEntriesFromJson(workspaceFolderPaths);
+			// Build the set of MCP servers that currently have at least one tool enabled in
+			// `vscode.lm.tools`. Extension-contributed entries cross-reference against this
+			// set so we can mark them as enabled or disabled (and avoid recommending the user
+			// disable tools they've already disabled).
+			const enabledMcpServers = new Set<string>();
+			for (const e of runtimeEntries) {
+				if (e.source === 'mcp' && e.server) { enabledMcpServers.add(e.server); }
+			}
+			const extensionMcpEntries = _enumerateExtensionMcpServers(vscode.extensions.all, enabledMcpServers);
+			const settingsMcpServers = vscode.workspace.getConfiguration('mcp').get<Record<string, unknown>>('servers', {});
+			const settingsMcpEntries = _buildMcpEntriesFromSettings(settingsMcpServers);
+			const skillEntries = _discoverSkillEntries(workspaceFolderPaths);
+
+			// Merge: runtime entries already include MCP tools from vscode.lm.tools.
+			// Deduplicate MCP server entries (prefer runtime over all static sources).
+			const runtimeServers = new Set(runtimeEntries.filter(e => e.source === 'mcp').map(e => e.server));
+			const uniqueMcpEntries = mcpEntries.filter(e => !runtimeServers.has(e.server));
+			const uniqueExtensionMcpEntries = extensionMcpEntries.filter(e => !runtimeServers.has(e.server) && !uniqueMcpEntries.some(m => m.server === e.server));
+			const uniqueSettingsMcpEntries = settingsMcpEntries.filter(e =>
+				!runtimeServers.has(e.server) &&
+				!uniqueMcpEntries.some(m => m.server === e.server) &&
+				!uniqueExtensionMcpEntries.some(m => m.server === e.server)
+			);
+
+			const availableTools = [...runtimeEntries, ...uniqueMcpEntries, ...uniqueExtensionMcpEntries, ...uniqueSettingsMcpEntries, ...skillEntries];
+			if (availableTools.length === 0) { return null; }
+
+			return _analyzeToolCuration(availableTools, last30Days, windowDays);
+		} catch (err) {
+			this.log(`⚠️ Tool curation analysis failed: ${String(err)}`);
+			return null;
+		}
+	}
+
+	async openMcpJson(): Promise<void> {
+		const fs = require('fs') as typeof import('fs');
+		const path = require('path') as typeof import('path');
+		const os = require('os') as typeof import('os');
+
+		// Collect all candidate paths (workspace + user-level), keeping only those that exist.
+		const folderPaths = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
+		const candidates: { label: string; fsPath: string }[] = [];
+
+		const workspaceCandidates = folderPaths.flatMap(folder => [
+			{ label: '.vscode/mcp.json', fsPath: path.join(folder, '.vscode', 'mcp.json') },
+			{ label: '.mcp.json (repo root)', fsPath: path.join(folder, '.mcp.json') },
+			{ label: '.vs/mcp.json', fsPath: path.join(folder, '.vs', 'mcp.json') },
+			{ label: '.cursor/mcp.json', fsPath: path.join(folder, '.cursor', 'mcp.json') },
+		]);
+		const home = process.env.USERPROFILE ?? process.env.HOME ?? os.homedir();
+		const userCandidate = { label: `~/.mcp.json (user-global)`, fsPath: path.join(home, '.mcp.json') };
+
+		for (const c of [...workspaceCandidates, userCandidate]) {
+			if (fs.existsSync(c.fsPath)) {
+				candidates.push(c);
+			}
+		}
+
+		if (candidates.length === 0) {
+			// No files exist — offer to create one
+			const target = folderPaths.length > 0
+				? path.join(folderPaths[0], '.vscode', 'mcp.json')
+				: path.join(home, '.mcp.json');
+			const choice = await vscode.window.showInformationMessage(
+				`No mcp.json files found. Create ${target}?`,
+				'Create', 'Cancel',
+			);
+			if (choice !== 'Create') { return; }
+			const dir = path.dirname(target);
+			if (!fs.existsSync(dir)) { fs.mkdirSync(dir, { recursive: true }); }
+			fs.writeFileSync(target, JSON.stringify({ servers: {} }, null, 2));
+			await vscode.window.showTextDocument(vscode.Uri.file(target));
+			return;
+		}
+
+		if (candidates.length === 1) {
+			await vscode.window.showTextDocument(vscode.Uri.file(candidates[0].fsPath));
+			return;
+		}
+
+		// Multiple files — show a quick pick
+		const items: (vscode.QuickPickItem & { fsPath: string })[] = candidates.map(c => ({
+			label: c.label,
+			description: c.fsPath,
+			fsPath: c.fsPath,
+		}));
+		const picked = await vscode.window.showQuickPick(items, {
+			title: 'Open MCP config file',
+			placeHolder: 'Select which mcp.json to open',
+		});
+		if (picked) {
+			await vscode.window.showTextDocument(vscode.Uri.file(picked.fsPath));
+		}
 	}
 
 	private createEmptyUsagePeriod(): UsageAnalysisPeriod {
@@ -5354,9 +5556,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 	public async showUsageAnalysis(): Promise<void> {
 		this.log('📊 Opening Usage Analysis dashboard');
 		if (this.analysisPanel) {
-			this.log('📊 Closing existing panel to refresh data...');
-			this.analysisPanel.dispose();
-			this.analysisPanel = undefined;
+			this.log('📊 Revealing existing Usage Analysis panel');
+			this.analysisPanel.reveal(vscode.ViewColumn.One, false);
+			return;
 		}
 		this.analysisPanel = vscode.window.createWebviewPanel(
 			'copilotUsageAnalysis', 'AI Usage Analysis',
@@ -5378,6 +5580,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 	public async showUsageAnalysisOnInsightsTab(): Promise<void> {
 		await this.showUsageAnalysis();
 		void this.analysisPanel?.webview.postMessage({ command: 'switchTab', tab: 'insights' });
+	}
+
+	/** Opens the Usage Analysis panel and immediately activates the Tools & Integration tab. */
+	public async showUsageAnalysisOnToolsTab(): Promise<void> {
+		await this.showUsageAnalysis();
+		void this.analysisPanel?.webview.postMessage({ command: 'switchTab', tab: 'tools', anchor: 'section-tool-curation' });
 	}
 
 	private async handleAnalysisMessage(message: any): Promise<void> {
@@ -5480,6 +5688,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 					currentWorkspacePaths: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
 					todaySessions: analysisStats.todaySessions || [],
 					insights: this.buildCurrentInsights(analysisStats),
+					curationAnalysis: analysisStats.curationAnalysis ?? null,
 				},
 			});
 		} catch (err) {
@@ -8281,6 +8490,7 @@ ${this.getLoadingHtmlScript()}
       todaySessions: stats.todaySessions || [],
       use24HourTime: this.getUse24HourTimeSetting(),
       insights: this.buildCurrentInsights(stats),
+      curationAnalysis: stats.curationAnalysis ?? null,
     }).replace(/</g, "\\u003c") : 'null';
 
     return `<!DOCTYPE html>
@@ -8565,6 +8775,38 @@ function setupBackend(context: vscode.ExtensionContext, tokenTracker: CopilotTok
   }
 }
 
+function registerSecondaryViewCommands(context: vscode.ExtensionContext, tokenTracker: CopilotTokenTracker): void {
+  const showMaturityCommand = vscode.commands.registerCommand(
+    "aiEngineeringFluency.showMaturity",
+    async () => {
+      tokenTracker.log("Show maturity command called");
+      await tokenTracker.showMaturity();
+    },
+  );
+  const showDashboardCommand = vscode.commands.registerCommand(
+    "aiEngineeringFluency.showDashboard",
+    async () => {
+      tokenTracker.log("Show dashboard command called");
+      await tokenTracker.showDashboard();
+    },
+  );
+  const showEnvironmentalCommand = vscode.commands.registerCommand(
+    "aiEngineeringFluency.showEnvironmental",
+    async () => {
+      tokenTracker.log("Show environmental impact command called");
+      await tokenTracker.showEnvironmental();
+    },
+  );
+  const openMcpJsonCommand = vscode.commands.registerCommand(
+    "aiEngineeringFluency.openMcpJson",
+    async () => {
+      tokenTracker.log("Open mcp.json command called");
+      await tokenTracker.openMcpJson();
+    },
+  );
+  context.subscriptions.push(showMaturityCommand, showDashboardCommand, showEnvironmentalCommand, openMcpJsonCommand);
+}
+
 function registerViewCommands(context: vscode.ExtensionContext, tokenTracker: CopilotTokenTracker): void {
   const refreshCommand = vscode.commands.registerCommand(
     "aiEngineeringFluency.refresh",
@@ -8607,40 +8849,16 @@ function registerViewCommands(context: vscode.ExtensionContext, tokenTracker: Co
     },
   );
 
-  const showMaturityCommand = vscode.commands.registerCommand(
-    "aiEngineeringFluency.showMaturity",
+  const openToolsTabCommand = vscode.commands.registerCommand(
+    "aiEngineeringFluency.openToolsTab",
     async () => {
-      tokenTracker.log("Show maturity command called");
-      await tokenTracker.showMaturity();
+      tokenTracker.log("Open Tools tab command called");
+      await tokenTracker.showUsageAnalysisOnToolsTab();
     },
   );
 
-  const showDashboardCommand = vscode.commands.registerCommand(
-    "aiEngineeringFluency.showDashboard",
-    async () => {
-      tokenTracker.log("Show dashboard command called");
-      await tokenTracker.showDashboard();
-    },
-  );
-
-  const showEnvironmentalCommand = vscode.commands.registerCommand(
-    "aiEngineeringFluency.showEnvironmental",
-    async () => {
-      tokenTracker.log("Show environmental impact command called");
-      await tokenTracker.showEnvironmental();
-    },
-  );
-
-  context.subscriptions.push(
-    refreshCommand,
-    showDetailsCommand,
-    showChartCommand,
-    showUsageAnalysisCommand,
-    openInsightsTabCommand,
-    showMaturityCommand,
-    showDashboardCommand,
-    showEnvironmentalCommand,
-  );
+  context.subscriptions.push(refreshCommand, showDetailsCommand, showChartCommand, showUsageAnalysisCommand, openInsightsTabCommand, openToolsTabCommand);
+  registerSecondaryViewCommands(context, tokenTracker);
 }
 
 function formatWindsurfDiagnosticsContent(diagnostics: any): string {
