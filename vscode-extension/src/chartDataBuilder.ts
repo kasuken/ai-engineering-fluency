@@ -2,6 +2,65 @@ import type { DailyTokenStats, ChartDataPayload, ModelUsage, LanguageUsage } fro
 import { addModelUsage } from './statsHelpers';
 import { getModelDisplayName } from './webview/shared/modelUtils';
 
+/**
+ * Editor display names that bill through GitHub Copilot's AI-Credit system.
+ * Sessions from these editors should use `copilotPricing` when computing costs.
+ * All other editors are billed directly by their own provider (use `provider` pricing).
+ */
+export const COPILOT_EDITOR_NAMES = new Set([
+	'VS Code', 'VS Code Insiders', 'VS Code Exploration',
+	'VS Code Server', 'VS Code Server (Insiders)', 'VSCodium',
+	'Visual Studio', 'JetBrains', 'Copilot CLI', 'MS Scout (Copilot CLI)',
+]);
+
+/** Returns the pricing source to use for cost estimation for a given editor. */
+function getPricingSourceForEditor(editor: string): 'provider' | 'copilot' {
+	return COPILOT_EDITOR_NAMES.has(editor) ? 'copilot' : 'provider';
+}
+
+/** Prefix-to-billing-provider lookup table, checked in order. */
+const MODEL_PROVIDER_PREFIXES: Array<[string, string]> = [
+	['claude', 'Anthropic'],
+	['anthropic', 'Anthropic'],
+	['gemini', 'Google'],
+	['google', 'Google'],
+	['mistral', 'Mistral AI'],
+	['codestral', 'Mistral AI'],
+	['magistral', 'Mistral AI'],
+	['ministral', 'Mistral AI'],
+	['devstral', 'Mistral AI'],
+	['pixtral', 'Mistral AI'],
+	['gpt', 'OpenAI'],
+	['o1', 'OpenAI'],
+	['o3', 'OpenAI'],
+	['o4', 'OpenAI'],
+	['grok', 'xAI'],
+	['raptor', 'xAI'],
+	['goldeneye', 'xAI'],
+	['qwen', 'Alibaba'],
+	['mai-', 'Microsoft'],
+];
+
+/**
+ * Maps a model ID to its billing provider name.
+ * Used for non-Copilot surfaces where the bill goes directly to the model vendor.
+ */
+export function getModelBillingProvider(modelId: string): string {
+	const id = modelId.toLowerCase();
+	const match = MODEL_PROVIDER_PREFIXES.find(([prefix]) => id.startsWith(prefix));
+	return match ? match[1] : 'Other';
+}
+
+/**
+ * Returns the billing group for a (editor, modelId) pair:
+ * - Copilot surfaces → always "GitHub Copilot" regardless of underlying model
+ * - All other surfaces → the model's provider (Anthropic, Google, Mistral AI, OpenAI, etc.)
+ */
+export function getBillingGroup(editor: string, modelId: string): string {
+	if (COPILOT_EDITOR_NAMES.has(editor)) { return 'GitHub Copilot'; }
+	return getModelBillingProvider(modelId);
+}
+
 /** Chart.js-compatible colour palette for dataset series. */
 export const MODEL_COLORS = [
 	{ bg: "rgba(54, 162, 235, 0.6)", border: "rgba(54, 162, 235, 1)" },
@@ -56,6 +115,25 @@ function mergeUsageGroup(
 	}
 }
 
+function mergeLanguageUsage(target: DailyTokenStats, src: DailyTokenStats): void {
+	if (!src.languageUsage) { return; }
+	if (!target.languageUsage) { target.languageUsage = {}; }
+	for (const [ext, usage] of Object.entries(src.languageUsage)) {
+		if (!target.languageUsage[ext]) { target.languageUsage[ext] = { linesAdded: 0, linesRemoved: 0 }; }
+		target.languageUsage[ext].linesAdded += usage.linesAdded;
+		target.languageUsage[ext].linesRemoved += usage.linesRemoved;
+	}
+}
+
+function mergeEditorModelUsage(target: DailyTokenStats, src: DailyTokenStats): void {
+	if (!src.editorModelUsage) { return; }
+	if (!target.editorModelUsage) { target.editorModelUsage = {}; }
+	for (const [editor, modelUsage] of Object.entries(src.editorModelUsage)) {
+		if (!target.editorModelUsage[editor]) { target.editorModelUsage[editor] = {}; }
+		addModelUsage(target.editorModelUsage[editor], modelUsage);
+	}
+}
+
 function mergeInto(target: DailyTokenStats, src: DailyTokenStats): void {
 	target.tokens += src.tokens;
 	target.sessions += src.sessions;
@@ -65,14 +143,8 @@ function mergeInto(target: DailyTokenStats, src: DailyTokenStats): void {
 	mergeUsageGroup(target.repositoryUsage, src.repositoryUsage);
 	if (src.linesAdded !== undefined) { target.linesAdded = (target.linesAdded ?? 0) + src.linesAdded; }
 	if (src.linesRemoved !== undefined) { target.linesRemoved = (target.linesRemoved ?? 0) + src.linesRemoved; }
-	if (src.languageUsage) {
-		if (!target.languageUsage) { target.languageUsage = {}; }
-		for (const [ext, usage] of Object.entries(src.languageUsage)) {
-			if (!target.languageUsage[ext]) { target.languageUsage[ext] = { linesAdded: 0, linesRemoved: 0 }; }
-			target.languageUsage[ext].linesAdded += usage.linesAdded;
-			target.languageUsage[ext].linesRemoved += usage.linesRemoved;
-		}
-	}
+	mergeLanguageUsage(target, src);
+	mergeEditorModelUsage(target, src);
 }
 
 function getMondayOfWeek(d: Date): Date {
@@ -161,6 +233,95 @@ function buildModelDatasets(entries: DailyTokenStats[], deps: ChartDataBuilderDe
 	return datasets;
 }
 
+/**
+ * Builds cost datasets split by editor/hosting surface.
+ * Each dataset holds per-bucket estimated costs for one editor type, using the
+ * appropriate pricing source (Copilot AI-Credit pricing for GitHub Copilot surfaces;
+ * direct provider pricing for all others).
+ */
+function buildEditorCostDatasets(entries: DailyTokenStats[], deps: ChartDataBuilderDeps) {
+	const allEditors = new Set<string>();
+	entries.forEach(e => { if (e.editorModelUsage) { Object.keys(e.editorModelUsage).forEach(ed => allEditors.add(ed)); } });
+	const editorTotals = new Map<string, number>();
+	for (const editor of allEditors) {
+		const total = entries.reduce((sum, e) => sum + deps.calculateEstimatedCost(e.editorModelUsage?.[editor] ?? {}, getPricingSourceForEditor(editor)), 0);
+		editorTotals.set(editor, total);
+	}
+	const sortedEditors = Array.from(allEditors).sort((a, b) => (editorTotals.get(b) || 0) - (editorTotals.get(a) || 0));
+	return sortedEditors.map((editor, idx) => {
+		const color = getModelColor(idx);
+		return {
+			label: editor,
+			data: entries.map(e => deps.calculateEstimatedCost(e.editorModelUsage?.[editor] ?? {}, getPricingSourceForEditor(editor))),
+			backgroundColor: color.bg,
+			borderColor: color.border,
+			borderWidth: 1,
+		};
+	});
+}
+
+/**
+ * Aggregates model usage per billing group from a day's editorModelUsage.
+ *
+ * For Copilot surfaces (VS Code, JetBrains, Visual Studio, …) all models are
+ * lumped into "GitHub Copilot" regardless of the underlying model.
+ * For every other surface the billing group is the model's vendor
+ * (Anthropic, Google, Mistral AI, OpenAI, xAI, …).
+ */
+function aggregateBillingGroupModelUsage(entry: DailyTokenStats): Record<string, ModelUsage> {
+	const result: Record<string, ModelUsage> = {};
+	const editorModelUsage = entry.editorModelUsage;
+	if (!editorModelUsage) { return result; }
+	for (const [editor, modelUsage] of Object.entries(editorModelUsage)) {
+		for (const [modelId, usage] of Object.entries(modelUsage)) {
+			const group = getBillingGroup(editor, modelId);
+			if (!result[group]) { result[group] = {}; }
+			addModelUsage(result[group], { [modelId]: usage });
+		}
+	}
+	return result;
+}
+
+/**
+ * Returns the pricing source for a billing group.
+ * "GitHub Copilot" bills through GitHub's AI-Credit system; all others are direct provider rates.
+ */
+export function getPricingSourceForBillingGroup(group: string): 'provider' | 'copilot' {
+	return group === 'GitHub Copilot' ? 'copilot' : 'provider';
+}
+
+/**
+ * Builds cost datasets split by billing/hosting provider.
+ * One dataset per billing group (e.g. "GitHub Copilot", "Anthropic", "Google", …),
+ * using the correct pricing source for each group.
+ */
+function buildBillingGroupCostDatasets(entries: DailyTokenStats[], deps: ChartDataBuilderDeps) {
+	const allGroups = new Set<string>();
+	entries.forEach(e => { Object.keys(aggregateBillingGroupModelUsage(e)).forEach(g => allGroups.add(g)); });
+	const groupTotals = new Map<string, number>();
+	for (const group of allGroups) {
+		const total = entries.reduce((sum, e) => {
+			const grouped = aggregateBillingGroupModelUsage(e);
+			return sum + deps.calculateEstimatedCost(grouped[group] ?? {}, getPricingSourceForBillingGroup(group));
+		}, 0);
+		groupTotals.set(group, total);
+	}
+	const sortedGroups = Array.from(allGroups).sort((a, b) => (groupTotals.get(b) || 0) - (groupTotals.get(a) || 0));
+	return sortedGroups.map((group, idx) => {
+		const color = getModelColor(idx);
+		return {
+			label: group,
+			data: entries.map(e => {
+				const grouped = aggregateBillingGroupModelUsage(e);
+				return deps.calculateEstimatedCost(grouped[group] ?? {}, getPricingSourceForBillingGroup(group));
+			}),
+			backgroundColor: color.bg,
+			borderColor: color.border,
+			borderWidth: 1,
+		};
+	});
+}
+
 function buildPeriodData(buckets: BucketEntry[], deps: ChartDataBuilderDeps) {
 	const entries = buckets.map(b => b.stats);
 	const labels = buckets.map(b => b.label);
@@ -205,7 +366,9 @@ function buildPeriodData(buckets: BucketEntry[], deps: ChartDataBuilderDeps) {
 		const color = getModelColor(idx);
 		return { label: deps.getRepoDisplayName(repo), fullRepo: repo, data: entries.map(e => (e.repositoryUsage[repo]?.linesAdded ?? 0) + (e.repositoryUsage[repo]?.linesRemoved ?? 0)), backgroundColor: color.bg, borderColor: color.border, borderWidth: 1 };
 	});
-	return { labels, tokensData, sessionsData, modelDatasets, editorDatasets, repositoryDatasets, periodCount, totalTokens, totalSessions, avgPerPeriod: periodCount > 0 ? Math.round(totalTokens / periodCount) : 0, costData, totalCost, avgCostPerPeriod: periodCount > 0 ? totalCost / periodCount : 0, locData, linesAddedData, linesRemovedData, languageDatasets, locEditorDatasets, locRepositoryDatasets, totalLinesAdded, totalLinesRemoved, avgLocPerPeriod };
+	const editorCostDatasets = buildEditorCostDatasets(entries, deps);
+	const billingGroupCostDatasets = buildBillingGroupCostDatasets(entries, deps);
+	return { labels, tokensData, sessionsData, modelDatasets, editorDatasets, repositoryDatasets, periodCount, totalTokens, totalSessions, avgPerPeriod: periodCount > 0 ? Math.round(totalTokens / periodCount) : 0, costData, totalCost, avgCostPerPeriod: periodCount > 0 ? totalCost / periodCount : 0, locData, linesAddedData, linesRemovedData, languageDatasets, locEditorDatasets, locRepositoryDatasets, totalLinesAdded, totalLinesRemoved, avgLocPerPeriod, editorCostDatasets, billingGroupCostDatasets };
 }
 
 function computeSummaryTotals(dailyBuckets: BucketEntry[], deps: ChartDataBuilderDeps) {
