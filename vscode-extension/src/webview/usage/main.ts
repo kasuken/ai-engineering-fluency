@@ -101,6 +101,7 @@ interface AvailableToolEntry {
 	server?: string;
 	extensionId?: string;
 	skillPath?: string;
+	pluginName?: string;
 	configFiles?: string[];
 	enabled?: boolean;
 	extensionActive?: boolean;
@@ -119,6 +120,7 @@ interface ToolCurationAnalysis {
 	usedTools: { name: string; count: number }[];
 	unusedTools: AvailableToolEntry[];
 	underusedMcpServers: { server: string; availableToolCount: number; usedToolCount: number; configFiles?: string[]; extensionId?: string; enabled?: boolean; extensionActive?: boolean }[];
+	underusedAgentPlugins: { pluginName: string; availableSkillCount: number; usedSkillCount: number }[];
 	estimatedPromptBloat: { totalTokens: number; byServer: Record<string, number> };
 	recommendations: ToolCurationRecommendation[];
 }
@@ -221,6 +223,22 @@ interface RepoAnalysisRecord {
 }
 
 const vscode = acquireVsCodeApi();
+const curationTraceOnceKeys = new Set<string>();
+
+function traceCuration(stage: string, details?: Record<string, unknown>): void {
+	try {
+		vscode.postMessage({ command: 'traceUsageCuration', stage, details: details ?? {} });
+	} catch {
+		// ignore tracing failures
+	}
+}
+
+function traceCurationOnce(key: string, stage: string, details?: Record<string, unknown>): void {
+	if (curationTraceOnceKeys.has(key)) { return; }
+	curationTraceOnceKeys.add(key);
+	traceCuration(stage, details);
+}
+
 type InitialUsageData = UsageAnalysisStats & { customizationMatrix?: WorkspaceCustomizationMatrix | null; missedPotential?: MissedPotentialWorkspace[] };
 const initialData = getWindowData<InitialUsageData>('__INITIAL_USAGE__');
 let hygieneMatrixState: WorkspaceCustomizationMatrix | null = null;
@@ -235,6 +253,189 @@ let currentInsights: EvaluatedInsight[] = [];
 // Persisted across stats refreshes so the curation section doesn't disappear
 // when a periodic updateStats message omits curationAnalysis.
 let currentCurationAnalysis: ToolCurationAnalysis | null = null;
+
+const USAGE_LOADING_CSS = `
+<style id="usage-loading-css">
+:root {
+  --ul-bg: var(--vscode-sideBar-background, #181825);
+  --ul-card: var(--vscode-editorWidget-background, #24273a);
+  --ul-fg: var(--vscode-editor-foreground, #cdd6f4);
+  --ul-muted: var(--vscode-descriptionForeground, #9399b2);
+  --ul-accent: var(--vscode-textLink-foreground, #89b4fa);
+  --ul-success: var(--vscode-terminal-ansiGreen, #a6e3a1);
+  --ul-border: var(--vscode-panel-border, #313244);
+  --ul-badge-bg: var(--vscode-badge-background, #313244);
+}
+#usage-loading-wrap {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  display: flex; align-items: flex-start; justify-content: center; padding: 28px 20px;
+}
+#usage-loading-card {
+  width: 100%; max-width: 680px;
+  background: var(--ul-card); border: 1px solid var(--ul-border);
+  border-radius: 16px; padding: 24px 28px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.3); color: var(--ul-fg);
+}
+#ul-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 4px; gap: 16px; }
+#ul-badge { font-size: 11px; font-weight: 700; letter-spacing: 0.15em; text-transform: uppercase; color: var(--ul-accent); margin-bottom: 4px; }
+#ul-title { font-size: 22px; font-weight: 700; color: var(--ul-fg); margin-bottom: 4px; }
+#ul-subtitle { font-size: 12px; color: var(--ul-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 360px; }
+#ul-right { display: flex; flex-direction: column; align-items: flex-end; gap: 6px; flex-shrink: 0; }
+#ul-pct { font-size: 32px; font-weight: 800; color: var(--ul-fg); line-height: 1; min-width: 60px; text-align: right; font-variant-numeric: tabular-nums; }
+.ul-meta-badge { font-size: 11px; padding: 3px 10px; border: 1px solid var(--ul-border); border-radius: 20px; color: var(--ul-muted); background: var(--vscode-editor-background, #1e1e2e); white-space: nowrap; }
+#ul-track { height: 6px; background: var(--ul-border); border-radius: 3px; overflow: hidden; margin: 16px 0; }
+#ul-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, var(--ul-accent), var(--ul-success)); transition: width 0.4s ease; width: 3%; }
+#ul-fill.ul-indeterminate { width: 25%; animation: ul-shimmer 1.8s ease-in-out infinite; background: linear-gradient(90deg, transparent, var(--ul-accent), var(--ul-success), transparent); }
+@keyframes ul-shimmer { 0% { margin-left: -30%; } 100% { margin-left: 110%; } }
+#ul-steps { background: var(--ul-bg); border: 1px solid var(--ul-border); border-radius: 10px; padding: 14px 16px; }
+.ul-step { display: flex; align-items: center; gap: 10px; padding: 5px 0; color: var(--ul-muted); font-size: 13px; transition: color 0.25s; }
+.ul-step.ul-done   { color: var(--ul-success); }
+.ul-step.ul-active { color: var(--ul-accent); font-weight: 600; }
+.ul-ico { width: 18px; text-align: center; flex-shrink: 0; }
+.ul-spin { display: inline-block; animation: ul-spin 0.75s linear infinite; }
+@keyframes ul-spin { to { transform: rotate(360deg); } }
+.ul-lbl { flex: 1; }
+.ul-cnt { font-size: 11px; opacity: 0.75; font-variant-numeric: tabular-nums; }
+@keyframes ul-pop { 0% { transform: scale(0.4); opacity: 0; } 60% { transform: scale(1.3); } 100% { transform: scale(1); opacity: 1; } }
+.ul-pop { animation: ul-pop 0.3s ease both; }
+</style>`;
+
+const USAGE_LOADING_STEPS = [
+	{ id: 'ul-s-start',  label: 'Starting usage analysis' },
+	{ id: 'ul-s-tools',  label: 'Collecting runtime tools' },
+	{ id: 'ul-s-mcp',    label: 'Discovering MCP servers' },
+	{ id: 'ul-s-skills', label: 'Scanning skill directories' },
+	{ id: 'ul-s-crunch', label: 'Computing curation analysis' },
+	{ id: 'ul-s-ready',  label: 'Ready!' },
+] as const;
+
+type UsageLoadingStepId = typeof USAGE_LOADING_STEPS[number]['id'];
+
+const USAGE_STAGE_MAP: Record<string, { pct: number; stepId: UsageLoadingStepId; subtitle: string }> = {
+	start:                     { pct:  5, stepId: 'ul-s-start',  subtitle: 'Starting usage analysis…' },
+	'curation:start':          { pct: 20, stepId: 'ul-s-tools',  subtitle: 'Collecting tools and skills…' },
+	'curation:runtimeTools':   { pct: 32, stepId: 'ul-s-tools',  subtitle: 'Collected runtime tools' },
+	'curation:mcpJson':        { pct: 44, stepId: 'ul-s-mcp',    subtitle: 'Scanning MCP config files…' },
+	'curation:mcpSources':     { pct: 55, stepId: 'ul-s-mcp',    subtitle: 'Collected MCP servers' },
+	'curation:skillsScanStart':{ pct: 63, stepId: 'ul-s-skills', subtitle: 'Scanning skill directories…' },
+	'curation:skillsScanDone': { pct: 75, stepId: 'ul-s-skills', subtitle: 'Skill discovery complete' },
+	'curation:analyzing':      { pct: 85, stepId: 'ul-s-crunch', subtitle: 'Analyzing tool usage patterns…' },
+	'curation:done':           { pct: 96, stepId: 'ul-s-crunch', subtitle: 'Curation analysis complete' },
+	ready:                     { pct:100, stepId: 'ul-s-ready',  subtitle: 'Usage analysis ready' },
+	error:                     { pct:100, stepId: 'ul-s-ready',  subtitle: 'Analysis completed with errors' },
+	'curation:error':          { pct: 85, stepId: 'ul-s-crunch', subtitle: 'Curation analysis skipped' },
+};
+
+function renderUsageLoadingState(initialMessage = 'Loading usage analysis...'): void {
+	const root = document.getElementById('root');
+	if (!root) { return; }
+	_ulLoadingActive = true;
+
+	const stepsHtml = USAGE_LOADING_STEPS.map((s, i) => {
+		const isFirst = i === 0;
+		const cls = isFirst ? 'ul-step ul-active' : 'ul-step';
+		const ico = isFirst ? '<span class="ul-spin">↻</span>' : '○';
+		return `<div class="${cls}" id="${s.id}"><span class="ul-ico">${ico}</span><span class="ul-lbl">${escapeHtml(s.label)}</span><span class="ul-cnt" id="${s.id}-cnt"></span></div>`;
+	}).join('');
+
+	root.innerHTML = `${USAGE_LOADING_CSS}
+<div id="usage-loading-wrap">
+  <div id="usage-loading-card">
+    <div id="ul-header">
+      <div>
+        <div id="ul-badge">📊 Analyzing Usage Data</div>
+        <div id="ul-title">${escapeHtml(initialMessage)}</div>
+        <div id="ul-subtitle">Initializing…</div>
+      </div>
+      <div id="ul-right">
+        <div id="ul-pct">–</div>
+        <div style="display:flex;gap:6px;" id="ul-meta"></div>
+      </div>
+    </div>
+    <div id="ul-track"><div id="ul-fill" class="ul-indeterminate"></div></div>
+    <div id="ul-steps">${stepsHtml}</div>
+  </div>
+</div>`;
+}
+
+function _ulSetDone(id: string): void {
+	const el = document.getElementById(id);
+	if (!el) { return; }
+	el.className = 'ul-step ul-done';
+	const ico = el.querySelector('.ul-ico');
+	if (ico) { ico.innerHTML = '<span class="ul-pop">✓</span>'; }
+}
+
+function _ulSetActive(id: string): void {
+	const el = document.getElementById(id);
+	if (!el) { return; }
+	el.className = 'ul-step ul-active';
+	const ico = el.querySelector('.ul-ico');
+	if (ico) { ico.innerHTML = '<span class="ul-spin">↻</span>'; }
+}
+
+function _ulSetCnt(id: string, text: string): void {
+	const el = document.getElementById(`${id}-cnt`);
+	if (el) { el.textContent = text; }
+}
+
+let _ulLastStepIdx = 0;
+// True while the loading card is the active view. Once real content is
+// rendered (updateStats) this is cleared, so stray progress events from a
+// background silent recompute never re-create the loading card over content.
+let _ulLoadingActive = false;
+
+function _ulAdvanceSteps(targetIdx: number, pct: number): void {
+	for (let i = _ulLastStepIdx; i < targetIdx; i++) { _ulSetDone(USAGE_LOADING_STEPS[i].id); }
+	if (targetIdx > _ulLastStepIdx) { _ulLastStepIdx = targetIdx; }
+	if (pct < 100) { _ulSetActive(USAGE_LOADING_STEPS[targetIdx].id); }
+	else { _ulSetDone(USAGE_LOADING_STEPS[targetIdx].id); }
+}
+
+function _ulDetailCnt(details: Record<string, unknown>): string {
+	if (typeof details.count === 'number') { return `${details.count}`; }
+	if (typeof details.skills === 'number') { return `${details.skills} skills`; }
+	if (typeof details.availableTools === 'number') { return `${details.availableTools} tools`; }
+	return '';
+}
+
+// Ensures the loading card exists before applying a progress event. Returns
+// false when the event should be ignored because content has already replaced
+// the card (stray events from a background silent recompute), preventing the
+// loading card from flashing back over the rendered analysis.
+function _ulEnsureCard(): boolean {
+	const root = document.getElementById('root');
+	if (!root) { return false; }
+	if (root.querySelector('#usage-loading-card')) { return true; }
+	if (!_ulLoadingActive) { return false; }
+	renderUsageLoadingState('Building Usage Analysis');
+	_ulLastStepIdx = 0;
+	return true;
+}
+
+function updateUsageLoadingProgress(message: any): void {
+	if (!_ulEnsureCard()) { return; }
+	const stage = typeof message?.stage === 'string' ? message.stage : '';
+	const mapped = USAGE_STAGE_MAP[stage];
+	if (!mapped) { return; }
+
+	const pct = mapped.pct;
+	const fill = document.getElementById('ul-fill');
+	if (fill) { fill.classList.remove('ul-indeterminate'); fill.style.width = `${Math.max(pct, 3)}%`; }
+	const pctEl = document.getElementById('ul-pct');
+	if (pctEl) { pctEl.textContent = pct === 100 ? '100%' : `${pct}%`; }
+	const subtitleEl = document.getElementById('ul-subtitle');
+	if (subtitleEl) { subtitleEl.textContent = mapped.subtitle; }
+
+	const targetIdx = USAGE_LOADING_STEPS.findIndex(s => s.id === mapped.stepId);
+	if (targetIdx >= 0) { _ulAdvanceSteps(targetIdx, pct); }
+
+	const details = message?.details;
+	if (details && typeof details === 'object') {
+		const cnt = _ulDetailCnt(details as Record<string, unknown>);
+		if (cnt) { _ulSetCnt(mapped.stepId, `(${cnt})`); }
+	}
+}
 
 function clearLoadingTimeout(): void {
 	if (loadingTimeoutId !== null) {
@@ -905,6 +1106,7 @@ function sanitizeInsights(rawInsights: any[]): EvaluatedInsight[] {
 
 function sanitizeStats(raw: any): UsageAnalysisStats | null {
 	if (!raw || typeof raw !== 'object') {
+		traceCurationOnce('sanitize-invalid-root', 'sanitizeStats.invalidRoot');
 		return null;
 	}
 
@@ -962,15 +1164,26 @@ function sanitizeStats(raw: any): UsageAnalysisStats | null {
 				usedTools: Array.isArray(ca.usedTools) ? ca.usedTools : [],
 				unusedTools: Array.isArray(ca.unusedTools) ? ca.unusedTools : [],
 				underusedMcpServers: Array.isArray(ca.underusedMcpServers) ? ca.underusedMcpServers : [],
+				underusedAgentPlugins: Array.isArray(ca.underusedAgentPlugins) ? ca.underusedAgentPlugins : [],
 				estimatedPromptBloat: ca.estimatedPromptBloat && typeof ca.estimatedPromptBloat === 'object'
 					? ca.estimatedPromptBloat
 					: { totalTokens: 0, byServer: {} },
 				recommendations: Array.isArray(ca.recommendations) ? ca.recommendations : [],
 			};
+			traceCuration('sanitizeStats.curation.present', {
+				availableTools: sanitized.curationAnalysis.availableTools.length,
+				unusedTools: sanitized.curationAnalysis.unusedTools.length,
+				unusedServers: sanitized.curationAnalysis.underusedMcpServers.filter(s => s && s.usedToolCount === 0).length,
+			});
+		} else {
+			traceCurationOnce('sanitize-no-curation', 'sanitizeStats.curation.missing');
 		}
 
 		return sanitized;
-	} catch {
+	} catch (error) {
+		traceCurationOnce('sanitize-error', 'sanitizeStats.error', {
+			error: error instanceof Error ? error.message : String(error),
+		});
 		return null;
 	}
 }
@@ -1763,27 +1976,26 @@ function buildUnusedSkillsHtml(unusedSkills: AvailableToolEntry[]): string {
 	const rows = unusedSkills.map(s => {
 		const skillFile = s.configFiles?.[0];
 		const viewLink = skillFile
-			? `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(skillFile)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:12px;text-decoration:underline;" title="Open ${escapeHtml(skillFile)}">View skill def.</button>`
+			? `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(skillFile)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:12px;text-decoration:underline;" title="Open ${escapeHtml(skillFile)}">View skill</button>`
 			: '—';
-		// Derive a human-readable source label from the skillPath / configFiles.
-		// skillPath is workspace-relative (e.g. ".github/skills/pdf/SKILL.md");
-		// user-scope paths have no workspace-relative path (s.skillPath starts with HOME).
+		// Derive a human-readable source label. Plugin skills show the plugin name.
 		let sourceLabel = '—';
-		if (s.skillPath) {
+		let manageBtn = '';
+		if (s.pluginName) {
+			sourceLabel = `Plugin: ${s.pluginName}`;
+			manageBtn = ` <button class="curation-file-btn" data-command="openAgentPlugins" data-plugin-name="${escapeHtml(s.pluginName)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open Extensions view filtered to agent plugins">manage</button>`;
+		} else if (s.skillPath) {
 			if (s.skillPath.startsWith('.github/skills')) { sourceLabel = 'Workspace (.github)'; }
 			else if (s.skillPath.startsWith('.claude/skills')) { sourceLabel = 'Workspace (.claude)'; }
 			else if (s.skillPath.startsWith('.agents/skills')) { sourceLabel = 'Workspace (.agents)'; }
 			else { sourceLabel = 'User (~)'; }
 		}
-		// Estimate per-skill prompt token overhead using the same formula as the backend
-		// (name + description + ~10 chars of JSON framing, divided by 4 chars/token).
 		const estTokens = Math.round((s.name.length + s.description.length + 10) / 4);
-		const overheadCell = `~${estTokens.toLocaleString()} tokens`;
 		return `<tr>
 		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${escapeHtml(s.name)}</td>
-		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${sourceLabel}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${escapeHtml(sourceLabel)}${manageBtn}</td>
 		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; max-width:320px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${escapeHtml(s.description)}">${escapeHtml(s.description)}</td>
-		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${overheadCell}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">~${estTokens.toLocaleString()} tokens</td>
 		<td style="padding:5px 8px; font-size:12px; white-space:nowrap;">${viewLink}</td>
 	</tr>`;
 	}).join('');
@@ -1802,7 +2014,46 @@ function buildUnusedSkillsHtml(unusedSkills: AvailableToolEntry[]): string {
 				</tr></thead>
 				<tbody>${rows}</tbody>
 			</table>
-			<div style="margin-top:8px; font-size:11px; color:var(--text-secondary);">💡 Est. overhead is per agent interaction (skill descriptions appear in every prompt). Update skill descriptions so Copilot selects them, or remove skills that are no longer needed.</div>
+			<div style="margin-top:8px; font-size:11px; color:var(--text-secondary);">💡 Est. overhead is per agent interaction. For plugin skills, click <em>manage</em> to open the agent plugins view where you can uninstall the plugin. For workspace skills, update the description or remove the SKILL.md.</div>
+		</div>
+	</details>`;
+}
+
+function buildUnderusedAgentPluginsHtml(underusedAgentPlugins: ToolCurationAnalysis['underusedAgentPlugins'], windowDays: number): string {
+	if (underusedAgentPlugins.length === 0) { return ''; }
+	const rows = underusedAgentPlugins.map(p => {
+		const manageBtn = `<button class="curation-file-btn" data-command="openAgentPlugins" data-plugin-name="${escapeHtml(p.pluginName)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open Extensions view filtered to @agentPlugins ${escapeHtml(p.pluginName)}">Manage Plugin</button>`;
+		const usageClass = p.usedSkillCount === 0 ? '' : 'plugin-has-usage';
+		return `<tr class="${usageClass}">
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${escapeHtml(p.pluginName)}</td>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${p.availableSkillCount}</td>
+			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${p.usedSkillCount}</td>
+			<td style="padding:5px 8px; font-size:12px;">${manageBtn}</td>
+		</tr>`;
+	}).join('');
+	const unusedCount = underusedAgentPlugins.filter(p => p.usedSkillCount === 0).length;
+	const usedCount = underusedAgentPlugins.length - unusedCount;
+	return `<details style="margin-top:8px;" open>
+		<summary style="cursor:pointer; font-size:13px; font-weight:600; color:var(--text-primary); padding:6px 0;">
+			🧩 Agent Plugins in Last ${windowDays} Days (${underusedAgentPlugins.length})
+		</summary>
+		<style>#plugin-hide-toggle:checked ~ .plugin-table-wrap .plugin-has-usage { display: none; }</style>
+		<div style="display:flex; align-items:center; gap:6px; margin:6px 0;">
+			<input type="checkbox" id="plugin-hide-toggle" checked style="margin:0; cursor:pointer; flex-shrink:0;">
+			<label for="plugin-hide-toggle" style="font-size:12px; color:var(--text-primary); cursor:pointer; user-select:none;">Hide plugins with usage</label>
+			<span style="font-size:11px; color:var(--text-secondary);">${unusedCount} with no usage · ${usedCount} with usage</span>
+		</div>
+		<div class="plugin-table-wrap" style="margin-top:8px; overflow-x:auto;">
+			<table style="width:100%; border-collapse:collapse; font-size:12px;">
+				<thead><tr style="border-bottom:1px solid var(--border-color);">
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Plugin</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Skills Available</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Skills Used</th>
+					<th style="padding:5px 8px; text-align:left; color:var(--text-primary); font-weight:600; font-size:12px;">Action</th>
+				</tr></thead>
+				<tbody>${rows}</tbody>
+			</table>
+			<div style="margin-top:8px; font-size:11px; color:var(--text-secondary);">💡 Click <em>Manage Plugin</em> to open the Extensions view filtered to <code>@agentPlugins</code> where you can uninstall unused plugins to reclaim prompt budget.</div>
 		</div>
 	</details>`;
 }
@@ -1838,22 +2089,47 @@ function buildBuiltinToolsHtml(builtinTools: AvailableToolEntry[], bloat: ToolCu
 }
 
 function buildCurationSectionHtml(curation: ToolCurationAnalysis | null | undefined): string {
-	if (!curation || curation.availableTools.length === 0) { return ''; }
+	try {
+		if (!curation || curation.availableTools.length === 0) {
+			traceCurationOnce('render-hidden-empty', 'buildCurationSectionHtml.hidden', {
+				hasCurationObject: !!curation,
+				availableTools: curation?.availableTools?.length ?? 0,
+			});
+			return '';
+		}
 
-	const { availableTools, unusedTools, underusedMcpServers, estimatedPromptBloat, windowDays } = curation;
-	const unusedSkills = unusedTools.filter(t => t.source === 'skill');
-	const builtinTools = availableTools.filter(t => t.source === 'builtin');
+		const { availableTools, unusedTools, underusedMcpServers, underusedAgentPlugins, estimatedPromptBloat, windowDays } = curation;
+		const unusedSkills = unusedTools.filter(t => t.source === 'skill');
+		const builtinTools = availableTools.filter(t => t.source === 'builtin');
 
-	return `
-		<!-- Tool Curation Section -->
-		<div id="section-tool-curation" class="section">
-			<div class="section-title"><span>✂️</span><span>Tool Curation</span></div>
-			<div class="section-subtitle" style="color:var(--text-primary); opacity:0.75;">Compare available tools against actual usage to reduce prompt overhead (last ${windowDays} days)</div>
-			${buildCurationSummaryHtml(availableTools, unusedTools, estimatedPromptBloat)}
-			${buildUnusedMcpHtml(underusedMcpServers, estimatedPromptBloat, windowDays)}
-			${buildBuiltinToolsHtml(builtinTools, estimatedPromptBloat)}
-			${buildUnusedSkillsHtml(unusedSkills)}
-		</div>`;
+		traceCuration('buildCurationSectionHtml.render', {
+			availableTools: availableTools.length,
+			unusedTools: unusedTools.length,
+			unusedSkills: unusedSkills.length,
+			mcpServers: underusedMcpServers.length,
+		});
+
+		return `
+			<!-- Tool Curation Section -->
+			<div id="section-tool-curation" class="section">
+				<div class="section-title"><span>✂️</span><span>Tool Curation</span></div>
+				<div class="section-subtitle" style="color:var(--text-primary); opacity:0.75;">Compare available tools against actual usage to reduce prompt overhead (last ${windowDays} days)</div>
+				${buildCurationSummaryHtml(availableTools, unusedTools, estimatedPromptBloat)}
+				${buildUnusedMcpHtml(underusedMcpServers, estimatedPromptBloat, windowDays)}
+				${buildUnderusedAgentPluginsHtml(underusedAgentPlugins, windowDays)}
+				${buildBuiltinToolsHtml(builtinTools, estimatedPromptBloat)}
+				${buildUnusedSkillsHtml(unusedSkills)}
+			</div>`;
+	} catch (error) {
+		traceCuration('buildCurationSectionHtml.error', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return `
+			<div id="section-tool-curation" class="section">
+				<div class="section-title"><span>✂️</span><span>Tool Curation</span></div>
+				<div class="section-subtitle" style="color:var(--text-primary); opacity:0.75;">Tool curation is temporarily unavailable due to a rendering error. Try Refresh.</div>
+			</div>`;
+	}
 }
 
 function buildReposAndAgentTabPanelsHtml(): string {
@@ -2029,31 +2305,55 @@ function refreshInsightsPanel(insights: EvaluatedInsight[]): void {
 }
 
 function wireCurationButtons(): void {
-	const section = document.getElementById('section-tool-curation');
-	if (!section) { return; }
-	section.querySelectorAll<HTMLButtonElement>('.curation-file-btn').forEach(btn => {
-		btn.addEventListener('click', () => {
-			const command = btn.getAttribute('data-command');
-			if (!command) { return; }
-			if (command === 'openFile') {
-				const filePath = btn.getAttribute('data-path');
-				if (filePath) { vscode.postMessage({ command: 'openFile', path: filePath }); }
-			} else if (command === 'openFileFromList') {
-				const pathsJson = btn.getAttribute('data-paths');
-				if (pathsJson) {
-					try {
-						const paths = JSON.parse(pathsJson) as string[];
-						vscode.postMessage({ command: 'openFileFromList', paths });
-					} catch { /* ignore malformed JSON */ }
+	try {
+		const section = document.getElementById('section-tool-curation');
+		if (!section) {
+			traceCurationOnce('wire-no-section', 'wireCurationButtons.noSection');
+			return;
+		}
+		const buttons = section.querySelectorAll<HTMLButtonElement>('.curation-file-btn');
+		traceCuration('wireCurationButtons.bind', { buttons: buttons.length });
+		buttons.forEach(btn => {
+			btn.addEventListener('click', () => {
+				try {
+					const command = btn.getAttribute('data-command');
+					if (!command) { return; }
+					if (command === 'openFile') {
+						const filePath = btn.getAttribute('data-path');
+						if (filePath) { vscode.postMessage({ command: 'openFile', path: filePath }); }
+					} else if (command === 'openFileFromList') {
+						const pathsJson = btn.getAttribute('data-paths');
+						if (pathsJson) {
+							try {
+								const paths = JSON.parse(pathsJson) as string[];
+								vscode.postMessage({ command: 'openFileFromList', paths });
+							} catch (error) {
+								traceCuration('wireCurationButtons.badPathsJson', {
+									error: error instanceof Error ? error.message : String(error),
+								});
+							}
+						}
+					} else if (command === 'manageExtension') {
+						const extensionId = btn.getAttribute('data-extension-id');
+						if (extensionId) { vscode.postMessage({ command: 'manageExtension', extensionId }); }
+					} else if (command === 'openAgentPlugins') {
+						const pluginName = btn.getAttribute('data-plugin-name') ?? '';
+						vscode.postMessage({ command: 'openAgentPlugins', pluginName });
+					} else {
+						vscode.postMessage({ command });
+					}
+				} catch (error) {
+					traceCuration('wireCurationButtons.clickError', {
+						error: error instanceof Error ? error.message : String(error),
+					});
 				}
-			} else if (command === 'manageExtension') {
-				const extensionId = btn.getAttribute('data-extension-id');
-				if (extensionId) { vscode.postMessage({ command: 'manageExtension', extensionId }); }
-			} else {
-				vscode.postMessage({ command });
-			}
+			});
 		});
-	});
+	} catch (error) {
+		traceCuration('wireCurationButtons.error', {
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
 }
 
 function wireInsightCardButtons(): void {
@@ -2453,6 +2753,12 @@ function renderLayout(stats: UsageAnalysisStats): void {
 	// Persist curation analysis across refreshes — periodic updateStats may omit it
 	if (stats.curationAnalysis) {
 		currentCurationAnalysis = stats.curationAnalysis;
+		traceCuration('renderLayout.curation.cached', {
+			availableTools: currentCurationAnalysis.availableTools.length,
+			unusedTools: currentCurationAnalysis.unusedTools.length,
+		});
+	} else {
+		traceCurationOnce('render-no-curation-update', 'renderLayout.curation.notProvidedInUpdate');
 	}
 
 	const customizationHtml = buildCustomizationSectionHtml(matrix);
@@ -2608,12 +2914,14 @@ function handleUpdateStats(message: any): void {
 	}
 	const sanitized = sanitizeStats(message.data);
 	if (sanitized) {
+		_ulLoadingActive = false;
 		renderLayout(sanitized);
 		setupSessionsTableSort();
 		renderRepositoryHygienePanels();
 		if (repoPrStatsData) { updateReposPrPanel(repoPrStatsData); }
 		if (agentSessionsData) { updateAgentSessionsPanel(agentSessionsData); }
 	} else {
+		traceCurationOnce('update-invalid-sanitized', 'handleUpdateStats.sanitizeReturnedNull');
 		showLoadError('Received invalid data from the extension. Try refreshing.');
 	}
 }
@@ -2670,7 +2978,25 @@ function handleUpdateInsights(rawInsights: unknown): void {
 	refreshInsightsPanel(sanitized);
 }
 
+function handleLoadingStateMessage(message: any): boolean {
+	switch (message.command) {
+		case 'usageLoadingProgress':
+			updateUsageLoadingProgress(message); return true;
+		case 'usageRefreshing':
+			clearLoadingTimeout();
+			_ulLastStepIdx = 0;
+			renderUsageLoadingState('Refreshing Usage Analysis');
+			return true;
+		case 'updateStatsError':
+			clearLoadingTimeout();
+			showLoadError('Failed to calculate usage analysis. Check the Output panel for details.');
+			return true;
+	}
+	return false;
+}
+
 function handleExtensionMessage(message: any): void {
+	if (handleLoadingStateMessage(message)) { return; }
 	switch (message.command) {
 		case 'repoAnalysisResults':
 			displayRepoAnalysisResults(message.data, message.workspacePath); break;
@@ -2680,10 +3006,6 @@ function handleExtensionMessage(message: any): void {
 			handleBatchAnalysisComplete(); break;
 		case 'updateStats':
 			handleUpdateStats(message); break;
-		case 'updateStatsError':
-			clearLoadingTimeout();
-			showLoadError('Failed to calculate usage analysis. Check the Output panel for details.');
-			break;
 		case 'toolSuppressed':
 			handleToolSuppressed(message.toolName as string); break;
 		case 'highlightUnknownTools':
@@ -3187,14 +3509,11 @@ async function bootstrap(): Promise<void> {
 	// TOOL_NAME_MAP is imported at build-time from src/toolNames.json
 
 	if (!initialData) {
-		const root = document.getElementById('root');
-		if (root) {
-			root.innerHTML = '<div style="padding: 32px; text-align: center; color: var(--vscode-foreground); opacity: 0.7; font-size: 14px;">⏳ Loading usage analysis…</div>';
-		}
+		renderUsageLoadingState('Loading usage analysis...');
 		// If data doesn't arrive within 30s, show a helpful hint (non-fatal)
 		loadingTimeoutId = setTimeout(() => {
 			const r = document.getElementById('root');
-			if (r && r.innerHTML.includes('Loading usage analysis')) {
+			if (r && r.querySelector('#usage-loading-card')) {
 				const hint = document.createElement('div');
 				hint.style.cssText = 'padding: 32px; text-align: center; font-size: 14px;';
 				const msg = document.createElement('div');

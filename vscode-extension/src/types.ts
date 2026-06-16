@@ -709,6 +709,8 @@ export interface AvailableToolEntry {
   extensionId?: string;
   /** Skill file path (relative) when `source === 'skill'`. */
   skillPath?: string;
+  /** Agent-plugin name (from `installed.json`) when this skill comes from a VS Code agent plugin. */
+  pluginName?: string;
   /** Absolute path(s) of the config or skill file(s) this entry was discovered from. */
   configFiles?: string[];
   /**
@@ -743,6 +745,8 @@ export interface ToolCurationAnalysis {
   unusedTools: AvailableToolEntry[];
   /** MCP servers with partial or zero tool usage. */
   underusedMcpServers: { server: string; availableToolCount: number; usedToolCount: number; configFiles?: string[]; extensionId?: string; enabled?: boolean; extensionActive?: boolean }[];
+  /** Agent plugins with skill usage counts for the window; sorted by usedSkillCount ascending. Includes all plugins (not just unused ones) so the UI can offer a "hide plugins with usage" toggle. */
+  underusedAgentPlugins: { pluginName: string; availableSkillCount: number; usedSkillCount: number }[];
   /** Rough prompt-bloat estimate from unused tool descriptions. */
   estimatedPromptBloat: { totalTokens: number; byServer: Record<string, number> };
   /** Prioritised list of recommendations. */

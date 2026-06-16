@@ -12,6 +12,7 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { fileURLToPath } from 'url';
 
 import type {
 	AvailableToolEntry,
@@ -261,22 +262,127 @@ export function buildMcpEntriesFromJson(workspaceFolderPaths: string[]): Availab
 // Skill discovery (works in both VS Code and CLI)
 // ---------------------------------------------------------------------------
 
-/** Extract the first description line from a SKILL.md file, or return a default. */
+/**
+ * Parse YAML frontmatter from a SKILL.md file and extract the `description` field.
+ *
+ * Handles:
+ * - Inline values:            `description: Some text`
+ * - Quoted inline values:     `description: "Some text"`
+ * - Folded block scalars:     `description: >-` / `description: >`
+ * - Literal block scalars:    `description: |-` / `description: |` / `description: |>`
+ *
+ * For folded scalars (starting with `>`) continuation lines are joined with a single
+ * space (standard YAML folded behaviour).  For literal scalars (starting with `|`)
+ * continuation lines are joined with a newline.
+ *
+ * Falls back to the first Markdown heading (`# Title`) when the frontmatter has no
+ * `description` key, and to `fallback` when neither can be found.
+ */
 function readSkillDescription(skillMdPath: string, fallback: string): string {
 	try {
 		const content = fs.readFileSync(skillMdPath, 'utf-8');
-		const descMatch = /^(?:description:|#\s+)(.+)/im.exec(content);
-		if (descMatch) {
-			return descMatch[1].trim().replace(/^["']|["']$/g, '');
-		}
+		const desc = extractDescriptionFromSkillContent(content);
+		if (desc) { return desc; }
 	} catch {
 		// ignore read errors
 	}
 	return fallback;
 }
 
+/**
+ * Extract the description value from the text content of a SKILL.md file.
+ * Exported for unit testing.
+ */
+export function extractDescriptionFromSkillContent(content: string): string | undefined {
+	// --- Attempt to parse YAML frontmatter block ---
+	const frontmatter = extractFrontmatter(content);
+	if (frontmatter !== undefined) {
+		const desc = parseFrontmatterDescription(frontmatter);
+		if (desc) { return desc; }
+	}
+
+	// --- Fallback: description: anywhere in the file (no frontmatter delimiters) ---
+	// Match only an inline value — skip block scalar indicators
+	const inlineMatch = /^description:\s+(?!>|[|])(.+)/im.exec(content);
+	if (inlineMatch) {
+		return inlineMatch[1].trim().replace(/^["']|["']$/g, '');
+	}
+
+	// --- Final fallback: first Markdown heading ---
+	const headingMatch = /^#\s+(.+)/m.exec(content);
+	if (headingMatch) { return headingMatch[1].trim(); }
+
+	return undefined;
+}
+
+/** Return the raw frontmatter text (between the two `---` fences), or undefined. */
+function extractFrontmatter(content: string): string | undefined {
+	// Allow an optional BOM and optional leading whitespace before the first fence
+	const stripped = content.replace(/^\uFEFF/, '').trimStart();
+	if (!/^---(?:\r?\n|$)/.test(stripped)) { return undefined; }
+	const afterOpen = stripped.slice(3);
+	// The closing fence must be `---` on its own line; allow EOF without trailing newline
+	const closeIdx = afterOpen.search(/\n---(?:\r?\n|$)/m);
+	if (closeIdx === -1) { return undefined; }
+	return afterOpen.slice(0, closeIdx);
+}
+
+/**
+ * Extract the `description` value from a raw YAML frontmatter string.
+ * Handles inline, folded (>/->) and literal (|/|-/|>) block styles.
+ */
+/** Collect indented body lines following a block scalar indicator, with all lines trimmed to remove leading/trailing whitespace. */
+function collectBlockScalarLines(lines: string[], startIdx: number, keyIndent: number): string[] {
+	const bodyLines: string[] = [];
+	for (let j = startIdx; j < lines.length; j++) {
+		const bodyLine = lines[j];
+		if (bodyLine.trim() === '') { bodyLines.push(''); continue; }
+		const bodyIndent = bodyLine.match(/^(\s*)/)?.[1].length ?? 0;
+		if (bodyIndent <= keyIndent) { break; }
+		bodyLines.push(bodyLine.trim());
+	}
+	// Trim trailing blank lines
+	while (bodyLines.length > 0 && bodyLines[bodyLines.length - 1] === '') { bodyLines.pop(); }
+	return bodyLines;
+}
+
+function parseFrontmatterDescription(frontmatter: string): string | undefined {
+	const lines = frontmatter.split(/\r?\n/);
+
+	for (let i = 0; i < lines.length; i++) {
+		const keyMatch = /^(\s*)description:\s*(.*)/i.exec(lines[i]);
+		if (!keyMatch) { continue; }
+
+		const indent = keyMatch[1].length;
+		const valueRaw = keyMatch[2].trim();
+
+		// Block scalar indicator: >, >-, |, |-, |>
+		const blockMatch = /^([|>])[-+>]?\s*$/.exec(valueRaw);
+		if (blockMatch) {
+			const bodyLines = collectBlockScalarLines(lines, i + 1, indent);
+			if (bodyLines.length === 0) { return undefined; }
+			return blockMatch[1] === '>' ? bodyLines.join(' ') : bodyLines.join('\n');
+		}
+
+		// Inline value (possibly quoted)
+		return valueRaw ? valueRaw.replace(/^["']|["']$/g, '') : undefined;
+	}
+
+	return undefined;
+}
+
+function readJsonFile(filePath: string): unknown {
+	try {
+		if (!fs.existsSync(filePath)) { return undefined; }
+		const raw = fs.readFileSync(filePath, 'utf-8');
+		return JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+}
+
 /** Collect skill entries from a single `.github/skills` directory. */
-function collectSkillsFromDirectory(folder: string, skillsDir: string, seenPaths: Set<string>): AvailableToolEntry[] {
+function collectSkillsFromDirectory(folder: string, skillsDir: string, seenPaths: Set<string>, pluginName?: string): AvailableToolEntry[] {
 	let skillDirs: fs.Dirent[];
 	try {
 		skillDirs = fs.readdirSync(skillsDir, { withFileTypes: true });
@@ -292,9 +398,137 @@ function collectSkillsFromDirectory(folder: string, skillsDir: string, seenPaths
 		seenPaths.add(skillMdPath);
 		const description = readSkillDescription(skillMdPath, `Skill: ${entry.name}`);
 		const relativePath = path.relative(folder, skillMdPath).replace(/\\/g, '/');
-		entries.push({ name: entry.name, description, source: 'skill', skillPath: relativePath, configFiles: [skillMdPath] });
+		const entry2: AvailableToolEntry = { name: entry.name, description, source: 'skill', skillPath: relativePath, configFiles: [skillMdPath] };
+		if (pluginName) { entry2.pluginName = pluginName; }
+		entries.push(entry2);
 	}
 	return entries;
+}
+
+const SKILL_DIR_SCAN_EXCLUDES = new Set([
+	'.git',
+	'node_modules',
+	'dist',
+	'out',
+	'build',
+	'.next',
+	'.venv',
+	'venv',
+	'target',
+	'.idea',
+	'.vscode',
+]);
+
+const DEFAULT_NESTED_SKILLS_SCAN_DEPTH = 4;
+const MAX_NESTED_SKILLS_SCAN_DIRS = 400;
+
+function findNestedSkillsDirectories(rootDir: string, maxDepth = DEFAULT_NESTED_SKILLS_SCAN_DEPTH): string[] {
+	const found: string[] = [];
+	const visited = new Set<string>();
+	let scannedDirs = 0;
+
+	const walk = (currentDir: string, depth: number): void => {
+		if (depth > maxDepth || visited.has(currentDir) || scannedDirs >= MAX_NESTED_SKILLS_SCAN_DIRS) { return; }
+		visited.add(currentDir);
+		scannedDirs++;
+
+		let entries: fs.Dirent[];
+		try {
+			entries = fs.readdirSync(currentDir, { withFileTypes: true });
+		} catch {
+			return;
+		}
+
+		for (const entry of entries) {
+			if (!entry.isDirectory()) { continue; }
+			if (SKILL_DIR_SCAN_EXCLUDES.has(entry.name)) { continue; }
+			const child = path.join(currentDir, entry.name);
+			if (entry.name === 'skills') {
+				found.push(child);
+				continue;
+			}
+			walk(child, depth + 1);
+		}
+	};
+
+	walk(rootDir, 0);
+	return found;
+}
+
+function collectSkillsFromRoot(relativeTo: string, rootDir: string, seenPaths: Set<string>): AvailableToolEntry[] {
+	if (!fs.existsSync(rootDir)) { return []; }
+
+	const entries: AvailableToolEntry[] = [];
+	entries.push(...collectSkillsFromDirectory(relativeTo, rootDir, seenPaths));
+
+	for (const skillsDir of findNestedSkillsDirectories(rootDir)) {
+		entries.push(...collectSkillsFromDirectory(relativeTo, skillsDir, seenPaths));
+	}
+
+	return entries;
+}
+
+function resolveSkillPath(rawPath: string, home: string): string {
+	let resolved = rawPath.trim();
+	if (!resolved) { return ''; }
+
+	if (resolved.startsWith('~')) {
+		if (resolved === '~') {
+			resolved = home;
+		} else if (resolved.startsWith('~/') || resolved.startsWith('~\\')) {
+			resolved = path.join(home, resolved.slice(2));
+		}
+	}
+
+	resolved = resolved.replace(/\$\{env:([^}]+)\}/gi, (_m, varName: string) => process.env[varName] ?? '');
+	resolved = resolved.replace(/%([^%]+)%/g, (_m, varName: string) => process.env[varName] ?? '');
+
+	if (!path.isAbsolute(resolved)) {
+		resolved = path.resolve(home, resolved);
+	}
+
+	return resolved;
+}
+
+function getVsCodeSettingsFiles(home: string): string[] {
+	const appData = process.env.APPDATA ?? path.join(home, 'AppData', 'Roaming');
+	const isWindows = process.platform === 'win32';
+
+	if (isWindows) {
+		return [
+			path.join(appData, 'Code', 'User', 'settings.json'),
+			path.join(appData, 'Code - Insiders', 'User', 'settings.json'),
+		];
+	}
+
+	if (process.platform === 'darwin') {
+		return [
+			path.join(home, 'Library', 'Application Support', 'Code', 'User', 'settings.json'),
+			path.join(home, 'Library', 'Application Support', 'Code - Insiders', 'User', 'settings.json'),
+		];
+	}
+
+	return [
+		path.join(home, '.config', 'Code', 'User', 'settings.json'),
+		path.join(home, '.config', 'Code - Insiders', 'User', 'settings.json'),
+	];
+}
+
+function getConfiguredAgentSkillLocations(home: string): string[] {
+	const locations = new Set<string>();
+
+	for (const settingsFile of getVsCodeSettingsFiles(home)) {
+		const parsed = readJsonFile(settingsFile) as { [key: string]: unknown } | undefined;
+		const raw = parsed?.['chat.agentSkillsLocations'];
+		if (!Array.isArray(raw)) { continue; }
+		for (const item of raw) {
+			if (typeof item !== 'string') { continue; }
+			const resolved = resolveSkillPath(item, home);
+			if (resolved) { locations.add(resolved); }
+		}
+	}
+
+	return [...locations];
 }
 
 /**
@@ -320,6 +554,87 @@ function userSkillDirs(): string[] {
 }
 
 /**
+ * Decode a `file://` URI (as stored in `installed.json`) to a local filesystem
+ * path.  Returns `undefined` if the URI is malformed or not a `file:` URI.
+ */
+function fileUriToPath(uri: string): string | undefined {
+	try {
+		const url = new URL(uri);
+		if (url.protocol !== 'file:') { return undefined; }
+		return path.normalize(fileURLToPath(url));
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Given a plugin directory, read `plugin.json` and return the resolved
+ * absolute paths of all declared `"skills"` entries.  Falls back to
+ * `./skills/` when the key is absent.
+ */
+function resolvePluginSkillDirs(pluginDir: string): string[] {
+	const pluginJson = readJsonFile(path.join(pluginDir, 'plugin.json')) as { skills?: unknown } | undefined;
+
+	let declaredSkills: string[];
+	if (Array.isArray(pluginJson?.skills)) {
+		declaredSkills = (pluginJson.skills as unknown[]).filter((s): s is string => typeof s === 'string');
+	} else if (typeof pluginJson?.skills === 'string') {
+		declaredSkills = [pluginJson.skills];
+	} else {
+		declaredSkills = ['./skills/'];
+	}
+
+	return declaredSkills
+		.map(s => path.resolve(pluginDir, s))
+		.filter(p => fs.existsSync(p));
+}
+
+/**
+ * Read `installed.json` from an `agent-plugins` home directory and resolve the
+ * declared `"skills"` paths from each plugin's `plugin.json`, mirroring the
+ * VS Code loading behaviour.
+ *
+ * VS Code does NOT scan the entire cloned repo.  It reads `installed.json` to
+ * find which plugin directories are installed, then reads each plugin's
+ * `plugin.json` to find the `"skills"` array, and only scans those declared
+ * sub-directories.  This function replicates that logic so we only report
+ * skills that are actually loaded.
+ */
+function resolveInstalledPluginSkillDirs(agentPluginsHome: string): { dir: string; pluginName: string }[] {
+	const installedJson = readJsonFile(path.join(agentPluginsHome, 'installed.json')) as { installed?: unknown[] } | undefined;
+	if (!Array.isArray(installedJson?.installed)) { return []; }
+
+	const results: { dir: string; pluginName: string }[] = [];
+	for (const entry of installedJson.installed) {
+		if (typeof entry !== 'object' || entry === null) { continue; }
+		const rec = entry as Record<string, unknown>;
+		const pluginUriStr = rec['pluginUri'];
+		if (typeof pluginUriStr !== 'string') { continue; }
+		const pluginDir = fileUriToPath(pluginUriStr);
+		if (!pluginDir || !fs.existsSync(pluginDir)) { continue; }
+		const pluginName = typeof rec['name'] === 'string' && rec['name'] ? rec['name'] : path.basename(pluginDir);
+		for (const dir of resolvePluginSkillDirs(pluginDir)) {
+			results.push({ dir, pluginName });
+		}
+	}
+	return results;
+}
+
+function userAgentPluginSkillDirs(): { dir: string; pluginName: string }[] {
+	const home = process.env.USERPROFILE ?? process.env.HOME ?? '';
+	if (!home) { return []; }
+	const pluginHomes = [
+		path.join(home, '.vscode', 'agent-plugins'),
+		path.join(home, '.vscode-insiders', 'agent-plugins'),
+	];
+	const results: { dir: string; pluginName: string }[] = [];
+	for (const pluginHome of pluginHomes) {
+		results.push(...resolveInstalledPluginSkillDirs(pluginHome));
+	}
+	return results;
+}
+
+/**
  * Scan workspace folders and user-level directories for skill files
  * (`SKILL.md`) and return them as `AvailableToolEntry` objects.
  *
@@ -333,7 +648,10 @@ function userSkillDirs(): string[] {
  *   `~/.claude/skills/`   (Visual Studio)
  *   `~/.agents/skills/`   (Visual Studio)
  */
-export function discoverSkillEntries(workspaceFolderPaths: string[]): AvailableToolEntry[] {
+export function discoverSkillEntries(
+	workspaceFolderPaths: string[],
+	options?: { additionalSkillDirs?: string[] },
+): AvailableToolEntry[] {
 	const entries: AvailableToolEntry[] = [];
 	const seenPaths = new Set<string>();
 
@@ -349,8 +667,30 @@ export function discoverSkillEntries(workspaceFolderPaths: string[]): AvailableT
 	// User-scoped skill directories (not tied to any workspace folder)
 	const home = process.env.USERPROFILE ?? process.env.HOME ?? '';
 	for (const skillsDir of userSkillDirs()) {
-		if (!fs.existsSync(skillsDir)) { continue; }
-		entries.push(...collectSkillsFromDirectory(home, skillsDir, seenPaths));
+		entries.push(...collectSkillsFromRoot(home, skillsDir, seenPaths));
+	}
+
+	// VS Code agent-plugin skill directories — resolved by reading installed.json
+	// and each plugin's plugin.json, matching VS Code's actual loading behaviour.
+	// This ensures we only report skills that are genuinely loaded into sessions,
+	// not every SKILL.md that happens to exist in a cloned plugin repository.
+	for (const { dir, pluginName } of userAgentPluginSkillDirs()) {
+		entries.push(...collectSkillsFromDirectory(home, dir, seenPaths, pluginName));
+	}
+
+	// chat.agentSkillsLocations from VS Code stable/insiders settings + extension-provided paths.
+	const optionDirs = Array.isArray(options?.additionalSkillDirs)
+		? options.additionalSkillDirs
+		: [];
+	const configuredDirs = [
+		...getConfiguredAgentSkillLocations(home),
+		...optionDirs
+			.filter((dir): dir is string => typeof dir === 'string')
+			.map(dir => resolveSkillPath(dir, home))
+			.filter(Boolean),
+	];
+	for (const configuredDir of configuredDirs) {
+		entries.push(...collectSkillsFromRoot(home, configuredDir, seenPaths));
 	}
 
 	return entries;
@@ -467,9 +807,36 @@ function buildCurationRecommendations(
 	return recs;
 }
 
+function computeUnderusedAgentPlugins(
+	availableTools: AvailableToolEntry[],
+	usedNames: Set<string>,
+): ToolCurationAnalysis['underusedAgentPlugins'] {
+	const pluginNamesBySkill = new Map<string, Set<string>>();
+	for (const t of availableTools) {
+		if (t.source !== 'skill' || !t.pluginName) { continue; }
+		const pluginNames = pluginNamesBySkill.get(t.name) ?? new Set<string>();
+		pluginNames.add(t.pluginName);
+		pluginNamesBySkill.set(t.name, pluginNames);
+	}
+
+	const pluginMap = new Map<string, { available: number; used: number }>();
+	for (const t of availableTools) {
+		if (t.source !== 'skill' || !t.pluginName) { continue; }
+		const rec = pluginMap.get(t.pluginName) ?? { available: 0, used: 0 };
+		rec.available++;
+		// Skill usage telemetry is keyed by skill name only. When multiple plugins share
+		// the same name we conservatively avoid attributing that usage to a specific plugin.
+		if (usedNames.has(t.name) && (pluginNamesBySkill.get(t.name)?.size ?? 0) === 1) {
+			rec.used++;
+		}
+		pluginMap.set(t.pluginName, rec);
+	}
+	return Array.from(pluginMap.entries())
+		.map(([pluginName, { available, used }]) => ({ pluginName, availableSkillCount: available, usedSkillCount: used }))
+		.sort((a, b) => a.usedSkillCount - b.usedSkillCount);
+}
+
 /**
- * Perform the full curation analysis.
- *
  * @param availableTools  - Tools visible in the current environment (runtime + mcp.json + skills).
  * @param usagePeriod     - Aggregated usage from the look-back window (use `last30Days` or custom).
  * @param windowDays      - Look-back window used to label the result (informational only).
@@ -507,6 +874,7 @@ export function analyzeToolCuration(
 	});
 
 	const underusedMcpServers = computeUnderusedMcpServers(availableTools, usedNames, usagePeriod);
+	const underusedAgentPlugins = computeUnderusedAgentPlugins(availableTools, usedNames);
 	const estimatedPromptBloat = buildBloatEstimate(unusedTools);
 	const recommendations = buildCurationRecommendations(underusedMcpServers, unusedTools, windowDays);
 
@@ -516,6 +884,7 @@ export function analyzeToolCuration(
 		usedTools: usedToolsArray,
 		unusedTools,
 		underusedMcpServers,
+		underusedAgentPlugins,
 		estimatedPromptBloat,
 		recommendations,
 	};
