@@ -937,4 +937,8 @@
   ,"profile_unit_test": "Profile Unit Test"
   ,"profiler_agent": "Profiler Agent"
   ,"run_profiler": "Run Profiler"
+  ,"mcp_gitkraken_cli_git_log_or_diff": "GitKraken MCP: Log/Compare"
+  ,"mcp_gitkraken_cli_git_push": "GitKraken MCP: Push"
+  ,"mcp_gitkraken_cli_git_status": "GitKraken MCP: Status"
+  ,"mcp_gitkraken_cli_gitlens_commit_composer": "GitKraken MCP: Commit Composer"
 }
