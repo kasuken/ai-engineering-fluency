@@ -82,6 +82,22 @@ function manualCompactCount(p: UsageAnalysisPeriod): number {
 	return p.toolCalls.byTool['__slash__compact'] ?? 0;
 }
 
+function autoModelUsageRatio(p: UsageAnalysisPeriod): number {
+	return p.modelSwitching.totalSessions > 0 ? p.modelSwitching.autoSessions / p.modelSwitching.totalSessions : 0;
+}
+
+function hasFoundryLocalModels(p: UsageAnalysisPeriod): boolean {
+	return (p.modelSwitching.foundryWindowsSessions ?? 0) > 0;
+}
+
+function usesOnlyDefaultModelSet(p: UsageAnalysisPeriod): boolean {
+	const uniqueCount = new Set([...p.modelSwitching.standardModels, ...p.modelSwitching.premiumModels, ...p.modelSwitching.lowCostModels, ...p.modelSwitching.mediumCostModels, ...p.modelSwitching.highCostModels]).size;
+	return uniqueCount <= 1
+		&& (p.modelSwitching.autoSessions ?? 0) === 0
+		&& (p.modelSwitching.foundryWindowsSessions ?? 0) === 0
+		&& (p.modelSwitching.unknownProviderSessions ?? 0) === 0;
+}
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -176,6 +192,52 @@ export const INSIGHT_CATALOG: InsightDefinition[] = [
 		appliesTo: (ctx) => ctx.missedPotential.length > 0,
 		weight: 90,
 		allowToast: true,
+	},
+	{
+		id: 'auto-model-efficiency',
+		category: 'customization',
+		severity: 'tip',
+		title: '⚡ Use the Auto model more often for cost-sensitive work',
+		buildBody: (ctx) => {
+			const ratio = Math.round(autoModelUsageRatio(ctx.last30Days) * 100);
+			return ratio > 0
+				? `Auto is only ${ratio}% of your model-switching sessions in the last 30 days. When you are optimizing for cost or speed, Auto can choose a better fit without you having to manage model selection manually.`
+				: `You have not used the Auto model in the last 30 days. When you are optimizing for cost or speed, Auto can choose a better fit without you having to manage model selection manually.`;
+		},
+		appliesTo: (ctx) => {
+			if (ctx.last30Days.sessions < 10) { return false; }
+			const ratio = autoModelUsageRatio(ctx.last30Days);
+			return ratio < 0.25 && ctx.last30Days.modelSwitching.totalSessions > 0;
+		},
+		weight: 82,
+	},
+	{
+		id: 'foundry-local-models',
+		category: 'customization',
+		severity: 'celebration',
+		title: '🧠 Nice use of Microsoft Foundry on Windows models',
+		buildBody: (ctx) => {
+			const sessions = ctx.last30Days.modelSwitching.foundryWindowsSessions ?? 0;
+			return `You used Microsoft Foundry on Windows / local models in ${sessions} session${sessions === 1 ? '' : 's'} in the last 30 days. Local models are great when you want more private, on-device or offline-friendly workflows.`;
+		},
+		appliesTo: (ctx) => (ctx.last30Days.modelSwitching.foundryWindowsSessions ?? 0) > 0,
+		weight: 88,
+	},
+	{
+		id: 'explore-model-providers',
+		category: 'customization',
+		severity: 'tip',
+		title: '🧩 Try more model providers from the Marketplace',
+		buildBody: (ctx) => {
+			return `You have mostly used the same default model so far. The VS Code Marketplace has model-provider extensions that can add more choices for different tasks, budgets, and privacy needs.`;
+		},
+		actionLabel: 'Open Extensions',
+		actionCommand: 'workbench.extensions.action.showExtensions',
+		appliesTo: (ctx) => {
+			if (ctx.last30Days.sessions < 10) { return false; }
+			return usesOnlyDefaultModelSet(ctx.last30Days);
+		},
+		weight: 80,
 	},
 
 	// ── Context ─────────────────────────────────────────────────────────────

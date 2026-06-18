@@ -35,6 +35,7 @@ import {
 	buildReasoningEffortTimeline,
 	extractResponseItemText,
 } from './tokenEstimation';
+import { getModelBillingProvider } from './chartDataBuilder';
 import {
 	getModeType,
 	isMcpTool,
@@ -174,6 +175,79 @@ toolName?: string;
 };
 model?: string;
 toolName?: string;
+}
+
+type SelectedModelMetadataRaw = {
+	identifier?: string;
+	metadata?: {
+		id?: string;
+		family?: string;
+		vendor?: string;
+		extension?: { value?: string };
+		modelPickerCategory?: { label?: string };
+	};
+};
+
+function _cmsNormalizeText(value: unknown): string {
+	return typeof value === 'string' ? value.trim().toLowerCase() : '';
+}
+
+function _cmsGetSelectedModelCandidate(event: CmsEvent): SelectedModelMetadataRaw | undefined {
+	const v = event.v as { selectedModel?: SelectedModelMetadataRaw; inputState?: { selectedModel?: SelectedModelMetadataRaw } } | undefined;
+	return v?.selectedModel ?? v?.inputState?.selectedModel;
+}
+
+function _cmsTrackModelSelectionSignals(modelId: string | undefined, modelInfo: SelectedModelMetadataRaw | undefined, analysis: SessionUsageAnalysis): void {
+	const normalizedId = (modelId ?? '').replace(/^copilot\//, '');
+	if (!normalizedId) { return; }
+	const family = _cmsNormalizeText(modelInfo?.metadata?.family);
+	const vendor = _cmsNormalizeText(modelInfo?.metadata?.vendor);
+	const extension = _cmsNormalizeText(modelInfo?.metadata?.extension?.value);
+	const category = _cmsNormalizeText(modelInfo?.metadata?.modelPickerCategory?.label);
+	if (normalizedId === 'auto' || family === 'auto' || family.includes('auto') || normalizedId.includes('/auto')) {
+		analysis.modelSwitching.autoSessions = 1;
+	}
+	const looksFoundry = family.includes('foundry') || family.includes('local') || extension.includes('foundry') || extension.includes('windows') || category.includes('foundry') || category.includes('windows') || normalizedId.includes('foundry');
+	const looksFoundryById = normalizedId.includes('foundry') && (normalizedId.includes('microsoft') || normalizedId.includes('aitk'));
+	if (looksFoundryById || (vendor.includes('microsoft') && looksFoundry)) {
+		analysis.modelSwitching.foundryWindowsSessions = 1;
+	}
+	const provider = getModelBillingProvider(normalizedId);
+	if (provider === 'Other') {
+		analysis.modelSwitching.unknownProviderSessions = 1;
+		if (!analysis.modelSwitching.unknownProviderModels.includes(normalizedId)) { analysis.modelSwitching.unknownProviderModels.push(normalizedId); }
+	}
+	const selectedExtension = modelInfo?.metadata?.extension?.value;
+	if (selectedExtension && !analysis.modelSwitching.selectedModelExtensions.includes(selectedExtension)) {
+		analysis.modelSwitching.selectedModelExtensions.push(selectedExtension);
+	}
+}
+
+function _cmsTrackSelectionSignalsFromEvent(event: CmsEvent, analysis: SessionUsageAnalysis): void {
+	if (event.type === 'session.start' && typeof event.data?.selectedModel === 'string') {
+		_cmsTrackModelSelectionSignals(event.data.selectedModel, _cmsGetSelectedModelCandidate(event), analysis);
+		return;
+	}
+	if (event.type === 'session.model_change' && typeof event.data?.newModel === 'string') {
+		_cmsTrackModelSelectionSignals(event.data.newModel, _cmsGetSelectedModelCandidate(event), analysis);
+		return;
+	}
+	const id0 = _cmsGetKind0ModelId(event);
+	if (id0) {
+		_cmsTrackModelSelectionSignals(id0, _cmsGetSelectedModelCandidate(event), analysis);
+		return;
+	}
+	const id2 = _cmsGetKind2ModelId(event);
+	if (id2) {
+		_cmsTrackModelSelectionSignals(id2, _cmsGetSelectedModelCandidate(event), analysis);
+		return;
+	}
+	// Also check for model field in event (for events that might have model/resolvedModel pattern)
+	if (typeof event.model === 'string') {
+		_cmsTrackModelSelectionSignals(event.model, _cmsGetSelectedModelCandidate(event), analysis);
+		// Also detect Foundry from event model field
+		_cmsDetectFoundryFromRequest(event as any, analysis);
+	}
 }
 
 /** Reconstructed delta session state (from applyDelta over JSONL lines) */
@@ -522,14 +596,27 @@ function _pdsaExtractModelSwitching(
 	const sessionDefaultModel = (
 		sessionState.selectedModel?.identifier ||
 		sessionState.selectedModel?.metadata?.id ||
+		sessionState.inputState?.selectedModel?.identifier ||
 		sessionState.inputState?.selectedModel?.metadata?.id ||
 		'gpt-4o'
 	).replace(/^copilot\//, '');
 
+	// Detect Auto model from the session-level selected model
+	const sessionSelectedId = (sessionState.selectedModel?.identifier || sessionState.inputState?.selectedModel?.identifier || '').replace(/^copilot\//, '');
+	if (sessionSelectedId === 'auto') {
+		analysis.modelSwitching.autoSessions = 1;
+	}
+
 	const models: string[] = [];
 	for (const req of requests) {
 		if (!req || !req.requestId) { continue; }
-		models.push(_pdsaGetReqModel(req, sessionDefaultModel, deps.modelPricing));
+		const reqModel = _pdsaGetReqModel(req, sessionDefaultModel, deps.modelPricing);
+		models.push(reqModel);
+		// Detect Foundry models from per-request modelId
+		const reqModelLower = reqModel.toLowerCase();
+		if (reqModelLower.includes('foundry') && (reqModelLower.includes('microsoft') || reqModelLower.includes('aitk'))) {
+			analysis.modelSwitching.foundryWindowsSessions = 1;
+		}
 	}
 	const uniqueModels = [...new Set(models)];
 	analysis.modelSwitching.uniqueModels = uniqueModels;
@@ -711,6 +798,12 @@ function _muaMergeTierModels(period: UsageAnalysisPeriod, ms: SessionModelSwitch
 	}
 }
 
+function _muaMergeUniqueStrings(target: string[], values: string[] | undefined): void {
+	for (const value of values ?? []) {
+		if (!target.includes(value)) { target.push(value); }
+	}
+}
+
 function _muaMergeCostModels(period: UsageAnalysisPeriod, ms: SessionModelSwitching): void {
 	for (const model of (ms.costBuckets?.low ?? [])) {
 		if (!period.modelSwitching.lowCostModels.includes(model)) { period.modelSwitching.lowCostModels.push(model); }
@@ -738,6 +831,8 @@ function _muaMergeModelSwitching(period: UsageAnalysisPeriod, analysis: SessionU
 	if (!analysis.modelSwitching) {
 		(analysis as { modelSwitching?: SessionModelSwitching }).modelSwitching = {
 			uniqueModels: [], modelCount: 0, switchCount: 0,
+			autoSessions: 0, foundryWindowsSessions: 0, unknownProviderSessions: 0,
+			selectedModelExtensions: [], unknownProviderModels: [],
 			tiers: { standard: [], premium: [], unknown: [] },
 			hasMixedTiers: false, standardRequests: 0, premiumRequests: 0,
 			unknownRequests: 0, totalRequests: 0,
@@ -751,6 +846,11 @@ function _muaMergeModelSwitching(period: UsageAnalysisPeriod, analysis: SessionU
 	period.modelSwitching.modelsPerSession.push(ms.modelCount);
 	_muaMergeTierModels(period, ms);
 	_muaMergeCostModels(period, ms);
+	period.modelSwitching.autoSessions += ms.autoSessions || 0;
+	period.modelSwitching.foundryWindowsSessions += ms.foundryWindowsSessions || 0;
+	period.modelSwitching.unknownProviderSessions += ms.unknownProviderSessions || 0;
+	_muaMergeUniqueStrings(period.modelSwitching.selectedModelExtensions, ms.selectedModelExtensions);
+	_muaMergeUniqueStrings(period.modelSwitching.unknownProviderModels, ms.unknownProviderModels);
 	if (ms.hasMixedTiers) { period.modelSwitching.mixedTierSessions++; }
 	if (ms.hasMixedCosts) { period.modelSwitching.mixedCostSessions++; }
 	period.modelSwitching.standardRequests += ms.standardRequests || 0;
@@ -1283,6 +1383,49 @@ function _cmsClassifyModels(uniqueModels: string[], modelPricing: { [key: string
 	return { standard, premium, unknown };
 }
 
+/**
+ * Detect Auto model usage from a request object by checking for the pattern:
+ * - model field equals "auto", or
+ * - both model and resolvedModel fields are present (indicating Auto was used and resolved to a specific model)
+ */
+function _cmsDetectAutoFromRequest(request: SessionRequestRaw | any, analysis: SessionUsageAnalysis): void {
+	// Check for explicit model === "auto" at request level
+	if (request.model === 'auto') {
+		analysis.modelSwitching.autoSessions = 1;
+		return;
+	}
+	// Check for pattern: both model and resolvedModel (auto resolution indicator)
+	if (request.model && request.resolvedModel && request.model !== request.resolvedModel) {
+		// If there's a different resolved model than requested model, Auto was used
+		analysis.modelSwitching.autoSessions = 1;
+		return;
+	}
+	// Also check in result.metadata
+	if (request.result?.metadata) {
+		if (request.result.metadata.model === 'auto') {
+			analysis.modelSwitching.autoSessions = 1;
+			return;
+		}
+		if (request.result.metadata.model && request.result.metadata.resolvedModel && 
+		    request.result.metadata.model !== request.result.metadata.resolvedModel) {
+			analysis.modelSwitching.autoSessions = 1;
+			return;
+		}
+	}
+}
+
+/**
+ * Detect Foundry/local model usage from request object by checking model field patterns
+ */
+function _cmsDetectFoundryFromRequest(request: SessionRequestRaw | any, analysis: SessionUsageAnalysis): void {
+	if (!request.model) { return; }
+	const modelStr = String(request.model).toLowerCase();
+	// Check for patterns like "aitk-foundry-local/..." or "Microsoft Foundry on Windows"
+	if (modelStr.includes('foundry') && (modelStr.includes('microsoft') || modelStr.includes('aitk'))) {
+		analysis.modelSwitching.foundryWindowsSessions = 1;
+	}
+}
+
 function _cmsCountJsonRequests(sessionContent: ParsedSessionJson, analysis: SessionUsageAnalysis, modelPricing: { [key: string]: ModelPricing }): void {
 	if (!sessionContent.requests || !Array.isArray(sessionContent.requests)) { return; }
 	let previousModel: string | null = null;
@@ -1295,18 +1438,27 @@ function _cmsCountJsonRequests(sessionContent: ParsedSessionJson, analysis: Sess
 		previousModel = currentModel;
 		_cmsIncrementTierCount(currentModel, tierCounts, modelPricing);
 		_cmsIncrementCostCount(currentModel, costCounts, modelPricing);
+		// Track Auto model usage: when 'model' field equals 'auto' or when both 'model' and 'resolved model' exist
+		_cmsDetectAutoFromRequest(requestRaw as SessionRequestRaw, analysis);
+		// Track Foundry model usage from request-level model field
+		_cmsDetectFoundryFromRequest(requestRaw as SessionRequestRaw, analysis);
 	}
 	analysis.modelSwitching.switchCount = switchCount;
 	_cmsApplyTierCounts(tierCounts, analysis);
 	_cmsApplyCostCounts(costCounts, analysis);
 }
 
+function _cmsTrackSelectionSignalsFromParsedJson(sessionContent: ParsedSessionJson, analysis: SessionUsageAnalysis): void {
+	_cmsTrackModelSelectionSignals(sessionContent.selectedModel?.identifier || sessionContent.selectedModel?.metadata?.id, sessionContent.selectedModel, analysis);
+	_cmsTrackModelSelectionSignals(sessionContent.inputState?.selectedModel?.identifier || sessionContent.inputState?.selectedModel?.metadata?.id, sessionContent.inputState?.selectedModel, analysis);
+}
+
 type CmsEvent = JsonlEventRaw & { type?: string; data?: { selectedModel?: string; newModel?: string }; model?: string };
 
 function _cmsGetKind0ModelId(event: CmsEvent): string | null {
 	if (event.kind !== 0) { return null; }
-	const v = event.v as { selectedModel?: { identifier?: string; metadata?: { id?: string } }; inputState?: { selectedModel?: { metadata?: { id?: string } } } } | undefined;
-	const id = v?.selectedModel?.identifier || v?.selectedModel?.metadata?.id || v?.inputState?.selectedModel?.metadata?.id;
+	const v = event.v as { selectedModel?: { identifier?: string; metadata?: { id?: string } }; inputState?: { selectedModel?: { identifier?: string; metadata?: { id?: string } } } } | undefined;
+	const id = v?.selectedModel?.identifier || v?.selectedModel?.metadata?.id || v?.inputState?.selectedModel?.identifier || v?.inputState?.selectedModel?.metadata?.id;
 	if (!id) { return null; }
 	return id.replace(/^copilot\//, '');
 }
@@ -1361,6 +1513,7 @@ function _cmsCountJsonlRequests(lines: string[], analysis: SessionUsageAnalysis,
 		try {
 			const event = JSON.parse(line) as CmsEvent;
 			defaultModel = _cmsExtractDefaultModel(event, defaultModel);
+			_cmsTrackSelectionSignalsFromEvent(event, analysis);
 			_cmsCountEventRequests(event, tierCounts, costCounts, defaultModel, modelPricing);
 		} catch { /* skip malformed lines */ }
 	}
@@ -1406,6 +1559,7 @@ export async function calculateModelSwitching(deps: Pick<UsageAnalysisDeps, 'war
 		if (!isJsonl) {
 			const parsed: unknown = preloadedParsedJson !== undefined ? preloadedParsedJson : JSON.parse(fileContent);
 			if (!isParsedSessionJson(parsed)) { deps.warn(`Unexpected session format in ${sessionFile}`); return; }
+			_cmsTrackSelectionSignalsFromParsedJson(parsed, analysis);
 			_cmsCountJsonRequests(parsed, analysis, deps.modelPricing);
 		} else {
 			_cmsCountJsonlRequests(fileContent.trim().split('\n'), analysis, deps.modelPricing);
@@ -1587,6 +1741,11 @@ export function createEmptySessionUsageAnalysis(): SessionUsageAnalysis {
 			uniqueModels: [],
 			modelCount: 0,
 			switchCount: 0,
+			autoSessions: 0,
+			foundryWindowsSessions: 0,
+			unknownProviderSessions: 0,
+			selectedModelExtensions: [],
+			unknownProviderModels: [],
 			tiers: { standard: [], premium: [], unknown: [] },
 			hasMixedTiers: false,
 			standardRequests: 0,
