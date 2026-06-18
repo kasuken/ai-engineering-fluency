@@ -31,6 +31,27 @@ import { estimateTokensFromText } from './tokenEstimation';
 
 export type JetBrainsMode = 'ask' | 'agent';
 
+export interface JetBrainsTurn {
+	/** Unique identifier for this turn. */
+	turnId: string;
+	/** ISO-8601 timestamp when this turn started. */
+	startTimestamp: string | null;
+	/** ISO-8601 timestamp when this turn ended. */
+	endTimestamp: string | null;
+	/** Turn completion status (e.g., 'success', 'cancelled'). */
+	status: string | null;
+	/** Additional turn status information. */
+	turnStatus: string | null;
+	/** Assistant message ID for this turn, if available. */
+	messageId: string | null;
+	/** Iteration number of the assistant message in this turn. */
+	iterationNumber: number | null;
+	/** Whether this turn contained thinking content. */
+	hasThinking: boolean;
+	/** Number of tool calls in this turn. */
+	toolCallCount: number;
+}
+
 export interface JetBrainsParsedSession {
 	/** Sum of estimated input + output tokens (excludes thinking). */
 	tokens: number;
@@ -65,6 +86,24 @@ export interface JetBrainsParsedSession {
 	 * `{ run_in_terminal: 27, read_file: 2 }`). Empty when no tools ran.
 	 */
 	toolCounts: Record<string, number>;
+	/**
+	 * Per-turn information for turns that have assistant messages.
+	 * Enables richer conversation analysis and turn-level statistics.
+	 */
+	turns: JetBrainsTurn[];
+	/**
+	 * All unique message IDs from assistant messages, in order.
+	 * Useful for tracking message references and conversation flow.
+	 */
+	messageIds: string[];
+	/**
+	 * Count of successful vs failed/cancelled turns.
+	 */
+	turnStatusCounts: { success: number; cancelled: number; failed: number; unknown: number };
+	/**
+	 * Whether any turns contained thinking content (Claude-style reasoning).
+	 */
+	hasThinking: boolean;
 }
 
 export interface JetBrainsToolCall {
@@ -75,6 +114,12 @@ export interface JetBrainsToolCall {
 	result?: string;
 	/** Mirrors `tool.execution_complete.data.success`. */
 	success?: boolean;
+	/** The turn ID this tool call belongs to, if available. */
+	turnId?: string;
+	/** Progress message from tool execution, if available. */
+	progressMessage?: string;
+	/** Tool call ID from `tool.execution_start.data.toolCallId`. */
+	toolCallId?: string;
 }
 
 /**
@@ -95,7 +140,31 @@ export function modelHintFromToolCallId(toolCallId: string | undefined): string 
 }
 
  
-type JbpState = { inputTokens: number; outputTokens: number; firstUserTs: string | null; lastTurnTs: string | null; modelFromTurnStart: string | null; modelFromToolCallId: string | null; sawToolCall: boolean; toolCallById: Map<string, JetBrainsToolCall>; renderedTurnIds: Set<string>; result: JetBrainsParsedSession };
+type JbpState = { 
+	inputTokens: number; 
+	outputTokens: number; 
+	firstUserTs: string | null; 
+	lastTurnTs: string | null; 
+	modelFromTurnStart: string | null; 
+	modelFromToolCallId: string | null; 
+	sawToolCall: boolean; 
+	toolCallById: Map<string, JetBrainsToolCall>; 
+	renderedTurnIds: Set<string>; 
+	result: JetBrainsParsedSession;
+	// Turn tracking
+	currentTurnId: string | null;
+	currentMessageId: string | null;
+	currentIterationNumber: number | null;
+	turnById: Map<string, JetBrainsTurn>;
+	// Message tracking
+	messageIds: string[];
+	// Turn status tracking
+	turnStatusCounts: { success: number; cancelled: number; failed: number; unknown: number };
+	// Thinking tracking
+	hasThinking: boolean;
+	// Tool call to turn mapping
+	toolCallByTurnId: Map<string, string[]>; // turnId -> toolCallIds
+};
 
  
 function _jbpPreParseLines(lines: string[]): { parsed: any[]; renderedTurnIds: Set<string> } {
@@ -120,6 +189,11 @@ function _jbpPreParseLines(lines: string[]): { parsed: any[]; renderedTurnIds: S
 function _jbpHandlePartitionCreated(event: any, result: JetBrainsParsedSession): void {
 	if (event.data?.conversationId) { result.conversationId = String(event.data.conversationId); }
 	if (event.data?.source) { result.source = String(event.data.source); }
+	// Initialize turn tracking arrays
+	result.turns = [];
+	result.messageIds = [];
+	result.turnStatusCounts = { success: 0, cancelled: 0, failed: 0, unknown: 0 };
+	result.hasThinking = false;
 }
 
  
@@ -127,6 +201,15 @@ function _jbpHandleUserMessage(event: any, state: JbpState): void {
 	state.result.interactions++;
 	if (typeof event.timestamp === 'string' && state.firstUserTs === null) { state.firstUserTs = event.timestamp; }
 	const turnId = event.data?.turnId;
+	
+	// Track turn changes
+	const newTurnId = typeof turnId === 'string' ? turnId : null;
+	if (newTurnId && newTurnId !== state.currentTurnId) {
+		state.currentTurnId = newTurnId;
+		state.currentMessageId = null;
+		state.currentIterationNumber = null;
+	}
+	
 	if (typeof event.data?.content === 'string' && (typeof turnId !== 'string' || !state.renderedTurnIds.has(turnId))) {
 		state.inputTokens += estimateTokensFromText(event.data.content);
 	}
@@ -134,10 +217,59 @@ function _jbpHandleUserMessage(event: any, state: JbpState): void {
 
  
 function _jbpHandleAssistantMessage(event: any, state: JbpState): void {
-	if (typeof event.data?.text === 'string' && event.data.text) { state.outputTokens += estimateTokensFromText(event.data.text); }
+	// Extract message content - try both 'text' and 'content' fields
+	const messageText = typeof event.data?.text === 'string' && event.data.text 
+		? event.data.text 
+		: (typeof event.data?.content === 'string' && event.data.content 
+			? event.data.content 
+			: null);
+	
+	if (messageText) { 
+		state.outputTokens += estimateTokensFromText(messageText); 
+	}
+	
+	// Extract thinking content
 	const thinking = event.data?.thinking?.text;
-	if (typeof thinking === 'string' && thinking) { state.result.thinkingTokens += estimateTokensFromText(thinking); }
-	if (typeof event.timestamp === 'string') { state.lastTurnTs = event.timestamp; }
+	if (typeof thinking === 'string' && thinking) { 
+		state.result.thinkingTokens += estimateTokensFromText(thinking);
+		state.hasThinking = true;
+		// Mark current turn as having thinking
+		if (state.currentTurnId && state.turnById.has(state.currentTurnId)) {
+			const turn = state.turnById.get(state.currentTurnId)!;
+			turn.hasThinking = true;
+		}
+	}
+	
+	// Track message metadata
+	if (typeof event.data?.messageId === 'string') {
+		state.currentMessageId = event.data.messageId;
+		state.result.messageIds.push(event.data.messageId);
+		// Associate with current turn
+		if (state.currentTurnId && state.turnById.has(state.currentTurnId)) {
+			const turn = state.turnById.get(state.currentTurnId)!;
+			turn.messageId = event.data.messageId;
+		}
+	}
+	
+	if (typeof event.data?.iterationNumber === 'number') {
+		state.currentIterationNumber = event.data.iterationNumber;
+		// Associate with current turn
+		if (state.currentTurnId && state.turnById.has(state.currentTurnId)) {
+			const turn = state.turnById.get(state.currentTurnId)!;
+			turn.iterationNumber = event.data.iterationNumber;
+		}
+	}
+	
+	if (typeof event.timestamp === 'string') { 
+		state.lastTurnTs = event.timestamp; 
+		// Update turn end timestamp if we're still in the same turn
+		if (state.currentTurnId && state.turnById.has(state.currentTurnId)) {
+			const turn = state.turnById.get(state.currentTurnId)!;
+			if (!turn.endTimestamp) {
+				turn.endTimestamp = event.timestamp;
+			}
+		}
+	}
 }
 
  
@@ -149,6 +281,28 @@ function _jbpHandleToolExecutionStart(event: any, state: JbpState): void {
 	}
 	const toolName = typeof event.data?.toolName === 'string' ? event.data.toolName : 'unknown';
 	const tc: JetBrainsToolCall = { toolName };
+	
+	// Capture turn ID association
+	if (state.currentTurnId) {
+		tc.turnId = state.currentTurnId;
+		// Track tool calls by turn
+		if (!state.toolCallByTurnId.has(state.currentTurnId)) {
+			state.toolCallByTurnId.set(state.currentTurnId, []);
+		}
+		state.toolCallByTurnId.get(state.currentTurnId)!.push(event.data?.toolCallId || '');
+		
+		// Increment tool call count for this turn
+		if (state.turnById.has(state.currentTurnId)) {
+			const turn = state.turnById.get(state.currentTurnId)!;
+			turn.toolCallCount++;
+		}
+	}
+	
+	// Store tool call ID
+	if (event.data?.toolCallId) {
+		tc.toolCallId = event.data.toolCallId;
+	}
+	
 	if (event.data?.arguments !== undefined) {
 		try { tc.arguments = JSON.stringify(event.data.arguments); } catch { /* ignore */ }
 	}
@@ -176,6 +330,11 @@ function _jbpHandleToolExecutionComplete(event: any, state: JbpState): void {
 	if (!tc) { return; }
 	if (typeof event.data?.success === 'boolean') { tc.success = event.data.success; }
 	if (resultText) { tc.result = resultText; }
+	
+	// Capture progress message
+	if (typeof event.data?.progressMessage === 'string') {
+		tc.progressMessage = event.data.progressMessage;
+	}
 }
 
  
@@ -188,12 +347,64 @@ function _jbpDispatchEvent(event: any, state: JbpState): void {
 			break;
 		case 'assistant.turn_start':
 			if (typeof event.data?.model === 'string' && !state.modelFromTurnStart) { state.modelFromTurnStart = event.data.model; }
+			// Track turn start
+			if (typeof event.data?.turnId === 'string') {
+				state.currentTurnId = event.data.turnId;
+				state.currentMessageId = null;
+				state.currentIterationNumber = null;
+				// Initialize turn tracking if not already exists
+				if (!state.turnById.has(event.data.turnId)) {
+					state.turnById.set(event.data.turnId, {
+						turnId: event.data.turnId,
+						startTimestamp: typeof event.timestamp === 'string' ? event.timestamp : null,
+						endTimestamp: null,
+						status: null,
+						turnStatus: null,
+						messageId: null,
+						iterationNumber: null,
+						hasThinking: false,
+						toolCallCount: 0
+					});
+				}
+			}
 			break;
 		case 'assistant.message': _jbpHandleAssistantMessage(event, state); break;
 		case 'tool.execution_start': _jbpHandleToolExecutionStart(event, state); break;
 		case 'tool.execution_complete': _jbpHandleToolExecutionComplete(event, state); break;
 		case 'assistant.turn_end':
 			if (typeof event.timestamp === 'string') { state.lastTurnTs = event.timestamp; }
+			// Update turn end information
+			if (typeof event.data?.turnId === 'string') {
+				const turnId = event.data.turnId;
+				if (state.turnById.has(turnId)) {
+					const turn = state.turnById.get(turnId)!;
+					turn.endTimestamp = typeof event.timestamp === 'string' ? event.timestamp : turn.endTimestamp;
+					
+					// Update status counts
+					const status = typeof event.data?.status === 'string' ? event.data.status : null;
+					const turnStatus = typeof event.data?.turnStatus === 'string' ? event.data.turnStatus : null;
+					
+					if (status) {
+						turn.status = status;
+						switch (status.toLowerCase()) {
+							case 'success':
+								state.result.turnStatusCounts.success++;
+								break;
+							case 'cancelled':
+								state.result.turnStatusCounts.cancelled++;
+								break;
+							case 'failed':
+								state.result.turnStatusCounts.failed++;
+								break;
+							default:
+								state.result.turnStatusCounts.unknown++;
+								break;
+						}
+					}
+					
+					turn.turnStatus = turnStatus;
+				}
+			}
 			break;
 	}
 }
@@ -210,12 +421,16 @@ export function parseJetBrainsPartition(content: string): JetBrainsParsedSession
 		tokens: 0, thinkingTokens: 0, actualTokens: 0, interactions: 0, modelUsage: {},
 		mode: 'ask', modelHint: 'unknown', firstInteraction: null, lastInteraction: null,
 		source: null, conversationId: null, toolCalls: [], toolCounts: {},
+		turns: [], messageIds: [], turnStatusCounts: { success: 0, cancelled: 0, failed: 0, unknown: 0 }, hasThinking: false
 	};
 	const { parsed, renderedTurnIds } = _jbpPreParseLines(content.split(/\r?\n/));
 	const state: JbpState = {
 		inputTokens: 0, outputTokens: 0, firstUserTs: null, lastTurnTs: null,
 		modelFromTurnStart: null, modelFromToolCallId: null, sawToolCall: false,
 		toolCallById: new Map(), renderedTurnIds, result,
+		currentTurnId: null, currentMessageId: null, currentIterationNumber: null,
+		turnById: new Map(), messageIds: [], turnStatusCounts: { success: 0, cancelled: 0, failed: 0, unknown: 0 },
+		hasThinking: false, toolCallByTurnId: new Map()
 	};
 	for (const event of parsed) { _jbpDispatchEvent(event, state); }
 	result.mode = state.sawToolCall ? 'agent' : 'ask';
@@ -223,6 +438,13 @@ export function parseJetBrainsPartition(content: string): JetBrainsParsedSession
 	result.tokens = state.inputTokens + state.outputTokens;
 	result.firstInteraction = state.firstUserTs;
 	result.lastInteraction = state.lastTurnTs;
+	result.hasThinking = state.hasThinking;
+	result.turnStatusCounts = { ...state.turnStatusCounts };
+	
+	// Convert turn map to array
+	result.turns = Array.from(state.turnById.values());
+	result.messageIds = [...state.messageIds];
+	
 	if (result.tokens > 0 && result.modelHint !== 'unknown') {
 		result.modelUsage[result.modelHint] = { inputTokens: state.inputTokens, outputTokens: state.outputTokens };
 	}

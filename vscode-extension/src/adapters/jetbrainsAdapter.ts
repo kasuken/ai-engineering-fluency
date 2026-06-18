@@ -31,7 +31,7 @@ import type {
 	DiscoveryResult,
 	CandidatePath,
 } from '../ecosystemAdapter';
-import { parseJetBrainsPartition, type JetBrainsParsedSession, type JetBrainsToolCall } from '../jetbrains';
+import { parseJetBrainsPartition, type JetBrainsParsedSession, type JetBrainsToolCall, type JetBrainsTurn } from '../jetbrains';
 import { normalizePath } from '../utils/pathUtils';
 import { pathExists } from '../utils/fsAsync';
 
@@ -123,6 +123,39 @@ export class JetBrainsAdapter implements IEcosystemAdapter, IDiscoverableEcosyst
 	async getToolCalls(sessionFile: string): Promise<JetBrainsToolCall[]> {
 		const parsed = await this.parsePartition(sessionFile);
 		return parsed?.toolCalls ?? [];
+	}
+
+	/**
+	 * Get turn-level information for a JetBrains partition.
+	 * Returns turn metadata including IDs, timestamps, status, and message associations.
+	 */
+	async getTurns(sessionFile: string): Promise<JetBrainsTurn[]> {
+		const parsed = await this.parsePartition(sessionFile);
+		return parsed?.turns ?? [];
+	}
+
+	/**
+	 * Get all message IDs from assistant messages in the partition.
+	 */
+	async getMessageIds(sessionFile: string): Promise<string[]> {
+		const parsed = await this.parsePartition(sessionFile);
+		return parsed?.messageIds ?? [];
+	}
+
+	/**
+	 * Get turn status counts (success, cancelled, failed, unknown).
+	 */
+	async getTurnStatusCounts(sessionFile: string): Promise<{ success: number; cancelled: number; failed: number; unknown: number }> {
+		const parsed = await this.parsePartition(sessionFile);
+		return parsed?.turnStatusCounts ?? { success: 0, cancelled: 0, failed: 0, unknown: 0 };
+	}
+
+	/**
+	 * Check if the partition contains any thinking content.
+	 */
+	async hasThinking(sessionFile: string): Promise<boolean> {
+		const parsed = await this.parsePartition(sessionFile);
+		return parsed?.hasThinking ?? false;
 	}
 
 	getEditorRoot(_sessionFile: string): string {
