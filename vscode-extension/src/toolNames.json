@@ -955,4 +955,7 @@
   ,"profile_unit_test": "Profile Unit Test"
   ,"profiler_agent": "Profiler Agent"
   ,"run_profiler": "Run Profiler"
+  ,"define_subagent": "Define Subagent"
+  ,"find_by_name": "Find by Name"
+  ,"manage_subagents": "Manage Subagents"
 }
