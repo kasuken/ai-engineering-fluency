@@ -848,8 +848,8 @@ wireExtensionPointButtons(vscode as { postMessage: (message: unknown) => void })
 
 async function bootstrap(): Promise<void> {
 console.log('[CopilotTokenTracker] bootstrap called');
-const { provideVSCodeDesignSystem, vsCodeButton, vsCodeBadge } = await import('@vscode/webview-ui-toolkit');
-provideVSCodeDesignSystem().register(vsCodeButton(), vsCodeBadge());
+await import('@vscode-elements/elements/dist/vscode-button/index.js');
+await import('@vscode-elements/elements/dist/vscode-badge/index.js');
 
 if (initialData) {
 console.log('[CopilotTokenTracker] Rendering details with initialData:', initialData);

@@ -675,9 +675,7 @@ window.addEventListener("message", (event) => {
 
 async function bootstrap(): Promise<void> {
   console.log("[CopilotTokenTracker] dashboard bootstrap called");
-  const { provideVSCodeDesignSystem, vsCodeButton } =
-    await import("@vscode/webview-ui-toolkit");
-  provideVSCodeDesignSystem().register(vsCodeButton());
+  await import('@vscode-elements/elements/dist/vscode-button/index.js');
 
   currentConfig = window.__DASHBOARD_CONFIG__ ?? null;
 
