@@ -1142,7 +1142,9 @@ export function calculateEstimatedCost(
 	let totalCost = 0;
 
 	for (const [model, usage] of Object.entries(modelUsage)) {
-		const baseEntry = modelPricing[model] ?? modelPricing['gpt-4o-mini'];
+		// No pricing entry → model still appears in usage breakdowns (via modelUsage)
+		// but contributes $0 to cost. Do NOT fall back to another model's rates.
+		const baseEntry = modelPricing[model];
 		if (!baseEntry) {
 			continue;
 		}

@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "description": "Model pricing data - costs per million tokens. Each model has direct provider/API pricing at the top level (used as a reference); models billed through GitHub Copilot AI Credits also include a `copilotPricing` block reflecting GitHub's published per-token rates (1 AI credit = $0.01).",
   "metadata": {
-    "lastUpdated": "2026-06-10",
+    "lastUpdated": "2026-06-21",
     "sources": [
       {
         "name": "OpenAI API Pricing",
@@ -48,6 +48,12 @@
         "url": "https://openrouter.ai",
         "retrievedDate": "2026-03-30",
         "note": "Cross-provider pricing aggregator used for verification"
+      },
+      {
+        "name": "DeepSeek API Pricing",
+        "url": "https://platform.deepseek.com/api-docs/pricing",
+        "retrievedDate": "2026-06-21",
+        "note": "deepseek-v4-flash: $0.09/M input, $0.18/M output; free tier (deepseek-v4-flash-free via OpenRouter) is $0"
       },
       {
         "name": "GitHub Copilot Models and Pricing",
@@ -1092,6 +1098,27 @@
       "multiplier": 0.0,
       "displayNames": [
         "Claude Fable 5"
+      ]
+    },
+    "deepseek-v4-flash": {
+      "inputCostPerMillion": 0.09,
+      "outputCostPerMillion": 0.18,
+      "cachedInputCostPerMillion": 0.018,
+      "category": "DeepSeek models",
+      "tier": "standard",
+      "multiplier": 0.0,
+      "displayNames": [
+        "DeepSeek V4 Flash"
+      ]
+    },
+    "deepseek-v4-flash-free": {
+      "inputCostPerMillion": 0.0,
+      "outputCostPerMillion": 0.0,
+      "category": "DeepSeek models",
+      "tier": "standard",
+      "multiplier": 0.0,
+      "displayNames": [
+        "DeepSeek V4 Flash (free)"
       ]
     }
   }
