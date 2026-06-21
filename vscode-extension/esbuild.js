@@ -38,6 +38,11 @@ async function main() {
 		outfile: 'dist/extension.js',
 		external: ['vscode'],
 		logLevel: 'silent',
+		// Polyfill import.meta.url so ESM packages that use createRequire(import.meta.url)
+		// work correctly when bundled as CJS (esbuild otherwise sets import.meta to {}).
+		// The banner defines a __importMetaUrl variable; define wires import.meta.url to it.
+		banner: { js: 'var __importMetaUrl = require("url").pathToFileURL(__filename).href;' },
+		define: { 'import.meta.url': '__importMetaUrl' },
 		plugins: [esbuildProblemMatcherPlugin],
 	});
 
