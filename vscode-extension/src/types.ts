@@ -98,6 +98,13 @@ export interface PeriodStats {
   estimatedCostCopilot?: number;
   /** Sum of cache-read tokens across all interactions in this period (when available). */
   cachedTokens?: number;
+  /**
+   * Estimated cost per billing group for this period in USD.
+   * Keys are billing group names (e.g. "GitHub Copilot", "Anthropic", "Google").
+   * Uses Copilot AI-Credit pricing for the "GitHub Copilot" group; provider/API
+   * rates for all others.
+   */
+  billingGroupCosts?: Record<string, number>;
 }
 
 export interface DetailedStats {
