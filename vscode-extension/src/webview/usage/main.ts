@@ -3503,8 +3503,7 @@ function handleBatchAnalysisComplete(): void {
 }
 
 async function bootstrap(): Promise<void> {
-	const { provideVSCodeDesignSystem, vsCodeButton } = await import('@vscode/webview-ui-toolkit');
-	provideVSCodeDesignSystem().register(vsCodeButton());
+	await import('@vscode-elements/elements/dist/vscode-button/index.js');
 
 	// TOOL_NAME_MAP is imported at build-time from src/toolNames.json
 
