@@ -152,8 +152,7 @@ function renderLayout(data: FluencyLevelData): void {
 }
 
 async function bootstrap(): Promise<void> {
-	const { provideVSCodeDesignSystem, vsCodeButton } = await import('@vscode/webview-ui-toolkit');
-	provideVSCodeDesignSystem().register(vsCodeButton());
+	await import('@vscode-elements/elements/dist/vscode-button/index.js');
 
 	if (!initialData) {
 		const root = document.getElementById('root');

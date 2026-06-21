@@ -171,7 +171,7 @@ import {
 } from './workspaceHelpers';
 
 // --- Chart building ---
-import { buildChartData as _buildChartData } from './chartDataBuilder';
+import { buildChartData as _buildChartData, getBillingGroup, getPricingSourceForBillingGroup } from './chartDataBuilder';
 
 // --- Stats helpers ---
 import { addModelUsage, addEditorUsage, addLanguageUsage, computeUtcDateRanges, aggregatePeriodStats, makePeriodAccumulator, type SessionAggregateInput } from './statsHelpers';
@@ -264,6 +264,22 @@ export function tooltipSecondaryPeriod(
 }
 
 // ── extension.ts module-level helpers ────────────────────────────────────────
+
+/**
+ * Groups per-editor model usage into billing groups (e.g. "GitHub Copilot", "Anthropic").
+ * Extracted as a module-level function to keep `computeBillingGroupCosts` complexity low.
+ */
+function aggregateEditorModelUsageByBillingGroup(editorModelUsage: { [editor: string]: ModelUsage }): Record<string, ModelUsage> {
+	const groupModelUsage: Record<string, ModelUsage> = {};
+	for (const [editor, modelUsage] of Object.entries(editorModelUsage)) {
+		for (const modelId of Object.keys(modelUsage)) {
+			const group = getBillingGroup(editor, modelId);
+			if (!groupModelUsage[group]) { groupModelUsage[group] = {}; }
+			addModelUsage(groupModelUsage[group], { [modelId]: modelUsage[modelId] });
+		}
+	}
+	return groupModelUsage;
+}
 
 function _dwbcPickWinner(
 	key: string, canonical: string,
@@ -2427,7 +2443,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 	private buildTooltipMarkdown(detailedStats: DetailedStats): vscode.MarkdownString {
 		const tooltip = new vscode.MarkdownString();
-		tooltip.isTrusted = false;
+		tooltip.isTrusted = true;
+		tooltip.supportThemeIcons = false;
 		tooltip.appendMarkdown('#### AI Engineering Fluency');
 		tooltip.appendMarkdown('\n---\n');
 		tooltip.appendMarkdown(`📅 Today  \n`);
@@ -2436,9 +2453,6 @@ class CopilotTokenTracker implements vscode.Disposable {
 		tooltip.appendMarkdown(`| Estimated cost (UBB) :       | $ ${(detailedStats.today.estimatedCostCopilot ?? 0).toFixed(2)} |\n`);
 		tooltip.appendMarkdown(`| CO₂ estimated :              | ${detailedStats.today.co2.toFixed(2)} grams |\n`);
 		tooltip.appendMarkdown(`| Water estimated :           | ${detailedStats.today.waterUsage.toFixed(3)} liters |\n`);
-		tooltip.appendMarkdown(`| Sessions :             | ${detailedStats.today.sessions} |\n`);
-		tooltip.appendMarkdown(`| Average interactions/session :     | ${detailedStats.today.avgInteractionsPerSession} |\n`);
-		tooltip.appendMarkdown(`| Average tokens/session :            | ${detailedStats.today.avgTokensPerSession.toLocaleString()} |\n`);
 		tooltip.appendMarkdown('\n---\n');
 		const secondaryPeriod = tooltipSecondaryPeriod(this.getStatusBarShowTokensSetting(), this.getStatusBarShowCostSetting());
 		const secondaryStats = secondaryPeriod === 'currentMonth' ? detailedStats.month : detailedStats.last30Days;
@@ -2449,17 +2463,49 @@ class CopilotTokenTracker implements vscode.Disposable {
 		tooltip.appendMarkdown(`| Estimated cost (UBB) :       | $ ${(secondaryStats.estimatedCostCopilot ?? 0).toFixed(2)} |\n`);
 		tooltip.appendMarkdown(`| CO₂ estimated :              | ${secondaryStats.co2.toFixed(2)} grams |\n`);
 		tooltip.appendMarkdown(`| Water estimated :           | ${secondaryStats.waterUsage.toFixed(3)} liters |\n`);
-		tooltip.appendMarkdown(`| Sessions :             | ${secondaryStats.sessions} |\n`);
-		tooltip.appendMarkdown(`| Average interactions/session :      | ${secondaryStats.avgInteractionsPerSession} |\n`);
-		tooltip.appendMarkdown(`| Average tokens/session :            | ${secondaryStats.avgTokensPerSession.toLocaleString()} |\n`);
 		tooltip.appendMarkdown('\n---\n');
-		const budget = this.getEffectiveMonthlyBudget();
-		if (budget > 0) {
-			const monthCost = detailedStats.month.estimatedCostCopilot ?? detailedStats.month.estimatedCost ?? 0;
-			const pct = Math.round((monthCost / budget) * 100);
-			tooltip.appendMarkdown(`\n---\n💰 Monthly budget: $${budget.toFixed(2)} — this month: $${monthCost.toFixed(2)} (${pct}%)`);
-		}
+		this.appendProviderCostSection(tooltip, detailedStats);
 		return tooltip;
+	}
+
+	/** Builds and appends the per-provider cost section with SVG progress bars.
+	 *  Each provider always gets a bar: GitHub Copilot uses cost vs. budget (if configured),
+	 *  all others show cost as a proportion of total monthly spend across all providers. */
+	private appendProviderCostSection(tooltip: vscode.MarkdownString, detailedStats: DetailedStats): void {
+		const monthCosts = detailedStats.month.billingGroupCosts ?? {};
+		const providers = Object.keys(monthCosts).sort((a, b) => (monthCosts[b] ?? 0) - (monthCosts[a] ?? 0));
+		if (providers.length === 0) { return; }
+		const budget = this.getEffectiveMonthlyBudget();
+		const totalCost = Object.values(monthCosts).reduce((s, v) => s + v, 0);
+		tooltip.appendMarkdown(`💰 Costs by Provider — Current Month  \n`);
+		tooltip.appendMarkdown(`|  |  |  |\n|---|---|---|\n`);
+		for (const provider of providers) {
+			const cost = monthCosts[provider] ?? 0;
+			const providerBudget = provider === 'GitHub Copilot' ? budget : 0;
+			const { ratio, color } = this.providerBarStyle(cost, providerBudget, totalCost);
+			const costStr = `$${cost.toFixed(2)}${providerBudget > 0 ? ` / $${providerBudget.toFixed(2)}` : ''}`;
+			const barCell = `![](data:image/svg+xml;charset=utf-8,${encodeURIComponent(this.buildBarSvg(ratio, color))})`;
+			tooltip.appendMarkdown(`| ${provider} | ${costStr} | ${barCell} |\n`);
+		}
+	}
+
+	/** Returns the bar fill ratio and colour for a provider row. */
+	private providerBarStyle(cost: number, providerBudget: number, totalCost: number): { ratio: number; color: string } {
+		if (providerBudget > 0) {
+			const ratio = cost / providerBudget;
+			const color = ratio >= 0.9 ? '#EF5350' : ratio >= 0.75 ? '#FFA726' : '#4CAF50';
+			return { ratio, color };
+		}
+		return { ratio: totalCost > 0 ? cost / totalCost : 0, color: '#5B9BD5' };
+	}
+
+	/** Generates a small SVG progress bar with the given fill ratio (0–1) and color. */
+	private buildBarSvg(ratio: number, fillColor: string): string {
+		const W = 130, H = 12, R = 4;
+		const clampedRatio = Math.min(1, Math.max(0, ratio));
+		const fillW = Math.max(R * 2, Math.round(clampedRatio * W));
+		const pctLabel = `${Math.round(ratio * 100)}%`;
+		return `<svg xmlns="http://www.w3.org/2000/svg" width="${W + 36}" height="${H}"><rect x="0" y="1" width="${W}" height="${H - 2}" rx="${R}" fill="#444"/><rect x="0" y="1" width="${fillW}" height="${H - 2}" rx="${R}" fill="${fillColor}"/><text x="${W + 4}" y="${H - 1}" font-family="sans-serif" font-size="9" fill="#ccc">${pctLabel}</text></svg>`;
 	}
 
 	private updateDetailsPanelIfOpen(detailedStats: DetailedStats, silent: boolean): void {
@@ -2754,6 +2800,28 @@ class CopilotTokenTracker implements vscode.Disposable {
 		return Array.from(dailyStatsMap.values()).sort((a, b) => a.date.localeCompare(b.date));
 	}
 
+	/**
+	 * Computes estimated costs grouped by billing provider for a period.
+	 * Uses per-editor model usage to determine which billing group each model/session belongs to.
+	 * The "GitHub Copilot" group value is replaced by the more accurate `estimatedCostCopilot`
+	 * (exact nanoAiu billing + estimated for remaining sessions) when available.
+	 */
+	private computeBillingGroupCosts(
+		editorModelUsage: { [editor: string]: ModelUsage },
+		estimatedCostCopilot: number
+	): Record<string, number> {
+		const groupModelUsage = aggregateEditorModelUsageByBillingGroup(editorModelUsage);
+		const result: Record<string, number> = {};
+		for (const [group, modelUsage] of Object.entries(groupModelUsage)) {
+			result[group] = this.calculateEstimatedCost(modelUsage, getPricingSourceForBillingGroup(group));
+		}
+		// Replace GitHub Copilot with the more accurate value that accounts for exact nanoAiu billing
+		if (estimatedCostCopilot > 0 || result['GitHub Copilot'] !== undefined) {
+			result['GitHub Copilot'] = estimatedCostCopilot;
+		}
+		return result;
+	}
+
 	private buildDetailedStatsResult(
 		todayStats: ReturnType<typeof makePeriodAccumulator>,
 		monthStats: ReturnType<typeof makePeriodAccumulator>,
@@ -2769,6 +2837,10 @@ class CopilotTokenTracker implements vscode.Disposable {
 		const monthWater = (monthStats.tokens / 1000) * this.waterUsagePer1kTokens;
 		const lastMonthWater = (lastMonthStats.tokens / 1000) * this.waterUsagePer1kTokens;
 		const last30DaysWater = (last30DaysStats.tokens / 1000) * this.waterUsagePer1kTokens;
+		const todayCopilotCost = todayStats.exactCopilotCostDollars + this.calculateEstimatedCost(todayStats.modelUsageNoExact, 'copilot');
+		const monthCopilotCost = monthStats.exactCopilotCostDollars + this.calculateEstimatedCost(monthStats.modelUsageNoExact, 'copilot');
+		const lastMonthCopilotCost = lastMonthStats.exactCopilotCostDollars + this.calculateEstimatedCost(lastMonthStats.modelUsageNoExact, 'copilot');
+		const last30DaysCopilotCost = last30DaysStats.exactCopilotCostDollars + this.calculateEstimatedCost(last30DaysStats.modelUsageNoExact, 'copilot');
 		return {
 			today: {
 				tokens: todayStats.tokens, thinkingTokens: todayStats.thinkingTokens,
@@ -2779,7 +2851,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 				modelUsage: todayStats.modelUsage, editorUsage: todayStats.editorUsage,
 				co2: todayCo2, treesEquivalent: todayCo2 / this.co2AbsorptionPerTreePerYear,
 				waterUsage: todayWater, estimatedCost: this.calculateEstimatedCost(todayStats.modelUsage),
-				estimatedCostCopilot: todayStats.exactCopilotCostDollars + this.calculateEstimatedCost(todayStats.modelUsageNoExact, 'copilot'),
+				estimatedCostCopilot: todayCopilotCost,
+				billingGroupCosts: this.computeBillingGroupCosts(todayStats.editorModelUsage, todayCopilotCost),
 				...(todayStats.cachedTokens > 0 ? { cachedTokens: todayStats.cachedTokens } : {})
 			},
 			month: {
@@ -2791,7 +2864,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 				modelUsage: monthStats.modelUsage, editorUsage: monthStats.editorUsage,
 				co2: monthCo2, treesEquivalent: monthCo2 / this.co2AbsorptionPerTreePerYear,
 				waterUsage: monthWater, estimatedCost: this.calculateEstimatedCost(monthStats.modelUsage),
-				estimatedCostCopilot: monthStats.exactCopilotCostDollars + this.calculateEstimatedCost(monthStats.modelUsageNoExact, 'copilot'),
+				estimatedCostCopilot: monthCopilotCost,
+				billingGroupCosts: this.computeBillingGroupCosts(monthStats.editorModelUsage, monthCopilotCost),
 				...(monthStats.cachedTokens > 0 ? { cachedTokens: monthStats.cachedTokens } : {})
 			},
 			lastMonth: {
@@ -2803,7 +2877,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 				modelUsage: lastMonthStats.modelUsage, editorUsage: lastMonthStats.editorUsage,
 				co2: lastMonthCo2, treesEquivalent: lastMonthCo2 / this.co2AbsorptionPerTreePerYear,
 				waterUsage: lastMonthWater, estimatedCost: this.calculateEstimatedCost(lastMonthStats.modelUsage),
-				estimatedCostCopilot: lastMonthStats.exactCopilotCostDollars + this.calculateEstimatedCost(lastMonthStats.modelUsageNoExact, 'copilot'),
+				estimatedCostCopilot: lastMonthCopilotCost,
+				billingGroupCosts: this.computeBillingGroupCosts(lastMonthStats.editorModelUsage, lastMonthCopilotCost),
 				...(lastMonthStats.cachedTokens > 0 ? { cachedTokens: lastMonthStats.cachedTokens } : {})
 			},
 			last30Days: {
@@ -2815,7 +2890,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 				modelUsage: last30DaysStats.modelUsage, editorUsage: last30DaysStats.editorUsage,
 				co2: last30DaysCo2, treesEquivalent: last30DaysCo2 / this.co2AbsorptionPerTreePerYear,
 				waterUsage: last30DaysWater, estimatedCost: this.calculateEstimatedCost(last30DaysStats.modelUsage),
-				estimatedCostCopilot: last30DaysStats.exactCopilotCostDollars + this.calculateEstimatedCost(last30DaysStats.modelUsageNoExact, 'copilot'),
+				estimatedCostCopilot: last30DaysCopilotCost,
+				billingGroupCosts: this.computeBillingGroupCosts(last30DaysStats.editorModelUsage, last30DaysCopilotCost),
 				...(last30DaysStats.cachedTokens > 0 ? { cachedTokens: last30DaysStats.cachedTokens } : {})
 			},
 			lastUpdated: now
@@ -2873,7 +2949,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 		return this._copilotPlanResolved?.monthlyAiCreditsUsd ?? 0;
 	}
 
-	/** Updates the status bar background color based on current-month spend vs. the configured budget.
+	/** Updates the status bar background color based on current-month GitHub Copilot spend vs. the configured budget.
+	 *  Uses the Copilot-only cost from billingGroupCosts so the comparison is provider-specific.
 	 *  Uses VS Code's built-in theme colors: warning (yellow) at ≥75%, error (red/orange) at ≥90%.
 	 *  Clears the background when no budget is configured or spend is below 75%. */
 	private updateStatusBarBackgroundColor(stats: DetailedStats): void {
@@ -2882,8 +2959,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 			this.statusBarItem.backgroundColor = undefined;
 			return;
 		}
-		const monthCost = stats.month.estimatedCostCopilot ?? stats.month.estimatedCost ?? 0;
-		const ratio = monthCost / budget;
+		const copilotCost = stats.month.billingGroupCosts?.['GitHub Copilot'] || stats.month.estimatedCostCopilot || stats.month.estimatedCost || 0;
+		const ratio = copilotCost / budget;
 		if (ratio >= 0.90) {
 			this.statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
 		} else if (ratio >= 0.75) {

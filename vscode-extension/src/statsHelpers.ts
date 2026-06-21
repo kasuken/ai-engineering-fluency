@@ -266,6 +266,8 @@ sessions: number;
 interactions: number;
 modelUsage: ModelUsage;
 editorUsage: EditorUsage;
+/** Per-editor model usage breakdown — mirrors DailyTokenStats.editorModelUsage. Used to compute accurate cost-by-billing-group totals for the period. */
+editorModelUsage: { [editor: string]: ModelUsage };
 /** Sum of exact Copilot billing costs (in USD) for sessions that have nanoAiu data. */
 exactCopilotCostDollars: number;
 /** Model usage for sessions that do NOT have exact nanoAiu billing data (used as fallback for Copilot cost estimate). */
@@ -294,6 +296,7 @@ sessions: 0,
 interactions: 0,
 modelUsage: {},
 editorUsage: {},
+editorModelUsage: {},
 exactCopilotCostDollars: 0,
 modelUsageNoExact: {},
 };
@@ -331,6 +334,8 @@ function accumulatePeriod(acc: PeriodAccumulator, tokens: number, estimated: num
 	if (countSession) { acc.sessions += 1; }
 	addEditorUsage(acc.editorUsage, editorType, tokens);
 	addModelUsage(acc.modelUsage, modelUsage);
+	if (!acc.editorModelUsage[editorType]) { acc.editorModelUsage[editorType] = {}; }
+	addModelUsage(acc.editorModelUsage[editorType], modelUsage);
 	if (copilotExactCostDollars !== undefined) {
 		acc.exactCopilotCostDollars += copilotExactCostDollars;
 	} else {
