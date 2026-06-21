@@ -256,13 +256,12 @@ test('calculateEstimatedCost: returns 0 for empty usage', () => {
         assert.equal(calculateEstimatedCost({}, {}), 0);
 });
 
-test('calculateEstimatedCost: uses fallback pricing for unknown models', () => {
+test('calculateEstimatedCost: unknown models contribute $0 (no gpt-4o-mini fallback)', () => {
         const modelUsage = { 'unknown-model': { inputTokens: 1000, outputTokens: 1000 } };
         const pricing = { 'gpt-4o-mini': { inputCostPerMillion: 0.15, outputCostPerMillion: 0.6 } };
         const cost = calculateEstimatedCost(modelUsage, pricing);
-        // Falls back to gpt-4o-mini pricing: input 1000/1M*0.15 + output 1000/1M*0.6 = 0.00075
-        assert.ok(cost > 0);
-        assert.ok(Math.abs(cost - 0.00075) < 0.0001);
+        // No pricing entry for 'unknown-model' → $0, not gpt-4o-mini rates
+        assert.equal(cost, 0);
 });
 
 test('calculateEstimatedCost: copilot source uses copilotPricing block when present', () => {
