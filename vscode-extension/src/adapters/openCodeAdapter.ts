@@ -206,7 +206,7 @@ export class OpenCodeAdapter implements IEcosystemAdapter, IDiscoverableEcosyste
 		let thinkingTokens = 0;
 		let turnCumulativeTotal = prevCumulativeTotal;
 		for (const assistantMsg of turnAssistantMsgs) {
-			if (!model) { model = assistantMsg.modelID || null; }
+		if (!model) { model = assistantMsg.modelID || assistantMsg.model?.modelID || null; }
 			thinkingTokens += assistantMsg.tokens?.reasoning || 0;
 			if (typeof assistantMsg.tokens?.total === 'number') {
 				turnCumulativeTotal = Math.max(turnCumulativeTotal, assistantMsg.tokens.total);
