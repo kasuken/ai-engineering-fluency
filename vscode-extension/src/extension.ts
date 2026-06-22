@@ -4441,12 +4441,21 @@ class CopilotTokenTracker implements vscode.Disposable {
 	/**
 	 * Add editor root and name information to session file details.
 	 * Enriches the details object with editorRoot and editorName properties.
+	 * When an adapter provides a session-specific name (e.g. "MS Scout (Copilot CLI)"
+	 * instead of "Copilot CLI"), editorSource is also updated so diagnostics tiles
+	 * and chart views group Scout sessions separately.
 	 */
 	private enrichDetailsWithEditorInfo(sessionFile: string, details: SessionFileDetails): void {
 		const eco = this.findEcosystem(sessionFile);
 		if (eco) {
 			details.editorRoot = eco.getEditorRoot(sessionFile);
-			details.editorName = getEcosystemDisplayName(eco, sessionFile);
+			const specificName = getEcosystemDisplayName(eco, sessionFile);
+			details.editorName = specificName;
+			// When the adapter returns a more specific name than its static displayName,
+			// propagate it to editorSource so tiles and charts group correctly.
+			if (specificName !== eco.displayName) {
+				details.editorSource = specificName;
+			}
 			return;
 		}
 		if (this.windsurf.isWindsurfSessionFile(sessionFile)) {
