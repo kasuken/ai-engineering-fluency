@@ -60,6 +60,8 @@ function emptyPeriod(): UsageAnalysisPeriod {
 			standardRequests: 0, premiumRequests: 0, unknownRequests: 0, totalRequests: 0,
 			lowCostModels: [], mediumCostModels: [], highCostModels: [], mixedCostSessions: 0,
 			lowCostRequests: 0, mediumCostRequests: 0, highCostRequests: 0,
+			autoSessions: 0, foundryWindowsSessions: 0, unknownProviderSessions: 0,
+			selectedModelExtensions: [], unknownProviderModels: [],
 		},
 		repositories: [], repositoriesWithCustomization: [],
 		editScope: { singleFileEdits: 0, multiFileEdits: 0, totalEditedFiles: 0, avgFilesPerSession: 0 },

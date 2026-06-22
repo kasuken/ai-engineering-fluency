@@ -30,6 +30,7 @@ Measures how you interact with Copilot through prompts, slash commands, and mode
 - Average 3+ exchanges per session → at least Stage 2
 - Average 5+ exchanges per session → at least Stage 3
 - Model switching across tiers → at least Stage 3
+- Any Auto model usage → at least Stage 2; Auto model used in 50%+ of sessions → at least Stage 3; Auto model used in 80%+ of sessions (with 5+ sessions) → Stage 4
 
 **Recognised slash commands:** `/explain`, `/fix`, `/tests`, `/doc`, `/generate`, `/optimize`, `/new`, `/newNotebook`, `/search`, `/fixTestFailure`, `/setupTests`
 
@@ -129,7 +130,10 @@ Measures how you tailor Copilot to your projects (custom instructions, model sel
 | 3 | 30%+ of repositories customized (minimum 2 repos) |
 | 4 | 70%+ of repositories customized (minimum 3 repos) |
 
-**Booster:** Using 3+ different models → at least Stage 3; using 5+ models with 3+ customized repos → Stage 4
+**Boosters:**
+- Using 3+ different models → at least Stage 3; using 5+ models with 3+ customized repos → Stage 4
+- Microsoft Foundry / local model usage → at least Stage 2
+- Unknown provider model usage → at least Stage 2
 
 ---
 

@@ -28,6 +28,8 @@ function emptyFd() {
         lowCostModels: new Set<string>(), mediumCostModels: new Set<string>(), highCostModels: new Set<string>(),
         multiFileEdits: 0, filesPerEditSum: 0, filesPerEditCount: 0,
         editsAgentCount: 0, workspaceAgentCount: 0,
+        autoSessions: 0, foundryWindowsSessions: 0, unknownProviderSessions: 0,
+        selectedModelExtensions: new Set<string>(), unknownProviderModels: new Set<string>(),
         repositories: new Set<string>(), repositoriesWithCustomization: new Set<string>(),
         applyRateSum: 0, applyRateCount: 0,
         multiTurnSessions: 0, turnsPerSessionSum: 0, turnsPerSessionCount: 0,
@@ -54,6 +56,8 @@ function emptyPeriod(): UsageAnalysisPeriod {
             standardRequests: 0, premiumRequests: 0, unknownRequests: 0, totalRequests: 0,
             lowCostModels: [], mediumCostModels: [], highCostModels: [], mixedCostSessions: 0,
             lowCostRequests: 0, mediumCostRequests: 0, highCostRequests: 0,
+            autoSessions: 0, foundryWindowsSessions: 0, unknownProviderSessions: 0,
+            selectedModelExtensions: [], unknownProviderModels: [],
         },
         repositories: [], repositoriesWithCustomization: [],
         editScope: { singleFileEdits: 0, multiFileEdits: 0, totalEditedFiles: 0, avgFilesPerSession: 0 },
@@ -118,6 +122,15 @@ test('PE: 100 interactions + agent + model switching reaches Stage 4', () => {
     fd.mixedTierSessions = 1;
     const pe = calculateFluencyScoreForTeamMember(fd, 0).categories.find(c => c.category === 'Prompt Engineering')!;
     assert.equal(pe.stage, 4);
+});
+
+test('PE: Auto-heavy usage boosts Prompt Engineering', () => {
+    const fd = emptyFd();
+    fd.sessionCount = 10;
+    fd.autoSessions = 8;
+    const pe = calculateFluencyScoreForTeamMember(fd, 10).categories.find(c => c.category === 'Prompt Engineering')!;
+    assert.ok(pe.stage >= 3, `expected PE >= 3 with heavy Auto usage, got ${pe.stage}`);
+    assert.ok(pe.tips.every(t => !t.toLowerCase().includes('auto model')), 'should not nudge frequent Auto users');
 });
 
 test('PE: avgTurns >= 3 boosts to at least Stage 2', () => {
@@ -972,6 +985,24 @@ test('CU (team): Stage 3 with uncustomized repos → "add to remaining" tip', ()
     const cu = calculateFluencyScoreForTeamMember(fd, 0).categories.find(c => c.category === 'Customization')!;
     assert.equal(cu.stage, 3);
     assert.ok(cu.tips.some((t: string) => t.includes('remaining')), 'tip should mention remaining repos');
+});
+
+test('CU (team): Foundry/local model usage promotes customization', () => {
+    const fd = emptyFd();
+    fd.foundryWindowsSessions = 3;
+    fd.sessionCount = 3;
+    const cu = calculateFluencyScoreForTeamMember(fd, 3).categories.find(c => c.category === 'Customization')!;
+    assert.ok(cu.stage >= 2, `expected Customization >= 2 with Foundry/local usage, got ${cu.stage}`);
+    assert.ok(cu.tips.some((t: string) => t.toLowerCase().includes('foundry') || t.toLowerCase().includes('local models')), 'tips should mention Foundry/local models');
+});
+
+test('CU (team): unknown provider usage promotes customization', () => {
+    const fd = emptyFd();
+    fd.unknownProviderSessions = 2;
+    fd.unknownProviderModels = new Set(['phi-4-mini']);
+    const cu = calculateFluencyScoreForTeamMember(fd, 2).categories.find(c => c.category === 'Customization')!;
+    assert.ok(cu.stage >= 2, `expected Customization >= 2 with unknown provider usage, got ${cu.stage}`);
+    assert.ok(cu.tips.some((t: string) => t.toLowerCase().includes('marketplace') || t.toLowerCase().includes('providers')), 'tip should mention more providers');
 });
 
 // ---------------------------------------------------------------------------

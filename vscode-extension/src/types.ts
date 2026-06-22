@@ -286,6 +286,11 @@ export interface SessionUsageAnalysis {
     uniqueModels: string[];
     modelCount: number;
     switchCount: number;
+    autoSessions: number;
+    foundryWindowsSessions: number;
+    unknownProviderSessions: number;
+    selectedModelExtensions: string[];
+    unknownProviderModels: string[];
     tiers: { standard: string[]; premium: string[]; unknown: string[] };
     hasMixedTiers: boolean;
     standardRequests: number;
@@ -396,6 +401,9 @@ export interface ModelSwitchingAnalysis {
   maxModelsPerSession: number;
   minModelsPerSession: number;
   switchingFrequency: number; // % of sessions with >1 model
+  autoSessions: number; // Sessions with an Auto-selected model
+  foundryWindowsSessions: number; // Sessions using Microsoft Foundry on Windows / local models
+  unknownProviderSessions: number; // Sessions with models from unknown providers
   standardModels: string[]; // Unique standard models used
   premiumModels: string[]; // Unique premium models used
   unknownModels: string[]; // Unique models with unknown tier
@@ -411,6 +419,8 @@ export interface ModelSwitchingAnalysis {
   lowCostRequests: number;
   mediumCostRequests: number;
   highCostRequests: number;
+  selectedModelExtensions: string[]; // Unique selectedModel metadata extensions observed
+  unknownProviderModels: string[]; // Unique models whose provider could not be identified
 }
 
 export interface MissedPotentialWorkspace {

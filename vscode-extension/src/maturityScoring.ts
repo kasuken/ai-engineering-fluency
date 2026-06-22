@@ -171,7 +171,7 @@ function _peQualifiesForStage4(totalInteractions: number, hasAgentMode: boolean,
 	const T = STAGE_THRESHOLDS.promptEngineering;
 	return totalInteractions >= T.stage4MinInteractions && hasAgentMode && (hasModelSwitching || usedSlashCommands.length >= T.stage4MinSlashCommands);
 }
-function _buildPeTips(stage: Stage, hasAgentMode: boolean, hasModelSwitching: boolean, usedSlashCommands: string[]): string[] {
+function _buildPeTips(stage: Stage, hasAgentMode: boolean, hasModelSwitching: boolean, usedSlashCommands: string[], autoUsageRatio: number): string[] {
 	const T = STAGE_THRESHOLDS.promptEngineering;
 	const tips: string[] = [];
 	if (stage < 2) { tips.push('Try asking Copilot a question using the Chat panel'); }
@@ -182,6 +182,8 @@ function _buildPeTips(stage: Stage, hasAgentMode: boolean, hasModelSwitching: bo
 	if (stage < 4) {
 		if (!hasAgentMode) { tips.push('Try [agent mode](https://code.visualstudio.com/docs/copilot/agents/overview) for autonomous, multi-step coding tasks'); }
 		if (!hasModelSwitching) { tips.push('Experiment with [different models](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_choose-a-language-model) for different tasks - use fast models for simple queries and reasoning models for complex problems'); }
+		if (autoUsageRatio === 0) { tips.push('Try the Auto model for cost-sensitive tasks so Copilot can pick the most efficient model for you'); }
+		else if (autoUsageRatio < 0.5) { tips.push('Use the Auto model more often when you want Copilot to balance quality and cost for you'); }
 		if (usedSlashCommands.length < T.stage4MinSlashCommands && hasAgentMode && hasModelSwitching) { tips.push('Explore more [slash commands](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts) like /explain, /tests, or /doc to diversify your prompting'); }
 	}
 	return tips;
@@ -197,12 +199,12 @@ function _applyPeConversationStage(p: UsageAnalysisPeriod, evidence: string[], s
 }
 
 function _scorePromptEngineering(p: UsageAnalysisPeriod): CategoryScore {
-	const { stage, evidence, usedSlashCommands, hasModelSwitching, hasAgentMode } = _speComputeEvidence(p);
-	return { stage, evidence, tips: _buildPeTips(stage, hasAgentMode, hasModelSwitching, usedSlashCommands) };
+	const { stage, evidence, usedSlashCommands, hasModelSwitching, hasAgentMode, autoUsageRatio } = _speComputeEvidence(p);
+	return { stage, evidence, tips: _buildPeTips(stage, hasAgentMode, hasModelSwitching, usedSlashCommands, autoUsageRatio) };
 }
 
 
-type SpeResult = { stage: Stage; evidence: string[]; usedSlashCommands: string[]; hasModelSwitching: boolean; hasAgentMode: boolean };
+type SpeResult = { stage: Stage; evidence: string[]; usedSlashCommands: string[]; hasModelSwitching: boolean; hasAgentMode: boolean; autoUsageRatio: number };
 function _speComputeEvidence(p: UsageAnalysisPeriod): SpeResult {
 	const evidence: string[] = [];
 	const T = STAGE_THRESHOLDS.promptEngineering;
@@ -220,15 +222,20 @@ function _speComputeEvidence(p: UsageAnalysisPeriod): SpeResult {
 
 	const hasModelSwitching = _peHasModelSwitching(p.modelSwitching.mixedTierSessions, p.modelSwitching.mixedCostSessions, p.modelSwitching.switchingFrequency);
 	const hasAgentMode = _peHasAgentMode(p.modeUsage.agent, p.modeUsage.cli);
+	const autoUsageRatio = p.modelSwitching.totalSessions > 0 ? (p.modelSwitching.autoSessions / p.modelSwitching.totalSessions) : 0;
+	if (p.modelSwitching.autoSessions > 0) { evidence.push(`Auto model used in ${fmt(p.modelSwitching.autoSessions)} session${p.modelSwitching.autoSessions === 1 ? '' : 's'} (${Math.round(autoUsageRatio * 100)}%)`); }
 
 	if (_peQualifiesForStage3(totalInteractions, usedSlashCommands, hasAgentMode)) { stage = 3; }
 	if (_peQualifiesForStage4(totalInteractions, hasAgentMode, hasModelSwitching, usedSlashCommands)) { stage = 4; }
+	if (autoUsageRatio > 0) { stage = promoteStage(stage, 2); }
+	if (autoUsageRatio >= 0.5) { stage = promoteStage(stage, 3); }
+	if (autoUsageRatio >= 0.8 && p.sessions >= 5) { stage = 4; }
 
 	if (hasModelSwitching) {
 		evidence.push(`Switched models in ${Math.round(p.modelSwitching.switchingFrequency)}% of sessions`);
 		if (stage < 4) { if (p.modelSwitching.mixedTierSessions > 0 || p.modelSwitching.mixedCostSessions > 0) { stage = promoteStage(stage, 3); } }
 	}
-	return { stage, evidence, usedSlashCommands, hasModelSwitching, hasAgentMode };
+	return { stage, evidence, usedSlashCommands, hasModelSwitching, hasAgentMode, autoUsageRatio };
 }
 
 function _ceFormatGapTip(gapParts: string[], allTypesNotUsed: string[]): string | undefined {
@@ -513,16 +520,26 @@ function _scoreCustomization(p: UsageAnalysisPeriod, lastCustomizationMatrix: Wo
 	const reposWithCustomization = totalRepos - (matrix?.workspacesWithIssues ?? 0);
 	const customizationRate = totalRepos > 0 ? (reposWithCustomization / totalRepos) : 0;
 	const uniqueModels = [...new Set([...p.modelSwitching.standardModels, ...p.modelSwitching.premiumModels, ...p.modelSwitching.lowCostModels, ...p.modelSwitching.mediumCostModels, ...p.modelSwitching.highCostModels])];
-	const stage = _cuComputeStage(customizationRate, reposWithCustomization, uniqueModels.length, T);
+	let stage = _cuComputeStage(customizationRate, reposWithCustomization, uniqueModels.length, T);
 
 	if (totalRepos > 0) { evidence.push(`Worked in ${totalRepos} repositor${totalRepos === 1 ? 'y' : 'ies'}`); }
 	if (uniqueModels.length >= T.stage3MinUniqueModels) { evidence.push(`Used ${uniqueModels.length} different models`); }
+	if (p.modelSwitching.foundryWindowsSessions > 0) {
+		stage = promoteStage(stage, 2);
+		evidence.push(`Used Microsoft Foundry / local models in ${fmt(p.modelSwitching.foundryWindowsSessions)} session${p.modelSwitching.foundryWindowsSessions === 1 ? '' : 's'}`);
+	}
+	if (p.modelSwitching.unknownProviderSessions > 0) {
+		stage = promoteStage(stage, 2);
+		evidence.push(`Used models from unknown providers in ${fmt(p.modelSwitching.unknownProviderSessions)} session${p.modelSwitching.unknownProviderSessions === 1 ? '' : 's'}`);
+	}
 
 	if (stage >= 4) { evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos customized (${T.stage4MinCustomizationRate * 100}%+ with ${T.stage4MinCustomizedRepos}+ repos → Stage 4)`); }
 	else if (stage >= 3) { evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos customized (${T.stage3MinCustomizationRate * 100}%+ with ${T.stage3MinCustomizedRepos}+ repos → Stage 3)`); }
 	else if (reposWithCustomization > 0) { evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos with custom instructions or agents.md`); }
 
 	const tips = _cuBuildTips(stage, totalRepos, reposWithCustomization);
+	if (p.modelSwitching.foundryWindowsSessions === 0) { tips.unshift('Try the Microsoft Foundry on Windows extension if you want to experiment with local models and offline-friendly workflows'); }
+	if (p.modelSwitching.unknownProviderSessions === 0 && uniqueModels.length <= 1) { tips.unshift('Try different model providers from the marketplace when you want more specialized or cost-effective options'); }
 	if (stage >= 4) { tips.push(_buildCustomizationStage4Tip(matrix, totalRepos, reposWithCustomization)); }
 
 	return { stage, evidence, tips };
@@ -633,6 +650,8 @@ type FluencyInputData = {
 	multiFileEdits: number; filesPerEditSum: number; filesPerEditCount: number;
 	editsAgentCount: number; workspaceAgentCount: number;
 	repositories: Set<string>; repositoriesWithCustomization: Set<string>;
+	autoSessions: number; foundryWindowsSessions: number; unknownProviderSessions: number;
+	selectedModelExtensions: Set<string>; unknownProviderModels: Set<string>;
 	applyRateSum: number; applyRateCount: number;
 	multiTurnSessions: number; turnsPerSessionSum: number; turnsPerSessionCount: number;
 	sessionCount: number; durationMsSum: number; durationMsCount: number;
@@ -652,13 +671,17 @@ type FluencyStageResult = { stage: Stage; tips: string[] };
 function _calcFluencyPE(fd: FluencyInputData, cv: FluencyVars): FluencyStageResult {
 	const T = STAGE_THRESHOLDS.promptEngineering;
 	let stage: Stage = 1;
+	const autoUsageRatio = fd.sessionCount > 0 ? fd.autoSessions / fd.sessionCount : 0;
 	if (cv.avgTurnsPerSession >= T.stage2MinAvgTurns) { stage = promoteStage(stage, 2); }
 	if (cv.avgTurnsPerSession >= T.stage3MinAvgTurns) { stage = promoteStage(stage, 3); }
 	if (cv.totalInteractions >= T.stage2MinInteractions) { stage = promoteStage(stage, 2); }
 	if (_peQualifiesForStage3(cv.totalInteractions, cv.usedSlashCommands, cv.hasAgentMode)) { stage = promoteStage(stage, 3); }
 	if (_peQualifiesForStage4(cv.totalInteractions, cv.hasAgentMode, cv.hasModelSwitching, cv.usedSlashCommands)) { stage = 4; }
+	if (autoUsageRatio > 0) { stage = promoteStage(stage, 2); }
+	if (autoUsageRatio >= 0.5) { stage = promoteStage(stage, 3); }
+	if (autoUsageRatio >= 0.8 && fd.sessionCount >= 5) { stage = 4; }
 	if (cv.hasModelSwitching && (fd.mixedTierSessions > 0 || fd.mixedCostSessions > 0)) { stage = promoteStage(stage, 3); }
-	return { stage, tips: _buildPeTips(stage, cv.hasAgentMode, cv.hasModelSwitching, cv.usedSlashCommands) };
+	return { stage, tips: _buildPeTips(stage, cv.hasAgentMode, cv.hasModelSwitching, cv.usedSlashCommands, autoUsageRatio) };
 }
 
 function _buildCeGapTip(fd: FluencyInputData, cv: FluencyVars, T: typeof STAGE_THRESHOLDS.contextEngineering): string | undefined {
@@ -759,9 +782,21 @@ function _calcFluencyCu(fd: FluencyInputData, cv: FluencyVars): FluencyStageResu
 	const reposWithCustomization = fd.repositoriesWithCustomization.size;
 	const customizationRate = totalRepos > 0 ? reposWithCustomization / totalRepos : 0;
 	const uniqueModels = new Set([...fd.standardModels, ...fd.premiumModels, ...fd.lowCostModels, ...fd.mediumCostModels, ...fd.highCostModels]);
-	const stage = _cuComputeStage(customizationRate, reposWithCustomization, uniqueModels.size, T);
+	let stage = _cuComputeStage(customizationRate, reposWithCustomization, uniqueModels.size, T);
 	const uncustomized = totalRepos - reposWithCustomization;
 	const tips: string[] = [];
+	if (fd.foundryWindowsSessions > 0) {
+		stage = promoteStage(stage, 2);
+		tips.push('If you are using Microsoft Foundry on Windows local models, keep exploring them for private and offline-friendly workflows');
+	} else if (uniqueModels.size <= 1) {
+		tips.push('Try the Microsoft Foundry on Windows extension if you want to experiment with local models and offline-friendly workflows');
+	}
+	if (fd.unknownProviderSessions > 0) {
+		stage = promoteStage(stage, 2);
+		tips.push('You have used models from other providers — keep exploring providers to match each task to the right model');
+	} else if (uniqueModels.size <= 1) {
+		tips.push('Try different model providers from the marketplace when you want more specialized or cost-effective options');
+	}
 	if (stage < 2) { tips.push("Create a .github/copilot-instructions.md or CLAUDE.md file with project-specific guidelines"); }
 	if (stage < 3) { tips.push("Add custom instructions to more repositories to standardize your Copilot experience"); }
 	if (stage < 4 && uncustomized > 0) { tips.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos customized — add instructions to the remaining ${fmt(uncustomized)} for Stage 4`); }
