@@ -42,7 +42,7 @@ The source of truth for supported platforms is
 | `claude-code`  | Claude Code          | jsonl  | `~/.claude/projects/{hash}/*.jsonl` |
 | `gemini-cli`   | Gemini CLI           | jsonl  | `~/.gemini/tmp/*/chats/session-*.jsonl` |
 | `antigravity`  | Antigravity          | jsonl  | `~/.gemini/antigravity/brain/*/.system_generated/logs/transcript.jsonl` |
-| `opencode`     | OpenCode             | json   | `<xdg-data>/opencode/storage/session/**/ses_*.json` |
+| `opencode`     | OpenCode             | json / jsonl | `<xdg-data>/opencode/storage/session/**/ses_*.json`; also `opencode.db` (SQLite, via `node:sqlite`) |
 
 **Not validated by this skill** (DB / binary formats that need the adapters'
 own parsers, so a generic JSON walker can't read them): `crush` (SQLite),
