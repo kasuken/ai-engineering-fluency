@@ -29,6 +29,14 @@ export interface IEcosystemAdapter {
 	 */
 	getDisplayName?(sessionFile: string): string;
 	/**
+	 * Returns the display name for a session file path that this adapter *discovered*
+	 * but does not *handle* (i.e. handles() returns false for that path).
+	 * Return undefined to signal "not mine". Used so adapters can label discovered
+	 * files (e.g. events.jsonl) with a specific name (e.g. "MS Scout (Copilot CLI)")
+	 * without changing the handles() contract.
+	 */
+	getDisplayNameForDiscoveredPath?(sessionFile: string): string | undefined;
+	/**
 	 * When true, backend sync is skipped for sessions handled by this adapter
 	 * (e.g. Visual Studio binary MessagePack sessions cannot be synced).
 	 */

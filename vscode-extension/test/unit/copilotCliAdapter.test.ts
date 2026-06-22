@@ -40,6 +40,21 @@ test('CopilotCliAdapter.getDisplayName: returns MS Scout label for tracked Scout
     }
 });
 
+test('CopilotCliAdapter.getDisplayNameForDiscoveredPath: returns Scout label for tracked UUID, undefined otherwise', () => {
+    const scoutUuid = '33333333-3333-3333-3333-333333333333';
+    const eventsPath = path.join(os.homedir(), '.copilot', 'session-state', scoutUuid, 'events.jsonl');
+    const otherPath = path.join(os.homedir(), '.copilot', 'session-state', 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'events.jsonl');
+    const scoutSessionIds = (adapter as unknown as { _scoutSessionIds: Set<string> })._scoutSessionIds;
+
+    scoutSessionIds.add(scoutUuid);
+    try {
+        assert.equal(adapter.getDisplayNameForDiscoveredPath!(eventsPath), 'MS Scout (Copilot CLI)');
+        assert.equal(adapter.getDisplayNameForDiscoveredPath!(otherPath), undefined);
+    } finally {
+        scoutSessionIds.delete(scoutUuid);
+    }
+});
+
 test('CopilotCliAdapter.getDisplayName: returns MS Scout label for tracked Scout sessions via events.jsonl path', () => {
     const scoutSessionId = '22222222-2222-2222-2222-222222222222';
     const eventsPath = path.join(os.homedir(), '.copilot', 'session-state', scoutSessionId, 'events.jsonl');

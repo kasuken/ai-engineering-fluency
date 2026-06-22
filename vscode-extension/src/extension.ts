@@ -537,13 +537,30 @@ class CopilotTokenTracker implements vscode.Disposable {
 	 * Returns the filename without the .agent.md extension.
 	 */
 	private getEditorTypeFromPath(filePath: string): string {
-		// Check if the adapter provides a more specific name (e.g. MS Scout vs Copilot CLI).
+		return this._resolveEditorLabel(filePath) ??
+			_getEditorTypeFromPath(filePath, (p) => this.findEcosystem(p)?.id === 'opencode');
+	}
+
+	/**
+	 * Resolves a session-specific editor label from the adapter that handles OR
+	 * discovered the file. Returns undefined when no adapter provides a specific label.
+	 * This covers both:
+	 *  - handled files (adapter.handles() = true): uses getDisplayName()
+	 *  - discovered-only files (events.jsonl): uses getDisplayNameForDiscoveredPath()
+	 */
+	private _resolveEditorLabel(filePath: string): string | undefined {
 		const eco = this.findEcosystem(filePath);
 		if (eco) {
 			const specificName = getEcosystemDisplayName(eco, filePath);
 			if (specificName !== eco.displayName) { return specificName; }
+			return undefined;
 		}
-		return _getEditorTypeFromPath(filePath, (p) => this.findEcosystem(p)?.id === 'opencode');
+		// File not handled by any adapter — check if any discoverable adapter knows it
+		for (const adapter of this.ecosystems) {
+			const label = adapter.getDisplayNameForDiscoveredPath?.(filePath);
+			if (label !== undefined) { return label; }
+		}
+		return undefined;
 	}
 
 	/** Returns the first adapter that claims this session file, or null for Copilot Chat sessions. */
@@ -4464,6 +4481,14 @@ class CopilotTokenTracker implements vscode.Disposable {
 			}
 			return;
 		}
+		// File not handled by any adapter — check if a discoverable adapter labels it
+		// (e.g. events.jsonl files discovered by CopilotCliAdapter for Scout sessions).
+		const discoveredLabel = this._resolveEditorLabel(sessionFile);
+		if (discoveredLabel) {
+			details.editorName = discoveredLabel;
+			details.editorSource = discoveredLabel;
+			return;
+		}
 		if (this.windsurf.isWindsurfSessionFile(sessionFile)) {
 			details.editorName = 'Windsurf';
 			return;
@@ -4848,12 +4873,8 @@ class CopilotTokenTracker implements vscode.Disposable {
 	 * that name is returned instead of the generic path-derived one.
 	 */
 	private detectEditorSource(filePath: string): string {
-		const eco = this.findEcosystem(filePath);
-		if (eco) {
-			const specificName = getEcosystemDisplayName(eco, filePath);
-			if (specificName !== eco.displayName) { return specificName; }
-		}
-		return _detectEditorSource(filePath, (p) => this.findEcosystem(p)?.id === 'opencode');
+		return this._resolveEditorLabel(filePath) ??
+			_detectEditorSource(filePath, (p) => this.findEcosystem(p)?.id === 'opencode');
 	}
 
 	/**

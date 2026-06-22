@@ -64,6 +64,20 @@ export class CopilotCliAdapter implements IEcosystemAdapter, IDiscoverableEcosys
 	}
 
 	/**
+	 * Called for files that were *discovered* by this adapter but not *handled*
+	 * (i.e. events.jsonl files, which are parsed by the JSONL fallback parser).
+	 * Returns 'MS Scout (Copilot CLI)' when the session UUID was marked as Scout
+	 * during discover(), undefined otherwise.
+	 */
+	getDisplayNameForDiscoveredPath(sessionFile: string): string | undefined {
+		const eventsUuid = path.basename(path.dirname(sessionFile));
+		if (eventsUuid && this._scoutSessionIds.has(eventsUuid)) {
+			return 'MS Scout (Copilot CLI)';
+		}
+		return undefined;
+	}
+
+	/**
 	 * Returns true only for session-store.db virtual paths.
 	 * For events.jsonl files the adapter participates in discovery only; the
 	 * existing fallback JSONL parser in extension.ts continues to own those.
