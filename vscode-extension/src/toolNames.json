@@ -958,4 +958,6 @@
   ,"define_subagent": "Define Subagent"
   ,"find_by_name": "Find by Name"
   ,"manage_subagents": "Manage Subagents"
+  ,"mcp__computer-use__request_access": "MCP  Computer Use  Request Access"
+  ,"mcp__computer-use__screenshot": "MCP  Computer Use  Screenshot"
 }
