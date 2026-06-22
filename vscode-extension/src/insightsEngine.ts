@@ -86,10 +86,6 @@ function autoModelUsageRatio(p: UsageAnalysisPeriod): number {
 	return p.modelSwitching.totalSessions > 0 ? p.modelSwitching.autoSessions / p.modelSwitching.totalSessions : 0;
 }
 
-function hasFoundryLocalModels(p: UsageAnalysisPeriod): boolean {
-	return (p.modelSwitching.foundryWindowsSessions ?? 0) > 0;
-}
-
 function usesOnlyDefaultModelSet(p: UsageAnalysisPeriod): boolean {
 	const uniqueCount = new Set([...p.modelSwitching.standardModels, ...p.modelSwitching.premiumModels, ...p.modelSwitching.lowCostModels, ...p.modelSwitching.mediumCostModels, ...p.modelSwitching.highCostModels]).size;
 	return uniqueCount <= 1

@@ -784,19 +784,16 @@ function _calcFluencyCu(fd: FluencyInputData, cv: FluencyVars): FluencyStageResu
 	const uniqueModels = new Set([...fd.standardModels, ...fd.premiumModels, ...fd.lowCostModels, ...fd.mediumCostModels, ...fd.highCostModels]);
 	let stage = _cuComputeStage(customizationRate, reposWithCustomization, uniqueModels.size, T);
 	const uncustomized = totalRepos - reposWithCustomization;
-	const evidence: string[] = [];
 	const tips: string[] = [];
 	if (fd.foundryWindowsSessions > 0) {
 		stage = promoteStage(stage, 2);
 		tips.push('If you are using Microsoft Foundry on Windows local models, keep exploring them for private and offline-friendly workflows');
-		evidence.push(`Used Microsoft Foundry / local models in ${fmt(fd.foundryWindowsSessions)} session${fd.foundryWindowsSessions === 1 ? '' : 's'}`);
 	} else if (uniqueModels.size <= 1) {
 		tips.push('Try the Microsoft Foundry on Windows extension if you want to experiment with local models and offline-friendly workflows');
 	}
 	if (fd.unknownProviderSessions > 0) {
 		stage = promoteStage(stage, 2);
 		tips.push('You have used models from other providers — keep exploring providers to match each task to the right model');
-		evidence.push(`Used models from unknown providers in ${fmt(fd.unknownProviderSessions)} session${fd.unknownProviderSessions === 1 ? '' : 's'}`);
 	} else if (uniqueModels.size <= 1) {
 		tips.push('Try different model providers from the marketplace when you want more specialized or cost-effective options');
 	}
