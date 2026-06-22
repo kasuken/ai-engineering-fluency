@@ -537,6 +537,12 @@ class CopilotTokenTracker implements vscode.Disposable {
 	 * Returns the filename without the .agent.md extension.
 	 */
 	private getEditorTypeFromPath(filePath: string): string {
+		// Check if the adapter provides a more specific name (e.g. MS Scout vs Copilot CLI).
+		const eco = this.findEcosystem(filePath);
+		if (eco) {
+			const specificName = getEcosystemDisplayName(eco, filePath);
+			if (specificName !== eco.displayName) { return specificName; }
+		}
 		return _getEditorTypeFromPath(filePath, (p) => this.findEcosystem(p)?.id === 'opencode');
 	}
 
@@ -4838,8 +4844,15 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 	/**
 	 * Detect which editor the session file belongs to based on its path.
+	 * When an adapter provides a more specific per-session name (e.g. "MS Scout (Copilot CLI)"),
+	 * that name is returned instead of the generic path-derived one.
 	 */
 	private detectEditorSource(filePath: string): string {
+		const eco = this.findEcosystem(filePath);
+		if (eco) {
+			const specificName = getEcosystemDisplayName(eco, filePath);
+			if (specificName !== eco.displayName) { return specificName; }
+		}
 		return _detectEditorSource(filePath, (p) => this.findEcosystem(p)?.id === 'opencode');
 	}
 
