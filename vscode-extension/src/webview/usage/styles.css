@@ -294,7 +294,7 @@ body {
 }
 
 .stale-warning {
-	color: #f59e0b;
+	color: var(--warning-fg);
 	font-weight: 600;
 }
 

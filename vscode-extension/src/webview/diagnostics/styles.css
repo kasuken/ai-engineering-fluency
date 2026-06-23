@@ -288,12 +288,12 @@ body {
 }
 
 .context-ref-filter:hover {
-	background: rgb(79, 195, 247, 0.2);
+	background: var(--list-hover-bg);
 	color: var(--link-color);
 }
 
 .context-ref-filter.active {
-	background: rgb(79, 195, 247, 0.3);
+	background: var(--list-inactive-bg);
 	color: var(--link-color);
 	font-weight: 600;
 }
@@ -371,7 +371,7 @@ body {
 	margin: 8px 0 4px;
 	font-size: 13px;
 	font-weight: 600;
-	color: var(--fg-muted, #ccc);
+	color: var(--fg-muted);
 }
 
 .tool-type-badge {
@@ -385,12 +385,12 @@ body {
 
 .tool-type-badge.built-in {
 	background: rgba(100, 120, 180, 0.25);
-	color: #9bb0d8;
+	color: var(--stage-3-color);
 }
 
 .tool-type-badge.alternative {
 	background: rgba(100, 200, 120, 0.2);
-	color: #7ecf8e;
+	color: var(--success-fg);
 }
 
 .tool-ratio {
@@ -404,22 +404,22 @@ body {
 }
 
 .ratio-better {
-	color: #7ecf8e;
+	color: var(--success-fg);
 }
 
 .ratio-worse {
-	color: #e06c75;
+	color: var(--error-fg);
 }
 
 .ratio-neutral {
-	color: var(--fg-muted, #ccc);
+	color: var(--fg-muted);
 }
 
 .inline-link {
 	background: none;
 	border: none;
 	padding: 0;
-	color: var(--link-color, #4fc1ff);
+	color: var(--link-color);
 	cursor: pointer;
 	font-size: inherit;
 	text-decoration: underline;
@@ -432,7 +432,7 @@ body {
 
 
 .session-table tr:hover {
-	background: rgb(255, 255, 255, 0.03);
+	background: var(--list-hover-bg);
 }
 
 .editor-badge {
@@ -575,19 +575,20 @@ border: 1px solid #1f6feb;
 
 .hierarchy-parent {
 	background: rgba(100, 60, 180, 0.2);
-	color: #b89dff;
+	color: var(--stage-2-color);
 	border: 1px solid rgba(100, 60, 180, 0.4);
 	cursor: pointer;
 }
 
 .hierarchy-parent:hover {
 	background: rgba(100, 60, 180, 0.35);
-	color: #d0b8ff;
+	color: var(--stage-2-color);
+	opacity: 0.85;
 }
 
 .hierarchy-children {
 	background: rgba(30, 120, 80, 0.2);
-	color: #7adbb0;
+	color: var(--success-fg);
 	border: 1px solid rgba(30, 120, 80, 0.4);
 }
 
@@ -611,7 +612,8 @@ border: 1px solid #1f6feb;
 	content: '↳';
 	position: absolute;
 	left: 4px;
-	color: rgba(30, 120, 80, 0.7);
+	color: var(--success-fg);
+	opacity: 0.7;
 	font-size: 11px;
 }
 
