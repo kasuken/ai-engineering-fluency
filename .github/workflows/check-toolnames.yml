@@ -466,6 +466,10 @@ jobs:
           print(f"✅ Wrote {len(to_add)} new entries to toolNames.json", file=sys.stderr)
           PYEOF
           
+      - name: Restore gradlew files to prevent stash conflicts
+        if: steps.extract.outputs.has_missing == 'true'
+        run: git checkout -- jetbrains-plugin/gradlew.bat jetbrains-plugin/gradlew
+
       - name: Create Pull Request
         if: steps.extract.outputs.has_missing == 'true'
         id: create-pr
