@@ -334,6 +334,7 @@ function scanRecursivePattern(ctx: PatternScanContext, excludeDirs: string[]): C
  */
 export function scanWorkspaceCustomizationFiles(workspaceFolderPath: string): CustomizationFileEntry[] {
 	if (!workspaceFolderPath || !fs.existsSync(workspaceFolderPath)) { return []; }
+	try { if (!fs.statSync(workspaceFolderPath).isDirectory()) { return []; } } catch { return []; }
 
 	const cfg = customizationPatternsData as CustomizationPatternsConfig;
 	const stalenessDays = typeof cfg.stalenessThresholdDays === 'number' ? cfg.stalenessThresholdDays : 90;
