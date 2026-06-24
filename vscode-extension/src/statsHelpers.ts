@@ -216,6 +216,46 @@ function _apsProcessRollupSession(sessionInput: SessionAggregateInput, ranges: U
 	return { addedToLast30Days: flags.last30Days, addedToLastMonth: flags.lastMonth };
 }
 
+/**
+ * Build ApsDayFields object from session data.
+ */
+function _apsBuildDayFields(sessionData: SessionFileCache, editorType: string): ApsDayFields {
+	const actualTokens = sessionData.actualTokens || 0;
+	const estimatedTokens = sessionData.tokens;
+	const tokens = actualTokens > 0 ? actualTokens : estimatedTokens;
+	return {
+		tokens,
+		estimatedTokens,
+		actualTokens,
+		thinkingTokens: sessionData.thinkingTokens || 0,
+		cachedTokens: sessionData.cacheReadTokens || 0,
+		interactions: sessionData.interactions,
+		editorType,
+		modelUsage: sessionData.modelUsage
+	};
+}
+
+/**
+ * Process fallback session for last 30 days period.
+ */
+function _apsProcessFallback30Days(entry: DailyTokenStats, f: ApsDayFields, sessionInput: SessionAggregateInput, repository: string, accs: ApsRollupAccs): void {
+	_apsBumpDailyEntry(entry, f.tokens, sessionInput.sessionData.interactions, sessionInput.editorType, repository, sessionInput.sessionData.modelUsage);
+	attributeLocToDay(entry, sessionInput.sessionData, sessionInput.editorType, repository);
+	_apsBumpPeriod(accs.last30DaysStats, f, true);
+}
+
+/**
+ * Process fallback session for month/today/last-month periods.
+ */
+function _apsProcessFallbackPeriods(lastActivityUtcKey: string, ranges: UtcDateRanges, accs: ApsRollupAccs, f: ApsDayFields): void {
+	if (lastActivityUtcKey >= ranges.monthUtcStartKey) {
+		_apsBumpPeriod(accs.monthStats, f, true);
+		if (lastActivityUtcKey === ranges.todayUtcKey) { _apsBumpPeriod(accs.todayStats, f, true); }
+	} else {
+		_apsBumpPeriod(accs.lastMonthStats, f, true);
+	}
+}
+
 function _apsProcessFallbackSession(sessionInput: SessionAggregateInput, ranges: UtcDateRanges, accs: ApsRollupAccs): boolean {
 	const { editorType, sessionData, mtime, lastInteraction } = sessionInput;
 	const repository = sessionData.repository || 'Unknown';
@@ -223,23 +263,18 @@ function _apsProcessFallbackSession(sessionInput: SessionAggregateInput, ranges:
 	const lastActivityUtcKey = toLocalDayKey(lastActivity);
 	const inLast30Days = lastActivityUtcKey >= ranges.last30DaysUtcStartKey;
 	const inLastMonth = lastActivityUtcKey >= ranges.lastMonthUtcStartKey && lastActivityUtcKey <= ranges.lastMonthUtcEndKey;
+	
 	if (!inLast30Days && !inLastMonth) { return true; }
-	const actualTokens = sessionData.actualTokens || 0;
-	const estimatedTokens = sessionData.tokens;
-	const tokens = actualTokens > 0 ? actualTokens : estimatedTokens;
-	const f: ApsDayFields = { tokens, estimatedTokens, actualTokens, thinkingTokens: sessionData.thinkingTokens || 0, cachedTokens: sessionData.cacheReadTokens || 0, interactions: sessionData.interactions, editorType, modelUsage: sessionData.modelUsage };
+	
+	const f = _apsBuildDayFields(sessionData, editorType);
+	
 	if (inLast30Days) {
 		const entry = _apsGetOrCreateDailyEntry(accs.dailyStatsMap, lastActivityUtcKey);
-		_apsBumpDailyEntry(entry, tokens, sessionData.interactions, editorType, repository, sessionData.modelUsage);
-		attributeLocToDay(entry, sessionData, editorType, repository);
-		_apsBumpPeriod(accs.last30DaysStats, f, true);
+		_apsProcessFallback30Days(entry, f, sessionInput, repository, accs);
 	}
-	if (lastActivityUtcKey >= ranges.monthUtcStartKey) {
-		_apsBumpPeriod(accs.monthStats, f, true);
-		if (lastActivityUtcKey === ranges.todayUtcKey) { _apsBumpPeriod(accs.todayStats, f, true); }
-	} else if (inLastMonth) {
-		_apsBumpPeriod(accs.lastMonthStats, f, true);
-	}
+	
+	_apsProcessFallbackPeriods(lastActivityUtcKey, ranges, accs, f);
+	
 	return false;
 }
 

@@ -310,6 +310,34 @@ const lastInteraction = all.length > 0 ? (all[all.length - 1].created_at ?? null
 return { title, firstInteraction, lastInteraction };
 }
 
+	/**
+	 * Create a ChatTurn object for Antigravity sessions.
+	 * All token estimates are 0 since Antigravity transcripts have no token data.
+	 */
+	private _batCreateChatTurn(turnNumber: number, entry: AntigravityEntry, assistantResponse: string, toolCalls: ChatTurn['toolCalls']): ChatTurn {
+		return {
+			turnNumber,
+			timestamp: entry.created_at ?? null,
+			mode: 'cli',
+			userMessage: extractUserRequestText(entry.content ?? ''),
+			assistantResponse,
+			model: null,
+			toolCalls,
+			contextReferences: createEmptyContextRefs(),
+			mcpTools: [],
+			inputTokensEstimate: 0,
+			outputTokensEstimate: 0,
+			thinkingTokensEstimate: 0,
+		};
+	}
+
+	/**
+	 * Check if an entry is a valid user input entry for turn creation.
+	 */
+	private _batIsUserInputEntry(entry: AntigravityEntry): boolean {
+		return entry.type === 'USER_INPUT' && entry.source === 'USER_EXPLICIT';
+	}
+
 /**
  * Build chat turns for the log viewer.
  *
@@ -321,35 +349,22 @@ return { title, firstInteraction, lastInteraction };
  * are always 0.
  */
 async buildAntigravityTurns(filePath: string): Promise<{ turns: ChatTurn[]; actualTokens?: number }> {
-const session = await this.readAntigravitySession(filePath);
-const allEntries = session.allEntries;
-const turns: ChatTurn[] = [];
-let turnNumber = 0;
+	const session = await this.readAntigravitySession(filePath);
+	const allEntries = session.allEntries;
+	const turns: ChatTurn[] = [];
+	let turnNumber = 0;
 
-for (let i = 0; i < allEntries.length; i++) {
-const entry = allEntries[i];
-if (entry.type !== 'USER_INPUT' || entry.source !== 'USER_EXPLICIT') { continue; }
-turnNumber++;
-const userMessage = extractUserRequestText(entry.content ?? '');
-const { assistantResponse, toolCalls } = _batCollectGroupData(allEntries, i + 1);
+	for (let i = 0; i < allEntries.length; i++) {
+		const entry = allEntries[i];
+		if (!this._batIsUserInputEntry(entry)) { continue; }
+		
+		turnNumber++;
+		const { assistantResponse, toolCalls } = _batCollectGroupData(allEntries, i + 1);
+		
+		turns.push(this._batCreateChatTurn(turnNumber, entry, assistantResponse, toolCalls));
+	}
 
-turns.push({
-turnNumber,
-timestamp: entry.created_at ?? null,
-mode: 'cli',
-userMessage,
-assistantResponse,
-model: null,
-toolCalls,
-contextReferences: createEmptyContextRefs(),
-mcpTools: [],
-inputTokensEstimate: 0,
-outputTokensEstimate: 0,
-thinkingTokensEstimate: 0,
-});
-}
-
-return { turns };
+	return { turns };
 }
 
 /**
