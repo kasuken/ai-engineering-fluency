@@ -50,11 +50,31 @@ export class CopilotCliAdapter implements IEcosystemAdapter, IDiscoverableEcosys
 	 * "MS Scout (Copilot CLI)" to distinguish them from regular CLI sessions.
 	 */
 	getDisplayName(sessionFile: string): string {
+		// DB virtual path: session-store.db#<uuid>
 		const sessionId = this.store.getSessionId(sessionFile);
 		if (sessionId && this._scoutSessionIds.has(sessionId)) {
 			return 'MS Scout (Copilot CLI)';
 		}
+		// events.jsonl path: ~/.copilot/session-state/<uuid>/events.jsonl
+		const eventsUuid = path.basename(path.dirname(sessionFile));
+		if (eventsUuid && this._scoutSessionIds.has(eventsUuid)) {
+			return 'MS Scout (Copilot CLI)';
+		}
 		return 'Copilot CLI';
+	}
+
+	/**
+	 * Called for files that were *discovered* by this adapter but not *handled*
+	 * (i.e. events.jsonl files, which are parsed by the JSONL fallback parser).
+	 * Returns 'MS Scout (Copilot CLI)' when the session UUID was marked as Scout
+	 * during discover(), undefined otherwise.
+	 */
+	getDisplayNameForDiscoveredPath(sessionFile: string): string | undefined {
+		const eventsUuid = path.basename(path.dirname(sessionFile));
+		if (eventsUuid && this._scoutSessionIds.has(eventsUuid)) {
+			return 'MS Scout (Copilot CLI)';
+		}
+		return undefined;
 	}
 
 	/**
@@ -156,6 +176,22 @@ export class CopilotCliAdapter implements IEcosystemAdapter, IDiscoverableEcosys
 		return {};
 	}
 
+	/**
+	 * Reads workspace.yaml from a UUID session directory and adds the UUID to
+	 * _scoutSessionIds if the cwd indicates a Microsoft Scout session.
+	 * Silently ignores missing or unreadable files.
+	 */
+	private async _tryMarkScoutFromWorkspaceYaml(uuidDir: string, uuid: string): Promise<void> {
+		const yamlPath = path.join(uuidDir, 'workspace.yaml');
+		try {
+			const content = await fs.promises.readFile(yamlPath, 'utf8');
+			const match = content.match(/^cwd:\s*(.+)$/m);
+			if (match && isMicrosoftScoutCwd(match[1].trim())) {
+				this._scoutSessionIds.add(uuid);
+			}
+		} catch { /* workspace.yaml may not exist */ }
+	}
+
 	getCandidatePaths(): CandidatePath[] {
 		const paths: CandidatePath[] = [
 			{ path: getCopilotCliSessionStateDir(), source: 'Copilot CLI' },
@@ -206,11 +242,14 @@ export class CopilotCliAdapter implements IEcosystemAdapter, IDiscoverableEcosys
 				const subDirs = entries.filter(e => e.isDirectory());
 				const subDirFiles = (await Promise.all(
 					subDirs.map(async (subDir) => {
-						const eventsFile = path.join(root, subDir.name, 'events.jsonl');
+						const uuidDir = path.join(root, subDir.name);
+						const eventsFile = path.join(uuidDir, 'events.jsonl');
 						try {
 							const stats = await fs.promises.stat(eventsFile);
 							if (stats.size > 0) {
 								knownUuids.add(subDir.name);
+								// Check workspace.yaml to detect Microsoft Scout sessions
+								await this._tryMarkScoutFromWorkspaceYaml(uuidDir, subDir.name);
 								return eventsFile;
 							}
 						} catch { /* no events.jsonl in this subdir */ }
