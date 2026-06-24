@@ -762,6 +762,43 @@ export async function extractRepositoryFromContentReferences(contentReferences: 
 	return undefined;
 }
 
+/**
+ * Parse a `.code-workspace` multi-root workspace file and return the resolved folder paths.
+ * Returns an empty array if the file cannot be read, is invalid JSON, or has no folders.
+ */
+export function parseCodeWorkspaceFolders(codeWorkspacePath: string): string[] {
+	try {
+		if (!codeWorkspacePath || !codeWorkspacePath.endsWith('.code-workspace') || !fs.existsSync(codeWorkspacePath)) {
+			return [];
+		}
+		const raw = fs.readFileSync(codeWorkspacePath, 'utf8');
+		const obj = JSON.parse(raw);
+		if (typeof obj !== 'object' || obj === null || !Array.isArray(obj.folders)) {
+			return [];
+		}
+		const folders: string[] = [];
+		for (const entry of obj.folders) {
+			if (typeof entry !== 'object' || entry === null) { continue; }
+			let folderPath: string | undefined;
+			if (typeof entry.path === 'string') {
+				folderPath = entry.path;
+			} else if (typeof entry.uri === 'string' && entry.uri.startsWith('file://')) {
+				folderPath = resolveFileUri(entry.uri);
+			}
+			if (!folderPath) { continue; }
+			try {
+				const resolved = fs.realpathSync.native(folderPath);
+				folders.push(resolved);
+			} catch {
+				folders.push(folderPath);
+			}
+		}
+		return folders;
+	} catch {
+		return [];
+	}
+}
+
 export function resolveWorkspaceFolderFromSessionPath(sessionFilePath: string, workspaceIdToFolderCache: Map<string, string | undefined>): string | undefined {
 	try {
 		// Normalize and split path into segments

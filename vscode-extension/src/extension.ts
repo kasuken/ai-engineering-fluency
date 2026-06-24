@@ -155,6 +155,7 @@ import {
   globToRegExp as _globToRegExp,
   resolveExactWorkspacePath as _resolveExactWorkspacePath,
   scanWorkspaceCustomizationFiles as _scanWorkspaceCustomizationFiles,
+  parseCodeWorkspaceFolders as _parseCodeWorkspaceFolders,
   getRepositoryUrl as _getRepositoryUrl,
   getModeType as _getModeType,
   extractCustomAgentName as _extractCustomAgentName,
@@ -3551,6 +3552,28 @@ class CopilotTokenTracker implements vscode.Disposable {
 	private ensureWorkspaceCustomizationCached(norm: string): void {
 		if (this._customizationFilesCache.has(norm)) { return; }
 		try {
+			// Handle multi-root workspace (.code-workspace) files — scan each folder and merge
+			if (norm.endsWith('.code-workspace')) {
+				const folders = _parseCodeWorkspaceFolders(norm);
+				if (folders.length > 0) {
+					const allFiles: CustomizationFileEntry[] = [];
+					const seen = new Set<string>();
+					for (const folder of folders) {
+						try {
+							const files = _scanWorkspaceCustomizationFiles(folder);
+							for (const f of files) {
+								const key = path.normalize(f.path);
+								if (!seen.has(key)) {
+									seen.add(key);
+									allFiles.push(f);
+								}
+							}
+						} catch { /* skip per-folder scan errors */ }
+					}
+					this._customizationFilesCache.set(norm, allFiles);
+					return;
+				}
+			}
 			const files = _scanWorkspaceCustomizationFiles(norm);
 			this._customizationFilesCache.set(norm, files);
 		} catch (e) { /* ignore scan errors per workspace */ }
