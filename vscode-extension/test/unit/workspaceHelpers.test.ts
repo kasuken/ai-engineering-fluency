@@ -1503,3 +1503,94 @@ test('globToRegExp: case-insensitive flag set correctly', () => {
     assert.ok(!reSensitive.flags.includes('i'));
     assert.ok(reInsensitive.flags.includes('i'));
 });
+
+// ---------------------------------------------------------------------------
+// parseCodeWorkspaceFolders
+// ---------------------------------------------------------------------------
+
+import { parseCodeWorkspaceFolders } from '../../src/workspaceHelpers';
+
+test('parseCodeWorkspaceFolders: returns empty array for non-existent path', () => {
+    const result = parseCodeWorkspaceFolders('/does/not/exist/code-workspace');
+    assert.deepEqual(result, []);
+});
+
+test('parseCodeWorkspaceFolders: returns empty array for non-code-workspace path', () => {
+    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wh-pcwf-'));
+    try {
+        const tmpFile = nodePath.join(tmpDir, 'not-a-workspace.json');
+        fs.writeFileSync(tmpFile, '{}', 'utf8');
+        const result = parseCodeWorkspaceFolders(tmpFile);
+        assert.deepEqual(result, []);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test('parseCodeWorkspaceFolders: returns folders from valid .code-workspace with path entries', () => {
+    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wh-pcwf-'));
+    try {
+        const folder1 = nodePath.join(tmpDir, 'repo1');
+        const folder2 = nodePath.join(tmpDir, 'repo2');
+        fs.mkdirSync(folder1, { recursive: true });
+        fs.mkdirSync(folder2, { recursive: true });
+        const wsFile = nodePath.join(tmpDir, 'test.code-workspace');
+        fs.writeFileSync(wsFile, JSON.stringify({
+            folders: [
+                { path: folder1 },
+                { path: folder2 },
+            ],
+        }), 'utf8');
+        const result = parseCodeWorkspaceFolders(wsFile);
+        // should resolve both folders via realpathSync.native
+        assert.equal(result.length, 2);
+        assert.ok(result.some(p => nodePath.basename(p) === 'repo1'));
+        assert.ok(result.some(p => nodePath.basename(p) === 'repo2'));
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test('parseCodeWorkspaceFolders: handles file:// URI entries', () => {
+    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wh-pcwf-'));
+    try {
+        const folder = nodePath.join(tmpDir, 'my-project');
+        fs.mkdirSync(folder, { recursive: true });
+        const wsFile = nodePath.join(tmpDir, 'test.code-workspace');
+        const fileUri = 'file://' + (process.platform === 'win32' ? '/' + folder.replace(/\\/g, '/') : folder);
+        fs.writeFileSync(wsFile, JSON.stringify({
+            folders: [
+                { uri: fileUri },
+            ],
+        }), 'utf8');
+        const result = parseCodeWorkspaceFolders(wsFile);
+        assert.equal(result.length, 1);
+        assert.ok(result[0].endsWith('my-project'));
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test('parseCodeWorkspaceFolders: returns empty array for invalid JSON', () => {
+    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wh-pcwf-'));
+    try {
+        const wsFile = nodePath.join(tmpDir, 'bad.code-workspace');
+        fs.writeFileSync(wsFile, 'not-json', 'utf8');
+        const result = parseCodeWorkspaceFolders(wsFile);
+        assert.deepEqual(result, []);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+test('parseCodeWorkspaceFolders: returns empty array when folders key is missing', () => {
+    const tmpDir = fs.mkdtempSync(nodePath.join(os.tmpdir(), 'wh-pcwf-'));
+    try {
+        const wsFile = nodePath.join(tmpDir, 'no-folders.code-workspace');
+        fs.writeFileSync(wsFile, JSON.stringify({ settings: {} }), 'utf8');
+        const result = parseCodeWorkspaceFolders(wsFile);
+        assert.deepEqual(result, []);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
