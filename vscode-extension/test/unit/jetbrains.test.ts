@@ -390,10 +390,10 @@ test('parseJetBrainsPartition: captures progress messages from tool execution', 
 	const content = toJsonl([
 		partitionCreated(),
 		userMessage('t1', 'use a tool'),
-		turnStart('t1'),
+		makeTurnStart('t1'),
 		toolStart('toolu_x', 'read_file'),
 		{ type: 'tool.execution_complete', data: { toolCallId: 'toolu_x', success: true, result: { result: [{ type: 'text', value: 'file contents' }] }, progressMessage: 'Reading file...' } },
-		turnEnd('t1', 'success', 'success'),
+		makeTurnEnd('t1', 'success', 'success'),
 	]);
 	const r = parseJetBrainsPartition(content);
 	
