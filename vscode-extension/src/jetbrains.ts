@@ -199,25 +199,31 @@ function _jbpDispatchEvent(event: any, state: JbpState): void {
 }
 
 /**
- * Parse a JetBrains partition file's raw JSONL content into the canonical
- * "common output" shape used by the rest of the extension.
- *
- * Malformed lines are skipped silently — partition files are append-only and
- * may legitimately have a half-written final line if read mid-write.
+ * Initialize a JetBrainsParsedSession with default values.
  */
-export function parseJetBrainsPartition(content: string): JetBrainsParsedSession {
-	const result: JetBrainsParsedSession = {
+function _jbpCreateDefaultSession(): JetBrainsParsedSession {
+	return {
 		tokens: 0, thinkingTokens: 0, actualTokens: 0, interactions: 0, modelUsage: {},
 		mode: 'ask', modelHint: 'unknown', firstInteraction: null, lastInteraction: null,
 		source: null, conversationId: null, toolCalls: [], toolCounts: {},
 	};
-	const { parsed, renderedTurnIds } = _jbpPreParseLines(content.split(/\r?\n/));
-	const state: JbpState = {
+}
+
+/**
+ * Initialize JbpState with default values.
+ */
+function _jbpCreateInitialState(result: JetBrainsParsedSession, renderedTurnIds: Set<string>): JbpState {
+	return {
 		inputTokens: 0, outputTokens: 0, firstUserTs: null, lastTurnTs: null,
 		modelFromTurnStart: null, modelFromToolCallId: null, sawToolCall: false,
 		toolCallById: new Map(), renderedTurnIds, result,
 	};
-	for (const event of parsed) { _jbpDispatchEvent(event, state); }
+}
+
+/**
+ * Finalize the parsed session by setting derived properties.
+ */
+function _jbpFinalizeSession(result: JetBrainsParsedSession, state: JbpState): void {
 	result.mode = state.sawToolCall ? 'agent' : 'ask';
 	result.modelHint = state.modelFromTurnStart || state.modelFromToolCallId || 'unknown';
 	result.tokens = state.inputTokens + state.outputTokens;
@@ -226,6 +232,24 @@ export function parseJetBrainsPartition(content: string): JetBrainsParsedSession
 	if (result.tokens > 0 && result.modelHint !== 'unknown') {
 		result.modelUsage[result.modelHint] = { inputTokens: state.inputTokens, outputTokens: state.outputTokens };
 	}
+}
+
+/**
+ * Parse a JetBrains partition file's raw JSONL content into the canonical
+ * "common output" shape used by the rest of the extension.
+ *
+ * Malformed lines are skipped silently — partition files are append-only and
+ * may legitimately have a half-written final line if read mid-write.
+ */
+export function parseJetBrainsPartition(content: string): JetBrainsParsedSession {
+	const result = _jbpCreateDefaultSession();
+	const { parsed, renderedTurnIds } = _jbpPreParseLines(content.split(/\r?\n/));
+	const state = _jbpCreateInitialState(result, renderedTurnIds);
+	
+	for (const event of parsed) { _jbpDispatchEvent(event, state); }
+	
+	_jbpFinalizeSession(result, state);
+	
 	return result;
 }
 

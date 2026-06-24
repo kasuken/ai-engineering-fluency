@@ -204,16 +204,58 @@ function _scorePromptEngineering(p: UsageAnalysisPeriod): CategoryScore {
 }
 
 
-type SpeResult = { stage: Stage; evidence: string[]; usedSlashCommands: string[]; hasModelSwitching: boolean; hasAgentMode: boolean; autoUsageRatio: number };
-function _speComputeEvidence(p: UsageAnalysisPeriod): SpeResult {
-	const evidence: string[] = [];
-	const T = STAGE_THRESHOLDS.promptEngineering;
+/**
+ * Add evidence for mode usage counts.
+ */
+function _speAddModeEvidence(evidence: string[], p: UsageAnalysisPeriod): void {
 	const totalInteractions = p.modeUsage.ask + p.modeUsage.edit + p.modeUsage.agent + p.modeUsage.cli;
 	if (totalInteractions > 0) { evidence.push(`${fmt(totalInteractions)} total interactions`); }
 	if (p.modeUsage.ask > 0) { evidence.push(`${fmt(p.modeUsage.ask)} ask-mode conversations`); }
 	if (p.modeUsage.agent > 0) { evidence.push(`${fmt(p.modeUsage.agent)} agent-mode interactions`); }
 	if (p.modeUsage.cli > 0) { evidence.push(`${fmt(p.modeUsage.cli)} CLI interactions`); }
+}
 
+/**
+ * Add evidence for auto model usage.
+ */
+function _speAddAutoModelEvidence(evidence: string[], p: UsageAnalysisPeriod, autoUsageRatio: number): void {
+	if (p.modelSwitching.autoSessions > 0) {
+		evidence.push(`Auto model used in ${fmt(p.modelSwitching.autoSessions)} session${p.modelSwitching.autoSessions === 1 ? '' : 's'} (${Math.round(autoUsageRatio * 100)}%)`);
+	}
+}
+
+/**
+ * Apply stage promotions based on auto usage ratio.
+ */
+function _speApplyAutoUsageStage(stage: Stage, autoUsageRatio: number, sessions: number): Stage {
+	let result = stage;
+	if (autoUsageRatio > 0) { result = promoteStage(result, 2); }
+	if (autoUsageRatio >= 0.5) { result = promoteStage(result, 3); }
+	if (autoUsageRatio >= 0.8 && sessions >= 5) { result = 4; }
+	return result;
+}
+
+/**
+ * Apply model switching stage boost.
+ */
+function _speApplyModelSwitchingBoost(stage: Stage, hasModelSwitching: boolean, p: UsageAnalysisPeriod, evidence: string[]): Stage {
+	if (!hasModelSwitching) { return stage; }
+	
+	evidence.push(`Switched models in ${Math.round(p.modelSwitching.switchingFrequency)}% of sessions`);
+	if (stage < 4 && (p.modelSwitching.mixedTierSessions > 0 || p.modelSwitching.mixedCostSessions > 0)) {
+		return promoteStage(stage, 3);
+	}
+	return stage;
+}
+
+type SpeResult = { stage: Stage; evidence: string[]; usedSlashCommands: string[]; hasModelSwitching: boolean; hasAgentMode: boolean; autoUsageRatio: number };
+function _speComputeEvidence(p: UsageAnalysisPeriod): SpeResult {
+	const evidence: string[] = [];
+	const T = STAGE_THRESHOLDS.promptEngineering;
+	
+	_speAddModeEvidence(evidence, p);
+	
+	const totalInteractions = p.modeUsage.ask + p.modeUsage.edit + p.modeUsage.agent + p.modeUsage.cli;
 	let stage: Stage = _applyPeConversationStage(p, evidence, 1);
 	if (totalInteractions >= T.stage2MinInteractions) { stage = 2; }
 
@@ -223,18 +265,15 @@ function _speComputeEvidence(p: UsageAnalysisPeriod): SpeResult {
 	const hasModelSwitching = _peHasModelSwitching(p.modelSwitching.mixedTierSessions, p.modelSwitching.mixedCostSessions, p.modelSwitching.switchingFrequency);
 	const hasAgentMode = _peHasAgentMode(p.modeUsage.agent, p.modeUsage.cli);
 	const autoUsageRatio = p.modelSwitching.totalSessions > 0 ? (p.modelSwitching.autoSessions / p.modelSwitching.totalSessions) : 0;
-	if (p.modelSwitching.autoSessions > 0) { evidence.push(`Auto model used in ${fmt(p.modelSwitching.autoSessions)} session${p.modelSwitching.autoSessions === 1 ? '' : 's'} (${Math.round(autoUsageRatio * 100)}%)`); }
+	
+	_speAddAutoModelEvidence(evidence, p, autoUsageRatio);
 
 	if (_peQualifiesForStage3(totalInteractions, usedSlashCommands, hasAgentMode)) { stage = 3; }
 	if (_peQualifiesForStage4(totalInteractions, hasAgentMode, hasModelSwitching, usedSlashCommands)) { stage = 4; }
-	if (autoUsageRatio > 0) { stage = promoteStage(stage, 2); }
-	if (autoUsageRatio >= 0.5) { stage = promoteStage(stage, 3); }
-	if (autoUsageRatio >= 0.8 && p.sessions >= 5) { stage = 4; }
-
-	if (hasModelSwitching) {
-		evidence.push(`Switched models in ${Math.round(p.modelSwitching.switchingFrequency)}% of sessions`);
-		if (stage < 4) { if (p.modelSwitching.mixedTierSessions > 0 || p.modelSwitching.mixedCostSessions > 0) { stage = promoteStage(stage, 3); } }
-	}
+	
+	stage = _speApplyAutoUsageStage(stage, autoUsageRatio, p.sessions);
+	stage = _speApplyModelSwitchingBoost(stage, hasModelSwitching, p, evidence);
+	
 	return { stage, evidence, usedSlashCommands, hasModelSwitching, hasAgentMode, autoUsageRatio };
 }
 
@@ -389,31 +428,68 @@ function _agBuildTips(stage: Stage): string[] {
 	return tips;
 }
 
+/**
+ * Add evidence for basic agentic usage.
+ */
+function _agAddBasicEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: Stage): Stage {
+	let result = stage;
+	if (p.modeUsage.agent > 0) { evidence.push(`${fmt(p.modeUsage.agent)} agent-mode interactions`); result = 2; }
+	if (p.modeUsage.cli > 0) { evidence.push(`${fmt(p.modeUsage.cli)} CLI interactions`); result = promoteStage(result, 2); }
+	if (p.toolCalls.total > 0) { evidence.push(`${fmt(p.toolCalls.total)} tool calls executed`); }
+	if (p.modeUsage.edit > 0) { evidence.push(`${fmt(p.modeUsage.edit)} edit-mode interactions`); }
+	return result;
+}
+
+/**
+ * Add evidence for edit scope and apply stage promotions.
+ */
+function _agAddEditScopeEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: Stage, T: typeof STAGE_THRESHOLDS.agentic): Stage {
+	if (!p.editScope) { return stage; }
+	
+	let result = stage;
+	const totalEditSessions = p.editScope.singleFileEdits + p.editScope.multiFileEdits;
+	const multiFileRate = totalEditSessions > 0 ? Math.round((p.editScope.multiFileEdits / totalEditSessions) * 100) : 0;
+	
+	if (p.editScope.multiFileEdits > 0) {
+		evidence.push(`${fmt(p.editScope.multiFileEdits)} multi-file edit sessions (${multiFileRate}%)`);
+		result = promoteStage(result, 2);
+	}
+	if (p.editScope.avgFilesPerSession >= T.stage3MinAvgFilesPerSession) {
+		evidence.push(`Avg ${p.editScope.avgFilesPerSession.toFixed(1)} files per edit session`);
+		result = promoteStage(result, 3);
+	}
+	
+	return result;
+}
+
+/**
+ * Apply agentic stage qualifications and boosters.
+ */
+function _agApplyStageQualifications(stage: Stage, p: UsageAnalysisPeriod, T: typeof STAGE_THRESHOLDS.agentic, evidence: string[]): Stage {
+	let result = stage;
+	
+	if (p.agentTypes?.editsAgent) { evidence.push(`${fmt(p.agentTypes.editsAgent)} edits agent sessions`); result = promoteStage(result, 2); }
+
+	const nonAutoToolCount = countNonAutoTools(p.toolCalls.byTool);
+	const agentInteractions = p.modeUsage.agent + p.modeUsage.cli;
+	
+	if (_agQualifiesForStage3(agentInteractions, nonAutoToolCount, T)) { result = 3; }
+	if (_agQualifiesForStage4(agentInteractions, nonAutoToolCount, T)) { result = 4; }
+	if (_agQualifiesMultiFileStage4(p.editScope, T)) { result = promoteStage(result, 4); }
+	
+	result = _agApplyMultiAgentBooster(p.multiAgentParentSessions ?? 0, T, result, evidence);
+	
+	return result;
+}
+
 function _scoreAgentic(p: UsageAnalysisPeriod): CategoryScore {
 	const evidence: string[] = [];
 	let stage: Stage = 1;
 	const T = STAGE_THRESHOLDS.agentic;
 
-	if (p.modeUsage.agent > 0) { evidence.push(`${fmt(p.modeUsage.agent)} agent-mode interactions`); stage = 2; }
-	if (p.modeUsage.cli > 0) { evidence.push(`${fmt(p.modeUsage.cli)} CLI interactions`); stage = promoteStage(stage, 2); }
-	if (p.toolCalls.total > 0) { evidence.push(`${fmt(p.toolCalls.total)} tool calls executed`); }
-	if (p.modeUsage.edit > 0) { evidence.push(`${fmt(p.modeUsage.edit)} edit-mode interactions`); }
-
-	if (p.editScope) {
-		const totalEditSessions = p.editScope.singleFileEdits + p.editScope.multiFileEdits;
-		const multiFileRate = totalEditSessions > 0 ? Math.round((p.editScope.multiFileEdits / totalEditSessions) * 100) : 0;
-		if (p.editScope.multiFileEdits > 0) { evidence.push(`${fmt(p.editScope.multiFileEdits)} multi-file edit sessions (${multiFileRate}%)`); stage = promoteStage(stage, 2); }
-		if (p.editScope.avgFilesPerSession >= T.stage3MinAvgFilesPerSession) { evidence.push(`Avg ${p.editScope.avgFilesPerSession.toFixed(1)} files per edit session`); stage = promoteStage(stage, 3); }
-	}
-
-	if (p.agentTypes?.editsAgent) { evidence.push(`${fmt(p.agentTypes.editsAgent)} edits agent sessions`); stage = promoteStage(stage, 2); }
-
-	const nonAutoToolCount = countNonAutoTools(p.toolCalls.byTool);
-	const agentInteractions = p.modeUsage.agent + p.modeUsage.cli;
-	if (_agQualifiesForStage3(agentInteractions, nonAutoToolCount, T)) { stage = 3; }
-	if (_agQualifiesForStage4(agentInteractions, nonAutoToolCount, T)) { stage = 4; }
-	if (_agQualifiesMultiFileStage4(p.editScope, T)) { stage = promoteStage(stage, 4); }
-	stage = _agApplyMultiAgentBooster(p.multiAgentParentSessions ?? 0, T, stage, evidence);
+	stage = _agAddBasicEvidence(evidence, p, stage);
+	stage = _agAddEditScopeEvidence(evidence, p, stage, T);
+	stage = _agApplyStageQualifications(stage, p, T, evidence);
 
 	return { stage, evidence, tips: _agBuildTips(stage) };
 }
@@ -433,41 +509,88 @@ function _tuBuildTips(stage: Stage, mcpServers: string[]): string[] {
 	return tips;
 }
 
-function _scoreToolUsage(p: UsageAnalysisPeriod): CategoryScore {
-	const evidence: string[] = [];
-	let stage: Stage = 1;
-	const T = STAGE_THRESHOLDS.toolUsage;
-
+/**
+ * Add evidence for basic tool usage.
+ */
+function _tuAddBasicToolEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: Stage): Stage {
 	const toolCount = Object.keys(p.toolCalls.byTool).length;
 	const nonAutoToolCount = countNonAutoTools(p.toolCalls.byTool);
+	
+	let result = stage;
 	if (nonAutoToolCount > 0) {
 		const autoCount = toolCount - nonAutoToolCount;
 		const autoNote = autoCount > 0 ? ` (+ ${fmt(autoCount)} automatic)` : '';
 		evidence.push(`${fmt(nonAutoToolCount)} intentional tools used${autoNote}`);
-		stage = 2;
+		result = 2;
 	} else if (toolCount > 0) {
 		evidence.push(`${fmt(toolCount)} tools used (all automatic — agent reads/searches)`);
 	}
+	
+	return result;
+}
 
-	if (p.agentTypes?.workspaceAgent > 0) { evidence.push(`${fmt(p.agentTypes.workspaceAgent)} @workspace agent sessions`); stage = promoteStage(stage, 3); }
+/**
+ * Add evidence for workspace agent usage.
+ */
+function _tuAddWorkspaceAgentEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: Stage): Stage {
+	if (p.agentTypes?.workspaceAgent > 0) {
+		evidence.push(`${fmt(p.agentTypes.workspaceAgent)} @workspace agent sessions`);
+		return promoteStage(stage, 3);
+	}
+	return stage;
+}
 
+/**
+ * Add evidence for advanced tool usage.
+ */
+function _tuAddAdvancedToolEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: Stage, T: typeof STAGE_THRESHOLDS.toolUsage): Stage {
 	const advancedToolFriendlyNames: Record<string, string> = {
 		github_pull_request: 'GitHub Pull Request', github_repo: 'GitHub Repository',
 		run_in_terminal: 'Run In Terminal', editFiles: 'Edit Files', listFiles: 'List Files'
 	};
 	const usedAdvanced = Object.keys(advancedToolFriendlyNames).filter(t => (p.toolCalls.byTool[t] || 0) > 0);
+	
+	let result = stage;
 	if (usedAdvanced.length > 0) {
 		evidence.push(`Advanced tools: ${usedAdvanced.map(t => advancedToolFriendlyNames[t]).join(', ')}`);
-		if (usedAdvanced.length >= T.stage3MinAdvancedTools) { stage = promoteStage(stage, 3); }
+		if (usedAdvanced.length >= T.stage3MinAdvancedTools) {
+			result = promoteStage(result, 3);
+		}
 	}
+	
+	return result;
+}
+
+/**
+ * Add evidence for MCP tool usage.
+ */
+function _tuAddMcpEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: Stage, T: typeof STAGE_THRESHOLDS.toolUsage): { stage: Stage; mcpServers: string[] } {
 	const mcpServers = Object.keys(p.mcpTools.byServer);
+	let result = stage;
+	
 	if (p.mcpTools.total > 0) {
 		evidence.push(`${fmt(p.mcpTools.total)} MCP tool calls across ${mcpServers.length} server(s)`);
-		stage = promoteStage(stage, 3);
-		if (mcpServers.length >= T.stage4MinMcpServers) { stage = 4; }
+		result = promoteStage(result, 3);
+		if (mcpServers.length >= T.stage4MinMcpServers) {
+			result = 4;
+		}
 	}
+	
+	return { stage: result, mcpServers };
+}
 
-	return { stage, evidence, tips: _tuBuildTips(stage, mcpServers) };
+function _scoreToolUsage(p: UsageAnalysisPeriod): CategoryScore {
+	const evidence: string[] = [];
+	let stage: Stage = 1;
+	const T = STAGE_THRESHOLDS.toolUsage;
+
+	stage = _tuAddBasicToolEvidence(evidence, p, stage);
+	stage = _tuAddWorkspaceAgentEvidence(evidence, p, stage);
+	stage = _tuAddAdvancedToolEvidence(evidence, p, stage, T);
+	
+	const { stage: finalStage, mcpServers } = _tuAddMcpEvidence(evidence, p, stage, T);
+
+	return { stage: finalStage, evidence, tips: _tuBuildTips(finalStage, mcpServers) };
 }
 
 function _buildCustomizationStage4Tip(matrix: WorkspaceCustomizationMatrix | undefined, totalRepos: number, reposWithCustomization: number): string {
@@ -511,6 +634,77 @@ function _cuBuildTips(stage: Stage, totalRepos: number, reposWithCustomization: 
 	return tips;
 }
 
+/**
+ * Extract unique models from model switching data.
+ */
+function _cuExtractUniqueModels(p: UsageAnalysisPeriod): string[] {
+	return [...new Set([
+		...p.modelSwitching.standardModels,
+		...p.modelSwitching.premiumModels,
+		...p.modelSwitching.lowCostModels,
+		...p.modelSwitching.mediumCostModels,
+		...p.modelSwitching.highCostModels
+	])];
+}
+
+/**
+ * Add evidence for repository and model usage.
+ */
+function _cuAddBasicEvidence(evidence: string[], totalRepos: number, uniqueModels: string[], T: typeof STAGE_THRESHOLDS.customization): void {
+	if (totalRepos > 0) { evidence.push(`Worked in ${totalRepos} repositor${totalRepos === 1 ? 'y' : 'ies'}`); }
+	if (uniqueModels.length >= T.stage3MinUniqueModels) { evidence.push(`Used ${uniqueModels.length} different models`); }
+}
+
+/**
+ * Apply stage boosts for special model usage.
+ */
+function _cuApplyModelUsageBoosts(stage: Stage, p: UsageAnalysisPeriod, evidence: string[]): Stage {
+	let result = stage;
+	
+	if (p.modelSwitching.foundryWindowsSessions > 0) {
+		result = promoteStage(result, 2);
+		evidence.push(`Used Microsoft Foundry / local models in ${fmt(p.modelSwitching.foundryWindowsSessions)} session${p.modelSwitching.foundryWindowsSessions === 1 ? '' : 's'}`);
+	}
+	if (p.modelSwitching.unknownProviderSessions > 0) {
+		result = promoteStage(result, 2);
+		evidence.push(`Used models from unknown providers in ${fmt(p.modelSwitching.unknownProviderSessions)} session${p.modelSwitching.unknownProviderSessions === 1 ? '' : 's'}`);
+	}
+	
+	return result;
+}
+
+/**
+ * Add evidence for customization level.
+ */
+function _cuAddCustomizationEvidence(evidence: string[], stage: Stage, reposWithCustomization: number, totalRepos: number, T: typeof STAGE_THRESHOLDS.customization): void {
+	if (stage >= 4) {
+		evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos customized (${T.stage4MinCustomizationRate * 100}%+ with ${T.stage4MinCustomizedRepos}+ repos → Stage 4)`);
+	} else if (stage >= 3) {
+		evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos customized (${T.stage3MinCustomizationRate * 100}%+ with ${T.stage3MinCustomizedRepos}+ repos → Stage 3)`);
+	} else if (reposWithCustomization > 0) {
+		evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos with custom instructions or agents.md`);
+	}
+}
+
+/**
+ * Build final tips with additional suggestions.
+ */
+function _cuBuildFinalTips(tips: string[], stage: Stage, p: UsageAnalysisPeriod, uniqueModels: string[], matrix: WorkspaceCustomizationMatrix | undefined, totalRepos: number, reposWithCustomization: number): string[] {
+	const result = [...tips];
+	
+	if (p.modelSwitching.foundryWindowsSessions === 0) {
+		result.unshift('Try the Microsoft Foundry on Windows extension if you want to experiment with local models and offline-friendly workflows');
+	}
+	if (p.modelSwitching.unknownProviderSessions === 0 && uniqueModels.length <= 1) {
+		result.unshift('Try different model providers from the marketplace when you want more specialized or cost-effective options');
+	}
+	if (stage >= 4) {
+		result.push(_buildCustomizationStage4Tip(matrix, totalRepos, reposWithCustomization));
+	}
+	
+	return result;
+}
+
 function _scoreCustomization(p: UsageAnalysisPeriod, lastCustomizationMatrix: WorkspaceCustomizationMatrix | undefined): CategoryScore {
 	const evidence: string[] = [];
 	const T = STAGE_THRESHOLDS.customization;
@@ -519,28 +713,16 @@ function _scoreCustomization(p: UsageAnalysisPeriod, lastCustomizationMatrix: Wo
 	const totalRepos = matrix?.totalWorkspaces ?? 0;
 	const reposWithCustomization = totalRepos - (matrix?.workspacesWithIssues ?? 0);
 	const customizationRate = totalRepos > 0 ? (reposWithCustomization / totalRepos) : 0;
-	const uniqueModels = [...new Set([...p.modelSwitching.standardModels, ...p.modelSwitching.premiumModels, ...p.modelSwitching.lowCostModels, ...p.modelSwitching.mediumCostModels, ...p.modelSwitching.highCostModels])];
+	const uniqueModels = _cuExtractUniqueModels(p);
+	
 	let stage = _cuComputeStage(customizationRate, reposWithCustomization, uniqueModels.length, T);
 
-	if (totalRepos > 0) { evidence.push(`Worked in ${totalRepos} repositor${totalRepos === 1 ? 'y' : 'ies'}`); }
-	if (uniqueModels.length >= T.stage3MinUniqueModels) { evidence.push(`Used ${uniqueModels.length} different models`); }
-	if (p.modelSwitching.foundryWindowsSessions > 0) {
-		stage = promoteStage(stage, 2);
-		evidence.push(`Used Microsoft Foundry / local models in ${fmt(p.modelSwitching.foundryWindowsSessions)} session${p.modelSwitching.foundryWindowsSessions === 1 ? '' : 's'}`);
-	}
-	if (p.modelSwitching.unknownProviderSessions > 0) {
-		stage = promoteStage(stage, 2);
-		evidence.push(`Used models from unknown providers in ${fmt(p.modelSwitching.unknownProviderSessions)} session${p.modelSwitching.unknownProviderSessions === 1 ? '' : 's'}`);
-	}
+	_cuAddBasicEvidence(evidence, totalRepos, uniqueModels, T);
+	stage = _cuApplyModelUsageBoosts(stage, p, evidence);
+	_cuAddCustomizationEvidence(evidence, stage, reposWithCustomization, totalRepos, T);
 
-	if (stage >= 4) { evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos customized (${T.stage4MinCustomizationRate * 100}%+ with ${T.stage4MinCustomizedRepos}+ repos → Stage 4)`); }
-	else if (stage >= 3) { evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos customized (${T.stage3MinCustomizationRate * 100}%+ with ${T.stage3MinCustomizedRepos}+ repos → Stage 3)`); }
-	else if (reposWithCustomization > 0) { evidence.push(`${fmt(reposWithCustomization)} of ${fmt(totalRepos)} repos with custom instructions or agents.md`); }
-
-	const tips = _cuBuildTips(stage, totalRepos, reposWithCustomization);
-	if (p.modelSwitching.foundryWindowsSessions === 0) { tips.unshift('Try the Microsoft Foundry on Windows extension if you want to experiment with local models and offline-friendly workflows'); }
-	if (p.modelSwitching.unknownProviderSessions === 0 && uniqueModels.length <= 1) { tips.unshift('Try different model providers from the marketplace when you want more specialized or cost-effective options'); }
-	if (stage >= 4) { tips.push(_buildCustomizationStage4Tip(matrix, totalRepos, reposWithCustomization)); }
+	let tips = _cuBuildTips(stage, totalRepos, reposWithCustomization);
+	tips = _cuBuildFinalTips(tips, stage, p, uniqueModels, matrix, totalRepos, reposWithCustomization);
 
 	return { stage, evidence, tips };
 }
@@ -563,35 +745,104 @@ function _wiBuildTips(stage: Stage, modesUsed: number, totalContextRefs: number,
 	return tips;
 }
 
+/**
+ * Calculate total context references from all sources.
+ */
+function _wiCalculateTotalContextRefs(p: UsageAnalysisPeriod): number {
+	return p.contextReferences.file + p.contextReferences.selection +
+		p.contextReferences.symbol + p.contextReferences.codebase + p.contextReferences.workspace;
+}
+
+/**
+ * Calculate number of modes used.
+ */
+function _wiCalculateModesUsed(p: UsageAnalysisPeriod): number {
+	return [p.modeUsage.ask > 0, p.modeUsage.agent > 0, p.modeUsage.cli > 0].filter(Boolean).length;
+}
+
+/**
+ * Add evidence for session count.
+ */
+function _wiAddSessionEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: Stage, T: typeof STAGE_THRESHOLDS.workflowIntegration): Stage {
+	if (p.sessions >= T.stage2MinSessions) {
+		evidence.push(`${fmt(p.sessions)} sessions in the last 30 days`);
+		return 2;
+	}
+	return stage;
+}
+
+/**
+ * Add evidence for apply usage.
+ */
+function _wiAddApplyUsageEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: Stage, T: typeof STAGE_THRESHOLDS.workflowIntegration): Stage {
+	if (!p.applyUsage || p.applyUsage.totalCodeBlocks <= 0) { return stage; }
+	
+	const applyRatePercent = Math.round(p.applyUsage.applyRate);
+	evidence.push(`${applyRatePercent}% code block apply rate (${fmt(p.applyUsage.totalApplies)}/${fmt(p.applyUsage.totalCodeBlocks)})`);
+	
+	if (applyRatePercent >= T.stage2MinApplyRatePct) {
+		return promoteStage(stage, 2);
+	}
+	
+	return stage;
+}
+
+/**
+ * Add evidence for session duration.
+ */
+function _wiAddSessionDurationEvidence(evidence: string[], p: UsageAnalysisPeriod): void {
+	if (p.sessionDuration && p.sessionDuration.avgDurationMs > 0) {
+		evidence.push(`Avg ${Math.round(p.sessionDuration.avgDurationMs / 60000)}min session duration`);
+	}
+}
+
+/**
+ * Add evidence for modes and context references.
+ */
+function _wiAddModesAndContextEvidence(evidence: string[], stage: Stage, modesUsed: number, totalContextRefs: number, T: typeof STAGE_THRESHOLDS.workflowIntegration): Stage {
+	let result = stage;
+	
+	if (modesUsed >= T.stage3MinModesUsed) {
+		evidence.push(`Uses ${modesUsed} modes (ask/agent/cli)`);
+		result = promoteStage(result, 3);
+	}
+
+	if (totalContextRefs >= T.hasExplicitContextMinRefs) {
+		evidence.push(`${fmt(totalContextRefs)} explicit context references`);
+		if (totalContextRefs >= T.stage3MinContextRefs) {
+			result = promoteStage(result, 3);
+		}
+	}
+	
+	return result;
+}
+
+/**
+ * Apply stage 4 qualification.
+ */
+function _wiApplyStage4Qualification(stage: Stage, p: UsageAnalysisPeriod, modesUsed: number, totalContextRefs: number, T: typeof STAGE_THRESHOLDS.workflowIntegration, evidence: string[]): Stage {
+	const qualifiesForStage4 = _wiQualifiesForStage4(p.sessions, modesUsed, totalContextRefs, T);
+	if (qualifiesForStage4) {
+		evidence.push('Deep integration: regular usage with multi-mode and explicit context');
+		return 4;
+	}
+	return stage;
+}
+
 function _scoreWorkflowIntegration(p: UsageAnalysisPeriod): CategoryScore {
 	const evidence: string[] = [];
 	let stage: Stage = 1;
 	const T = STAGE_THRESHOLDS.workflowIntegration;
 
-	if (p.sessions >= T.stage2MinSessions) { evidence.push(`${fmt(p.sessions)} sessions in the last 30 days`); stage = 2; }
+	stage = _wiAddSessionEvidence(evidence, p, stage, T);
+	stage = _wiAddApplyUsageEvidence(evidence, p, stage, T);
+	_wiAddSessionDurationEvidence(evidence, p);
 
-	if (p.applyUsage && p.applyUsage.totalCodeBlocks > 0) {
-		const applyRatePercent = Math.round(p.applyUsage.applyRate);
-		evidence.push(`${applyRatePercent}% code block apply rate (${fmt(p.applyUsage.totalApplies)}/${fmt(p.applyUsage.totalCodeBlocks)})`);
-		if (applyRatePercent >= T.stage2MinApplyRatePct) { stage = promoteStage(stage, 2); }
-	}
-
-	if (p.sessionDuration && p.sessionDuration.avgDurationMs > 0) {
-		evidence.push(`Avg ${Math.round(p.sessionDuration.avgDurationMs / 60000)}min session duration`);
-	}
-
-	const totalContextRefs = p.contextReferences.file + p.contextReferences.selection +
-		p.contextReferences.symbol + p.contextReferences.codebase + p.contextReferences.workspace;
-	const modesUsed = [p.modeUsage.ask > 0, p.modeUsage.agent > 0, p.modeUsage.cli > 0].filter(Boolean).length;
-	if (modesUsed >= T.stage3MinModesUsed) { evidence.push(`Uses ${modesUsed} modes (ask/agent/cli)`); stage = promoteStage(stage, 3); }
-
-	if (totalContextRefs >= T.hasExplicitContextMinRefs) {
-		evidence.push(`${fmt(totalContextRefs)} explicit context references`);
-		if (totalContextRefs >= T.stage3MinContextRefs) { stage = promoteStage(stage, 3); }
-	}
-
-	const qualifiesForStage4 = _wiQualifiesForStage4(p.sessions, modesUsed, totalContextRefs, T);
-	if (qualifiesForStage4) { stage = 4; evidence.push('Deep integration: regular usage with multi-mode and explicit context'); }
+	const totalContextRefs = _wiCalculateTotalContextRefs(p);
+	const modesUsed = _wiCalculateModesUsed(p);
+	
+	stage = _wiAddModesAndContextEvidence(evidence, stage, modesUsed, totalContextRefs, T);
+	stage = _wiApplyStage4Qualification(stage, p, modesUsed, totalContextRefs, T, evidence);
 
 	return { stage, evidence, tips: _wiBuildTips(stage, modesUsed, totalContextRefs, T) };
 }
@@ -828,44 +1079,75 @@ function _calcFluencyWi(fd: FluencyInputData, cv: FluencyVars, effectiveSessions
 	return { stage, tips };
 }
 
-export function calculateFluencyScoreForTeamMember(fd: FluencyInputData, dashboardSessions: number): { stage: number; label: string; categories: { category: string; icon: string; stage: number; tips: string[] }[] } {
+/**
+ * Build FluencyVars object from FluencyInputData.
+ * Extracted to reduce complexity of calculateFluencyScoreForTeamMember.
+ */
+function _buildFluencyVars(fd: FluencyInputData): FluencyVars {
 	const totalInteractions = fd.askModeCount + fd.editModeCount + fd.agentModeCount + fd.cliModeCount;
 	const avgTurnsPerSession = fd.turnsPerSessionCount > 0 ? fd.turnsPerSessionSum / fd.turnsPerSessionCount : 0;
 	const switchingFrequency = fd.switchingFreqCount > 0 ? fd.switchingFreqSum / fd.switchingFreqCount : 0;
-	const cv: FluencyVars = {
+	
+	const hasModelSwitching = fd.mixedTierSessions > 0 || fd.mixedCostSessions > 0 || switchingFrequency > 0;
+	const hasAgentMode = (fd.agentModeCount + fd.cliModeCount) > 0;
+	
+	const avgFilesPerSession = fd.filesPerEditCount > 0 ? fd.filesPerEditSum / fd.filesPerEditCount : 0;
+	const avgApplyRate = fd.applyRateCount > 0 ? fd.applyRateSum / fd.applyRateCount : 0;
+	
+	const totalContextRefs = fd.ctxFile + fd.ctxSelection + fd.ctxSymbol + fd.ctxCodebase + fd.ctxWorkspace;
+	
+	const usedRefTypeCount = [
+		fd.ctxFile, fd.ctxSelection, fd.ctxSymbol, fd.ctxCodebase, fd.ctxWorkspace,
+		fd.ctxTerminal, fd.ctxVscode, fd.ctxClipboard, fd.ctxChanges,
+		fd.ctxProblemsPanel, fd.ctxOutputPanel, fd.ctxTerminalLastCommand, fd.ctxTerminalSelection,
+	].filter(v => v > 0).length;
+	
+	return {
 		totalInteractions,
 		avgTurnsPerSession,
-		hasModelSwitching: fd.mixedTierSessions > 0 || fd.mixedCostSessions > 0 || switchingFrequency > 0,
-		hasAgentMode: (fd.agentModeCount + fd.cliModeCount) > 0,
+		hasModelSwitching,
+		hasAgentMode,
 		nonAutoToolCount: countNonAutoTools(fd.toolCallsByTool),
-		avgFilesPerSession: fd.filesPerEditCount > 0 ? fd.filesPerEditSum / fd.filesPerEditCount : 0,
-		avgApplyRate: fd.applyRateCount > 0 ? fd.applyRateSum / fd.applyRateCount : 0,
-		totalContextRefs: fd.ctxFile + fd.ctxSelection + fd.ctxSymbol + fd.ctxCodebase + fd.ctxWorkspace,
-		usedRefTypeCount: [
-			fd.ctxFile, fd.ctxSelection, fd.ctxSymbol, fd.ctxCodebase, fd.ctxWorkspace,
-			fd.ctxTerminal, fd.ctxVscode, fd.ctxClipboard, fd.ctxChanges,
-			fd.ctxProblemsPanel, fd.ctxOutputPanel, fd.ctxTerminalLastCommand, fd.ctxTerminalSelection,
-		].filter(v => v > 0).length,
+		avgFilesPerSession,
+		avgApplyRate,
+		totalContextRefs,
+		usedRefTypeCount,
 		usedSlashCommands: getUsedSlashCommands(fd.toolCallsByTool),
 	};
+}
+
+/**
+ * Build the result categories array from individual category scores.
+ * Extracted to reduce complexity of calculateFluencyScoreForTeamMember.
+ */
+function _buildFluencyCategories(pe: FluencyStageResult, ce: FluencyStageResult, ag: FluencyStageResult, tu: FluencyStageResult, cu: FluencyStageResult, wi: FluencyStageResult): { category: string; icon: string; stage: number; tips: string[] }[] {
+	return [
+		{ category: "Prompt Engineering", icon: "💬", stage: pe.stage, tips: pe.tips },
+		{ category: "Context Engineering", icon: "📎", stage: ce.stage, tips: ce.tips },
+		{ category: "Agentic", icon: "🤖", stage: ag.stage, tips: ag.tips },
+		{ category: "Tool Usage", icon: "🔧", stage: tu.stage, tips: tu.tips },
+		{ category: "Customization", icon: "⚙️", stage: cu.stage, tips: cu.tips },
+		{ category: "Workflow Integration", icon: "🔄", stage: wi.stage, tips: wi.tips },
+	];
+}
+
+export function calculateFluencyScoreForTeamMember(fd: FluencyInputData, dashboardSessions: number): { stage: number; label: string; categories: { category: string; icon: string; stage: number; tips: string[] }[] } {
+	const cv = _buildFluencyVars(fd);
+	const effectiveSessions = Math.max(dashboardSessions, fd.sessionCount);
+	
 	const pe = _calcFluencyPE(fd, cv);
 	const ce = _calcFluencyCE(fd, cv);
 	const ag = _calcFluencyAg(fd, cv);
 	const tu = _calcFluencyTu(fd, cv);
 	const cu = _calcFluencyCu(fd, cv);
-	const wi = _calcFluencyWi(fd, cv, Math.max(dashboardSessions, fd.sessionCount));
+	const wi = _calcFluencyWi(fd, cv, effectiveSessions);
+	
 	const overallStage = computeMedianStage([pe.stage, ce.stage, ag.stage, tu.stage, cu.stage, wi.stage] as Stage[]);
+	
 	return {
 		stage: overallStage,
 		label: STAGE_LABELS[overallStage as Stage] ?? `Stage ${overallStage}`,
-		categories: [
-			{ category: "Prompt Engineering", icon: "💬", stage: pe.stage, tips: pe.tips },
-			{ category: "Context Engineering", icon: "📎", stage: ce.stage, tips: ce.tips },
-			{ category: "Agentic", icon: "🤖", stage: ag.stage, tips: ag.tips },
-			{ category: "Tool Usage", icon: "🔧", stage: tu.stage, tips: tu.tips },
-			{ category: "Customization", icon: "⚙️", stage: cu.stage, tips: cu.tips },
-			{ category: "Workflow Integration", icon: "🔄", stage: wi.stage, tips: wi.tips },
-		],
+		categories: _buildFluencyCategories(pe, ce, ag, tu, cu, wi),
 	};
 }
 
