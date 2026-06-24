@@ -243,7 +243,7 @@ function _jbpHandleAssistantMessage(event: any, state: JbpState): void {
 	// Track message metadata
 	if (typeof event.data?.messageId === 'string') {
 		state.currentMessageId = event.data.messageId;
-		state.result.messageIds.push(event.data.messageId);
+		state.messageIds.push(event.data.messageId);
 		// Associate with current turn
 		if (state.currentTurnId && state.turnById.has(state.currentTurnId)) {
 			const turn = state.turnById.get(state.currentTurnId)!;
@@ -388,16 +388,16 @@ function _jbpDispatchEvent(event: any, state: JbpState): void {
 						turn.status = status;
 						switch (status.toLowerCase()) {
 							case 'success':
-								state.result.turnStatusCounts.success++;
+								state.turnStatusCounts.success++;
 								break;
 							case 'cancelled':
-								state.result.turnStatusCounts.cancelled++;
+								state.turnStatusCounts.cancelled++;
 								break;
 							case 'failed':
-								state.result.turnStatusCounts.failed++;
+								state.turnStatusCounts.failed++;
 								break;
 							default:
-								state.result.turnStatusCounts.unknown++;
+								state.turnStatusCounts.unknown++;
 								break;
 						}
 					}
