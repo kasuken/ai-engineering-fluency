@@ -2,6 +2,17 @@
 
 All notable changes to the CLI (@rajbos/ai-engineering-fluency) will be documented in this file.
 
+## [Unreleased]
+
+### Bug Fixes
+- Fix update sync-host-views skill paths after CopilotTokenTracker rename (#1398)
+- Fix modelSwitching cost model array initialization
+
+### Maintenance
+- Added unit tests for error handling and CLI utilities (#1375)
+- Bumped `@types/node` to 26.0.0
+- Bumped `esbuild` to 0.28.1
+
 ## [0.2.9] - 2026-06-07
 
 ### Features
