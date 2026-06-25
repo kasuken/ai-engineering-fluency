@@ -500,7 +500,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 	/** True when the user explicitly signed out from our extension this VS Code session. Gated by globalState so it survives reloads. */
 	private _githubSignedOutByUser: boolean = false;
 	/** Resolved Copilot plan details fetched from copilot_internal/user after sign-in. */
-	private _copilotPlanResolved: { planId: string; planName: string; monthlyAiCreditsUsd: number; monthlyPremiumRequests: number | null } | undefined;
+	private _copilotPlanResolved: { planId: string; planName: string; monthlyAiCreditsUsd: number; monthlyPremiumRequests: number | null; isMCPEnabled?: boolean } | undefined;
 	/** Quota entitlements from copilot_internal/user response (e.g., premium_interactions entitlement). */
 	private _copilotQuotaEntitlements: { premium_interactions?: number; completions?: number } = {};
 
@@ -1859,6 +1859,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 
 	private logCopilotPlanDetails(planId: string | undefined, knownPlan: { name: string; monthlyPremiumRequests: number | null; monthlyPricePerUser: number; monthlyAiCreditsUsd: number } | undefined, planInfo: any): void {
 		this.logKnownPlanEntry(planId, knownPlan);
+		if (this._copilotPlanResolved) {
+			this._copilotPlanResolved.isMCPEnabled = typeof planInfo?.is_mcp_enabled === 'boolean' ? planInfo.is_mcp_enabled : undefined;
+		}
 		this.logPlanInfoUserFields(planInfo);
 		this.logQuotaSnapshots(planInfo.quota_snapshots);
 		this.logLegacyPlanFields(planInfo);
@@ -6471,7 +6474,7 @@ Return ONLY the JSON object, no markdown formatting, no explanations.`;
 		period: UsageAnalysisPeriod;
 		lastUpdated: string;
 	}> {
-		return _calculateMaturityScores(this._lastCustomizationMatrix, (useCache) => this.calculateUsageAnalysisStats(useCache, preloaded), useCache);
+		return _calculateMaturityScores(this._lastCustomizationMatrix, (useCache) => this.calculateUsageAnalysisStats(useCache, preloaded), useCache, this._copilotPlanResolved?.isMCPEnabled);
 	}
 
 	public async showMaturity(): Promise<void> {
