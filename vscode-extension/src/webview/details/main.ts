@@ -221,7 +221,7 @@ setCompactNumbers(stats.compactNumbers !== false);
 const root = document.getElementById('root');
 if (!root) { return; }
 
-const projectedTokens = Math.round(calculateProjection(stats.last30Days.tokens));
+const projectedTokens = Math.round(calculateProjection(stats.last30Days.tokens + (stats.last30Days.cachedTokens ?? 0) + stats.last30Days.thinkingTokens));
 const projectedSessions = Math.round(calculateProjection(stats.last30Days.sessions));
 const projectedCo2 = calculateProjection(stats.last30Days.co2);
 const projectedWater = calculateProjection(stats.last30Days.waterUsage);
@@ -330,11 +330,9 @@ function outputTokenCell(p: PeriodStats): string {
 
 function totalTokenCell(p: PeriodStats): string {
 	const modelTotal = sumInputTokens(p) + sumOutputTokens(p);
-	// When actual tokens (from debug logs) are available, prefer p.tokens — it
-	// captures every llm_request event including those without model attribution,
-	// matching the value shown in the status bar. Otherwise prefer modelTotal
-	// (per-request API data), then fall back to the text-based estimate.
-	if ((p.actualTokens ?? 0) > 0) { return formatCompact(p.tokens); }
+	if ((p.actualTokens ?? 0) > 0) {
+		return formatCompact(p.tokens + (p.cachedTokens ?? 0) + p.thinkingTokens);
+	}
 	return formatCompact(modelTotal > 0 ? modelTotal : p.tokens);
 }
 
