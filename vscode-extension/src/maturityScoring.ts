@@ -494,17 +494,17 @@ function _scoreAgentic(p: UsageAnalysisPeriod): CategoryScore {
 	return { stage, evidence, tips: _agBuildTips(stage) };
 }
 
-function _tuBuildTips(stage: Stage, mcpServers: string[]): string[] {
+function _tuBuildTips(stage: Stage, mcpServers: string[], isMCPDisabled?: boolean): string[] {
 	const tips: string[] = [];
 	if (stage < 2) { tips.push('Try [agent mode](https://code.visualstudio.com/docs/copilot/agents/overview) to let Copilot use built-in tools for file operations and terminal commands'); }
 	if (stage < 3) {
-		if (mcpServers.length === 0) { tips.push('Set up [MCP servers](https://code.visualstudio.com/docs/copilot/customization/mcp-servers) to connect Copilot to external tools (databases, APIs, cloud services)'); }
-		else { tips.push('Explore [GitHub integrations](https://code.visualstudio.com/docs/copilot/agents/agent-tools) and advanced tools like editFiles and run_in_terminal'); }
+		if (mcpServers.length === 0 && !isMCPDisabled) { tips.push('Set up [MCP servers](https://code.visualstudio.com/docs/copilot/customization/mcp-servers) to connect Copilot to external tools (databases, APIs, cloud services)'); }
+		else if (mcpServers.length > 0) { tips.push('Explore [GitHub integrations](https://code.visualstudio.com/docs/copilot/agents/agent-tools) and advanced tools like editFiles and run_in_terminal'); }
 	}
 	if (stage < 4) {
 		if (mcpServers.length === 1) { tips.push('Add more [MCP servers](https://code.visualstudio.com/docs/copilot/customization/mcp-servers) to expand Copilot\'s capabilities - check the VS Code MCP registry'); }
-		else if (mcpServers.length === 0) { tips.push('Explore the [VS Code MCP registry](https://code.visualstudio.com/docs/copilot/customization/mcp-servers) for tools that integrate with your workflow'); }
-		else { tips.push('You\'re using multiple MCP servers - keep exploring advanced tool combinations'); }
+		else if (mcpServers.length === 0 && !isMCPDisabled) { tips.push('Explore the [VS Code MCP registry](https://code.visualstudio.com/docs/copilot/customization/mcp-servers) for tools that integrate with your workflow'); }
+		else if (mcpServers.length > 0) { tips.push('You\'re using multiple MCP servers - keep exploring advanced tool combinations'); }
 	}
 	return tips;
 }
@@ -579,7 +579,7 @@ function _tuAddMcpEvidence(evidence: string[], p: UsageAnalysisPeriod, stage: St
 	return { stage: result, mcpServers };
 }
 
-function _scoreToolUsage(p: UsageAnalysisPeriod): CategoryScore {
+function _scoreToolUsage(p: UsageAnalysisPeriod, isMCPEnabled?: boolean): CategoryScore {
 	const evidence: string[] = [];
 	let stage: Stage = 1;
 	const T = STAGE_THRESHOLDS.toolUsage;
@@ -587,10 +587,15 @@ function _scoreToolUsage(p: UsageAnalysisPeriod): CategoryScore {
 	stage = _tuAddBasicToolEvidence(evidence, p, stage);
 	stage = _tuAddWorkspaceAgentEvidence(evidence, p, stage);
 	stage = _tuAddAdvancedToolEvidence(evidence, p, stage, T);
-	
-	const { stage: finalStage, mcpServers } = _tuAddMcpEvidence(evidence, p, stage, T);
 
-	return { stage: finalStage, evidence, tips: _tuBuildTips(finalStage, mcpServers) };
+	const mcpDisabled = isMCPEnabled === false;
+	if (!mcpDisabled) {
+		const { stage: mcpStage, mcpServers: mcpServersResult } = _tuAddMcpEvidence(evidence, p, stage, T);
+		stage = mcpStage;
+		return { stage, evidence, tips: _tuBuildTips(stage, mcpServersResult) };
+	}
+
+	return { stage, evidence, tips: _tuBuildTips(stage, [], mcpDisabled) };
 }
 
 function _buildCustomizationStage4Tip(matrix: WorkspaceCustomizationMatrix | undefined, totalRepos: number, reposWithCustomization: number): string {
@@ -1004,7 +1009,7 @@ function _calcFluencyAg(fd: FluencyInputData, cv: FluencyVars): FluencyStageResu
 	return { stage, tips };
 }
 
-function _calcFluencyTu(fd: FluencyInputData, cv: FluencyVars): FluencyStageResult {
+function _calcFluencyTu(fd: FluencyInputData, cv: FluencyVars, isMCPEnabled?: boolean): FluencyStageResult {
 	const T = STAGE_THRESHOLDS.toolUsage;
 	let stage: Stage = 1;
 	if (cv.nonAutoToolCount > 0) { stage = 2; }
@@ -1012,17 +1017,18 @@ function _calcFluencyTu(fd: FluencyInputData, cv: FluencyVars): FluencyStageResu
 	const advancedToolIds = ["github_pull_request", "github_repo", "run_in_terminal", "editFiles", "listFiles"];
 	const usedAdvancedCount = advancedToolIds.filter(t => (fd.toolCallsByTool[t] ?? 0) > 0).length;
 	if (usedAdvancedCount >= T.stage3MinAdvancedTools) { stage = promoteStage(stage, 3); }
-	if (fd.mcpTotal > 0) { stage = promoteStage(stage, 3); }
-	if (Object.keys(fd.mcpByServer).length >= T.stage4MinMcpServers) { stage = 4; }
+	if (isMCPEnabled !== false && fd.mcpTotal > 0) { stage = promoteStage(stage, 3); }
+	if (isMCPEnabled !== false && Object.keys(fd.mcpByServer).length >= T.stage4MinMcpServers) { stage = 4; }
 	const tips: string[] = [];
 	if (stage < 2) { tips.push("Try agent mode to let Copilot use built-in tools for file operations and terminal commands"); }
 	if (stage < 3) {
-		if (fd.mcpTotal === 0) { tips.push("Set up MCP servers to connect Copilot to external tools (databases, APIs, cloud services)"); }
-		else { tips.push("Explore GitHub integrations and advanced tools like editFiles and run_in_terminal"); }
+		if (fd.mcpTotal === 0 && isMCPEnabled !== false) { tips.push("Set up MCP servers to connect Copilot to external tools (databases, APIs, cloud services)"); }
+		else if (fd.mcpTotal > 0) { tips.push("Explore GitHub integrations and advanced tools like editFiles and run_in_terminal"); }
 	}
 	if (stage < 4) {
 		if (Object.keys(fd.mcpByServer).length === 1) { tips.push("Add more MCP servers to expand Copilot's capabilities"); }
-		else if (fd.mcpTotal === 0) { tips.push("Explore MCP servers for tools that integrate with your workflow"); }
+		else if (fd.mcpTotal === 0 && isMCPEnabled !== false) { tips.push("Explore MCP servers for tools that integrate with your workflow"); }
+		else if (fd.mcpTotal > 0) { tips.push("Keep exploring advanced tool combinations"); }
 	}
 	return { stage, tips };
 }
@@ -1131,14 +1137,14 @@ function _buildFluencyCategories(pe: FluencyStageResult, ce: FluencyStageResult,
 	];
 }
 
-export function calculateFluencyScoreForTeamMember(fd: FluencyInputData, dashboardSessions: number): { stage: number; label: string; categories: { category: string; icon: string; stage: number; tips: string[] }[] } {
+export function calculateFluencyScoreForTeamMember(fd: FluencyInputData, dashboardSessions: number, isMCPEnabled?: boolean): { stage: number; label: string; categories: { category: string; icon: string; stage: number; tips: string[] }[] } {
 	const cv = _buildFluencyVars(fd);
 	const effectiveSessions = Math.max(dashboardSessions, fd.sessionCount);
 	
 	const pe = _calcFluencyPE(fd, cv);
 	const ce = _calcFluencyCE(fd, cv);
 	const ag = _calcFluencyAg(fd, cv);
-	const tu = _calcFluencyTu(fd, cv);
+	const tu = _calcFluencyTu(fd, cv, isMCPEnabled);
 	const cu = _calcFluencyCu(fd, cv);
 	const wi = _calcFluencyWi(fd, cv, effectiveSessions);
 	
@@ -1157,7 +1163,7 @@ export function calculateFluencyScoreForTeamMember(fd: FluencyInputData, dashboa
  * Overall stage = median of the 6 category scores.
  * @param useCache If true, use cached usage stats. If false, force recalculation.
  */
-export async function calculateMaturityScores(lastCustomizationMatrix: WorkspaceCustomizationMatrix | undefined, calculateUsageAnalysisStatsFn: (useCache?: boolean) => Promise<UsageAnalysisStats>, useCache = true): Promise<{
+export async function calculateMaturityScores(lastCustomizationMatrix: WorkspaceCustomizationMatrix | undefined, calculateUsageAnalysisStatsFn: (useCache?: boolean) => Promise<UsageAnalysisStats>, useCache = true, isMCPEnabled?: boolean): Promise<{
 	overallStage: number;
 	overallLabel: string;
 	categories: { category: string; icon: string; stage: number; evidence: string[]; tips: string[] }[];
@@ -1170,7 +1176,7 @@ export async function calculateMaturityScores(lastCustomizationMatrix: Workspace
 	const pe = _scorePromptEngineering(p);
 	const ce = _scoreContextEngineering(p);
 	const ag = _scoreAgentic(p);
-	const tu = _scoreToolUsage(p);
+	const tu = _scoreToolUsage(p, isMCPEnabled);
 	const cu = _scoreCustomization(p, lastCustomizationMatrix);
 	const wi = _scoreWorkflowIntegration(p);
 
