@@ -20,25 +20,25 @@ function getPricingSourceForEditor(editor: string): 'provider' | 'copilot' {
 
 /** Prefix-to-billing-provider lookup table, checked in order. */
 const MODEL_PROVIDER_PREFIXES: Array<[string, string]> = [
-	['claude', 'Anthropic'],
 	['anthropic', 'Anthropic'],
-	['gemini', 'Google'],
-	['google', 'Google'],
-	['mistral', 'Mistral AI'],
+	['claude', 'Anthropic'],
 	['codestral', 'Mistral AI'],
-	['magistral', 'Mistral AI'],
-	['ministral', 'Mistral AI'],
 	['devstral', 'Mistral AI'],
-	['pixtral', 'Mistral AI'],
+	['gemini', 'Google'],
+	['goldeneye', 'xAI'],
+	['google', 'Google'],
 	['gpt', 'OpenAI'],
+	['grok', 'xAI'],
+	['magistral', 'Mistral AI'],
+	['mai-', 'Microsoft'],
+	['ministral', 'Mistral AI'],
+	['mistral', 'Mistral AI'],
 	['o1', 'OpenAI'],
 	['o3', 'OpenAI'],
 	['o4', 'OpenAI'],
-	['grok', 'xAI'],
-	['raptor', 'xAI'],
-	['goldeneye', 'xAI'],
+	['pixtral', 'Mistral AI'],
 	['qwen', 'Alibaba'],
-	['mai-', 'Microsoft'],
+	['raptor', 'xAI'],
 ];
 
 /**

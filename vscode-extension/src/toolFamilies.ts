@@ -16,18 +16,18 @@ export interface ToolFamily {
 /** Default tool family definitions. Tool names are matched against normalized names in outputTokensByTool. */
 export const DEFAULT_TOOL_FAMILIES: ToolFamily[] = [
 	{
+		id: 'code-intelligence',
+		name: 'Code Intelligence',
+		builtIn: ['get_errors', 'hover', 'get_references', 'get_definition'],
+		alternatives: ['lsp', 'diagnostics', 'symbol_lookup'],
+		description: 'Tools that query language-server or IDE intelligence.',
+	},
+	{
 		id: 'reading',
 		name: 'File Reading',
 		builtIn: ['read', 'view', 'cat'],
 		alternatives: ['lean-ctx', 'read_file', 'copilot_readFile'],
 		description: 'Tools that read file contents into context.',
-	},
-	{
-		id: 'search',
-		name: 'Search & Discovery',
-		builtIn: ['search', 'grep', 'rg', 'glob', 'find'],
-		alternatives: ['symdex', 'search_files', 'copilot_searchFiles'],
-		description: 'Tools that search the codebase for files or text patterns.',
 	},
 	{
 		id: 'writing',
@@ -37,18 +37,18 @@ export const DEFAULT_TOOL_FAMILIES: ToolFamily[] = [
 		description: 'Tools that create or modify files.',
 	},
 	{
+		id: 'search',
+		name: 'Search & Discovery',
+		builtIn: ['search', 'grep', 'rg', 'glob', 'find'],
+		alternatives: ['symdex', 'search_files', 'copilot_searchFiles'],
+		description: 'Tools that search the codebase for files or text patterns.',
+	},
+	{
 		id: 'shell',
 		name: 'Shell / Terminal',
 		builtIn: ['run_in_terminal', 'bash', 'shell'],
 		alternatives: ['run_command', 'execute_command'],
 		description: 'Tools that execute shell commands.',
-	},
-	{
-		id: 'code-intelligence',
-		name: 'Code Intelligence',
-		builtIn: ['get_errors', 'hover', 'get_references', 'get_definition'],
-		alternatives: ['lsp', 'diagnostics', 'symbol_lookup'],
-		description: 'Tools that query language-server or IDE intelligence.',
 	},
 ];
 

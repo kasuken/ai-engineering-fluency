@@ -748,15 +748,15 @@ toolsLabel.append(toolsLabelStrong);
 const toolsList = document.createElement('ul');
 toolsList.className = 'empty-state-steps';
 const toolsTexts = [
-'�� VS Code / VS Code Insiders / VSCodium — GitHub Copilot Chat extension',
-'🖱️ Cursor, 🌊 Windsurf — built-in AI chat',
-'🖥️ Visual Studio 2022+ — GitHub Copilot Chat extension',
-'🟢 OpenCode, 🦀 Crush — terminal-based coding agents',
-'🤖 Claude Code — Anthropic\'s CLI coding agent',
-'💎 Gemini CLI — Google\'s open-source CLI coding agent',
 '🚀 Antigravity — Google\'s Gemini-powered desktop IDE',
-'π Pi — Mistral-powered terminal coding agent',
+'🤖 Claude Code — Anthropic\'s CLI coding agent',
 '💻 Copilot CLI — GitHub Copilot in the terminal',
+'🖱️ Cursor, 🌊 Windsurf — built-in AI chat',
+'💎 Gemini CLI — Google\'s open-source CLI coding agent',
+'🟢 OpenCode, 🦀 Crush — terminal-based coding agents',
+'π Pi — Mistral-powered terminal coding agent',
+'🖥️ Visual Studio 2022+ — GitHub Copilot Chat extension',
+'💙 VS Code / VS Code Insiders / VSCodium — GitHub Copilot Chat extension',
 ];
 toolsTexts.forEach(text => {
 const li = document.createElement('li');

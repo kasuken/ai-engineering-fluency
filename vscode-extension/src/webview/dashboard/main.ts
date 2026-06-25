@@ -335,7 +335,7 @@ function buildModelBreakdown(modelUsage: ModelUsage): HTMLElement {
       model,
       tokens: usage.inputTokens + usage.outputTokens,
     }))
-    .sort((a, b) => b.tokens - a.tokens);
+    .sort((a, b) => b.tokens - a.tokens || a.model.localeCompare(b.model));
 
   for (const { model, tokens } of models) {
     const item = el("div", "model-item");
