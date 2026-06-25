@@ -962,4 +962,9 @@
   ,"mcp__computer-use__screenshot": "MCP: Computer Use  Screenshot"
   ,"CronList": "Cron List"
   ,"mcp__scheduled-tasks__list_scheduled_tasks": "MCP: Scheduled Tasks - List Scheduled Tasks"
+  ,"m_accept_workiq_eula": "WorkIQ EULA Acceptance"
+  ,"mcp_azure_bicep_m_get_bicep_best_practices": "Azure Bicep MCP (Local): Get Best Practices"
+  ,"mcp_azure_bicep_m_list_avm_metadata": "Azure Bicep MCP (Remote): List AVM Metadata"
+  ,"mcp_azure_mcp_policy": "Azure MCP Policy"
+  ,"workiq_search_emails": "WorkIQ Search Emails"
 }
