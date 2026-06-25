@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "description": "Model pricing data - costs per million tokens. Each model has direct provider/API pricing at the top level (used as a reference); models billed through GitHub Copilot AI Credits also include a `copilotPricing` block reflecting GitHub's published per-token rates (1 AI credit = $0.01).",
   "metadata": {
-    "lastUpdated": "2026-06-21",
+    "lastUpdated": "2026-06-25",
     "sources": [
       {
         "name": "OpenAI API Pricing",
@@ -53,7 +53,7 @@
         "name": "DeepSeek API Pricing",
         "url": "https://platform.deepseek.com/api-docs/pricing",
         "retrievedDate": "2026-06-21",
-        "note": "deepseek-v4-flash: $0.09/M input, $0.18/M output; free tier (deepseek-v4-flash-free via OpenRouter) is $0"
+        "note": "deepseek-v4-flash: $0.14/M input (miss), $0.0028/M input (cache hit), $0.28/M output; free tier (deepseek-v4-flash-free via OpenRouter) is $0"
       },
       {
         "name": "GitHub Copilot Models and Pricing",
@@ -1101,9 +1101,9 @@
       ]
     },
     "deepseek-v4-flash": {
-      "inputCostPerMillion": 0.09,
-      "outputCostPerMillion": 0.18,
-      "cachedInputCostPerMillion": 0.018,
+      "inputCostPerMillion": 0.14,
+      "outputCostPerMillion": 0.28,
+      "cachedInputCostPerMillion": 0.0028,
       "category": "DeepSeek models",
       "tier": "standard",
       "multiplier": 0.0,
