@@ -2,6 +2,34 @@
 
 All notable changes to the VS Code extension will be documented in this file.
 
+## [Unreleased]
+
+### Features
+- Tool Curation tab: analyze tool usage patterns, identify unused or underused tools (#1410)
+- Per-provider budget costs in status bar tooltip (#1412)
+- Cost split by editor and billing provider in analysis views (#1412)
+- Microsoft Scout editor session support (#1391)
+- Cursor editor session support (#1357)
+- Externalized JSON config files from webview bundles for easier customization (#1393)
+- Add 17+ friendly tool names across multiple issues
+
+### Bug Fixes
+- Align total tokens to include cached and thinking tokens (#1460)
+- Fix multi-root .code-workspace folder customization discovery (#1467)
+- Fix session state fields for messageIds and turnStatusCounts (#1462)
+- Fix UI colors for VS Code light mode (#1458)
+- Fix Scout session detection and display name labeling
+- Fix OpenCode SQLite DB session detection and add DeepSeek V4 Flash pricing (#1443)
+- Fix deprecated @vscode/webview-ui-toolkit replacement with @vscode-elements/elements
+- Fix unknown models showing "$0 cost" instead of gpt-4o-mini fallback
+- Fix per-tool suppression and background update stats refresh
+- Fix security vulnerabilities via npm overrides
+
+### Improvements
+- Added comprehensive unit tests improving coverage to 87.60% (#1375, #1406, #1436)
+- Enhanced JetBrains session parsing with turn-level metadata (#1455)
+- Code refactoring and dependency updates
+
 ## [0.11.6] - 2026-06-07
 
 ### Features
