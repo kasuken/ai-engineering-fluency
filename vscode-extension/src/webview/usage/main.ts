@@ -1104,6 +1104,23 @@ function sanitizeInsights(rawInsights: any[]): EvaluatedInsight[] {
 		}));
 }
 
+function _sanitizeCurationAnalysis(rawCa: unknown): ToolCurationAnalysis | null {
+	if (!rawCa || typeof rawCa !== 'object') { return null; }
+	const ca = rawCa as Partial<ToolCurationAnalysis>;
+	return {
+		windowDays: typeof ca.windowDays === 'number' ? ca.windowDays : 30,
+		availableTools: Array.isArray(ca.availableTools) ? ca.availableTools : [],
+		usedTools: Array.isArray(ca.usedTools) ? ca.usedTools : [],
+		unusedTools: Array.isArray(ca.unusedTools) ? ca.unusedTools : [],
+		underusedMcpServers: Array.isArray(ca.underusedMcpServers) ? ca.underusedMcpServers : [],
+		underusedAgentPlugins: Array.isArray(ca.underusedAgentPlugins) ? ca.underusedAgentPlugins : [],
+		estimatedPromptBloat: ca.estimatedPromptBloat && typeof ca.estimatedPromptBloat === 'object'
+			? ca.estimatedPromptBloat
+			: { totalTokens: 0, byServer: {} },
+		recommendations: Array.isArray(ca.recommendations) ? ca.recommendations : [],
+	};
+}
+
 function sanitizeStats(raw: any): UsageAnalysisStats | null {
 	if (!raw || typeof raw !== 'object') {
 		traceCurationOnce('sanitize-invalid-root', 'sanitizeStats.invalidRoot');
@@ -1156,24 +1173,13 @@ function sanitizeStats(raw: any): UsageAnalysisStats | null {
 
 		// Pass through curationAnalysis (already structured server-side).
 		// Normalize required array/object fields so rendering paths don't throw on partial payloads.
-		if (raw.curationAnalysis && typeof raw.curationAnalysis === 'object') {
-			const ca = raw.curationAnalysis as Partial<ToolCurationAnalysis>;
-			sanitized.curationAnalysis = {
-				windowDays: typeof ca.windowDays === 'number' ? ca.windowDays : 30,
-				availableTools: Array.isArray(ca.availableTools) ? ca.availableTools : [],
-				usedTools: Array.isArray(ca.usedTools) ? ca.usedTools : [],
-				unusedTools: Array.isArray(ca.unusedTools) ? ca.unusedTools : [],
-				underusedMcpServers: Array.isArray(ca.underusedMcpServers) ? ca.underusedMcpServers : [],
-				underusedAgentPlugins: Array.isArray(ca.underusedAgentPlugins) ? ca.underusedAgentPlugins : [],
-				estimatedPromptBloat: ca.estimatedPromptBloat && typeof ca.estimatedPromptBloat === 'object'
-					? ca.estimatedPromptBloat
-					: { totalTokens: 0, byServer: {} },
-				recommendations: Array.isArray(ca.recommendations) ? ca.recommendations : [],
-			};
+		const curationAnalysis = _sanitizeCurationAnalysis(raw.curationAnalysis);
+		if (curationAnalysis) {
+			sanitized.curationAnalysis = curationAnalysis;
 			traceCuration('sanitizeStats.curation.present', {
-				availableTools: sanitized.curationAnalysis.availableTools.length,
-				unusedTools: sanitized.curationAnalysis.unusedTools.length,
-				unusedServers: sanitized.curationAnalysis.underusedMcpServers.filter(s => s && s.usedToolCount === 0).length,
+				availableTools: curationAnalysis.availableTools.length,
+				unusedTools: curationAnalysis.unusedTools.length,
+				unusedServers: curationAnalysis.underusedMcpServers.filter(s => s && s.usedToolCount === 0).length,
 			});
 		} else {
 			traceCurationOnce('sanitize-no-curation', 'sanitizeStats.curation.missing');
@@ -1861,85 +1867,86 @@ function buildCurationSummaryHtml(availableTools: AvailableToolEntry[], unusedTo
 	</div>`;
 }
 
+type McpServerEntry = ToolCurationAnalysis['underusedMcpServers'][number];
+
+function _mcpSourceLabel(s: McpServerEntry): string {
+	if (s.extensionId) { return 'Extension'; }
+	if (!s.configFiles || s.configFiles.length === 0) { return 'Settings'; }
+	const labels = new Set<string>();
+	for (const f of s.configFiles) {
+		const p = f.replace(/\\/g, '/');
+		if (p.includes('/.vscode/')) { labels.add('Workspace'); }
+		else if (p.includes('/.vs/')) { labels.add('Workspace (VS)'); }
+		else if (p.includes('/.cursor/')) { labels.add('Workspace (Cursor)'); }
+		else if (p.endsWith('/.mcp.json')) { labels.add(p.split('/').slice(-2).join('/')); }
+		else { labels.add('Config file'); }
+	}
+	return [...labels].join(', ');
+}
+
+function _buildMcpSourceOpenBtn(s: McpServerEntry, sourceTip: string): string {
+	if (s.configFiles && s.configFiles.length === 1) {
+		return ` <button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(s.configFiles[0])}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open ${escapeHtml(s.configFiles[0])}">open</button>`;
+	}
+	if (s.configFiles && s.configFiles.length > 1) {
+		return ` <button class="curation-file-btn" data-command="openFileFromList" data-paths="${escapeHtml(JSON.stringify(s.configFiles))}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="${escapeHtml(sourceTip)}">open</button>`;
+	}
+	if (s.extensionId) {
+		return ` <button class="curation-file-btn" data-command="manageExtension" data-extension-id="${escapeHtml(s.extensionId)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open Extensions view for ${escapeHtml(s.extensionId)}">open</button>`;
+	}
+	return ` <button class="curation-file-btn" data-command="searchMcpExtensions" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Browse MCP extensions in the marketplace">open</button>`;
+}
+
+function _buildMcpActionCell(s: McpServerEntry): string {
+	if (s.extensionId) {
+		return `<button class="curation-file-btn" data-command="manageExtension" data-extension-id="${escapeHtml(s.extensionId)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open the Extensions view for ${escapeHtml(s.extensionId)} (disable or uninstall to reclaim prompt budget)">Manage Extension</button>`;
+	}
+	if (!s.configFiles || s.configFiles.length === 0) {
+		return `<button class="curation-file-btn" data-command="openToolPicker" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open VS Code tool selection menu">Change Tools</button>`;
+	}
+	if (s.configFiles.length === 1) {
+		return `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(s.configFiles[0])}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open ${escapeHtml(s.configFiles[0])}">Change Tools</button>`;
+	}
+	return `<button class="curation-file-btn" data-command="openFileFromList" data-paths="${escapeHtml(JSON.stringify(s.configFiles))}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Defined in ${s.configFiles.length} config files">Change Tools</button>`;
+}
+
+function _buildMcpServerRowHtml(s: McpServerEntry, bloat: ToolCurationAnalysis['estimatedPromptBloat']): string {
+	const b = bloat.byServer[s.server] ?? 0;
+	const sourceLabel = _mcpSourceLabel(s);
+	const sourceTip = s.configFiles?.join('\n') ?? s.extensionId ?? '';
+	const sourceOpenBtn = _buildMcpSourceOpenBtn(s, sourceTip);
+	const actionCell = _buildMcpActionCell(s);
+	const notConnected = s.availableToolCount === 0;
+	return `<tr class="${s.usedToolCount > 0 ? 'mcp-has-usage' : ''}">
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${escapeHtml(s.server)}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;" title="${escapeHtml(sourceTip)}">${escapeHtml(sourceLabel)}${sourceOpenBtn}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${notConnected ? '<em style="color:var(--text-secondary)">not connected</em>' : s.availableToolCount}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${notConnected ? '—' : s.usedToolCount}</td>
+		<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${b > 0 ? `~${b.toLocaleString()} tokens` : '—'}</td>
+		<td style="padding:5px 8px; font-size:12px;">${actionCell}</td>
+	</tr>`;
+}
+
+function _buildMcpJsonLink(allServers: McpServerEntry[]): string {
+	const allConfigFiles = [...new Set(
+		allServers.filter(s => !s.extensionId).flatMap(s => s.configFiles ?? [])
+	)];
+	const preferredFile = allConfigFiles.find(f => f.replace(/\\/g, '/').endsWith('.vscode/mcp.json')) ?? allConfigFiles[0];
+	if (!preferredFile) { return `<code>.vscode/mcp.json</code>`; }
+	const displayName = preferredFile.replace(/\\/g, '/').split('/').slice(-3).join('/');
+	return `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(preferredFile)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="${escapeHtml(preferredFile)}">${escapeHtml(displayName)}</button>`;
+}
+
 function buildUnusedMcpHtml(underusedMcpServers: ToolCurationAnalysis['underusedMcpServers'], bloat: ToolCurationAnalysis['estimatedPromptBloat'], windowDays: number): string {
 	// Show all servers, zero-usage first, then partially used, then fully used.
 	const allServers = [...underusedMcpServers].sort((a, b) => {
-		// Sort key: zero-usage → partial-usage → fully-used
 		const aKey = a.usedToolCount === 0 ? 0 : a.usedToolCount < a.availableToolCount ? 1 : 2;
 		const bKey = b.usedToolCount === 0 ? 0 : b.usedToolCount < b.availableToolCount ? 1 : 2;
 		return aKey !== bKey ? aKey - bKey : a.usedToolCount - b.usedToolCount;
 	});
 	if (allServers.length === 0) { return ''; }
-	const toggleId = 'mcp-hide-used-toggle';
-	/** Derive a human-readable scope label from a server's config files / extension id. */
-	function mcpSourceLabel(s: typeof allServers[0]): string {
-		if (s.extensionId) { return 'Extension'; }
-		if (!s.configFiles || s.configFiles.length === 0) { return 'Settings'; }
-		const labels = new Set<string>();
-		for (const f of s.configFiles) {
-			const p = f.replace(/\\/g, '/');
-			if (p.includes('/.vscode/')) { labels.add('Workspace'); }
-			else if (p.includes('/.vs/')) { labels.add('Workspace (VS)'); }
-			else if (p.includes('/.cursor/')) { labels.add('Workspace (Cursor)'); }
-			else if (p.endsWith('/.mcp.json')) {
-				// Could be workspace root or user home — show last 2 segments as hint
-				const parts = p.split('/');
-				labels.add(parts.slice(-2).join('/'));
-			} else {
-				labels.add('Config file');
-			}
-		}
-		return [...labels].join(', ');
-	}
-
-	const rows = allServers.map(s => {
-		const b = bloat.byServer[s.server] ?? 0;
-		const sourceLabel = mcpSourceLabel(s);
-		const sourceTip = s.configFiles?.join('\n') ?? s.extensionId ?? '';
-		let sourceOpenBtn = '';
-		if (s.configFiles && s.configFiles.length === 1) {
-			sourceOpenBtn = ` <button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(s.configFiles[0])}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open ${escapeHtml(s.configFiles[0])}">open</button>`;
-		} else if (s.configFiles && s.configFiles.length > 1) {
-			sourceOpenBtn = ` <button class="curation-file-btn" data-command="openFileFromList" data-paths="${escapeHtml(JSON.stringify(s.configFiles))}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="${escapeHtml(sourceTip)}">open</button>`;
-		} else if (s.extensionId) {
-			sourceOpenBtn = ` <button class="curation-file-btn" data-command="manageExtension" data-extension-id="${escapeHtml(s.extensionId)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open Extensions view for ${escapeHtml(s.extensionId)}">open</button>`;
-		} else {
-			// Configured via VS Code UI settings — search the marketplace for MCP extensions
-			sourceOpenBtn = ` <button class="curation-file-btn" data-command="searchMcpExtensions" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Browse MCP extensions in the marketplace">open</button>`;
-		}
-		let actionCell: string;
-		if (s.extensionId) {
-			actionCell = `<button class="curation-file-btn" data-command="manageExtension" data-extension-id="${escapeHtml(s.extensionId)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open the Extensions view for ${escapeHtml(s.extensionId)} (disable or uninstall to reclaim prompt budget)">Manage Extension</button>`;
-		} else if (!s.configFiles || s.configFiles.length === 0) {
-			actionCell = `<button class="curation-file-btn" data-command="openToolPicker" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open VS Code tool selection menu">Change Tools</button>`;
-		} else if (s.configFiles.length === 1) {
-			actionCell = `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(s.configFiles[0])}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Open ${escapeHtml(s.configFiles[0])}">Change Tools</button>`;
-		} else {
-			actionCell = `<button class="curation-file-btn" data-command="openFileFromList" data-paths="${escapeHtml(JSON.stringify(s.configFiles))}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="Defined in ${s.configFiles.length} config files">Change Tools</button>`;
-		}
-		const notConnected = s.availableToolCount === 0;
-		return `<tr class="${s.usedToolCount > 0 ? 'mcp-has-usage' : ''}">
-			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;">${escapeHtml(s.server)}</td>
-			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px; white-space:nowrap;" title="${escapeHtml(sourceTip)}">${escapeHtml(sourceLabel)}${sourceOpenBtn}</td>
-			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${notConnected ? '<em style="color:var(--text-secondary)">not connected</em>' : s.availableToolCount}</td>
-			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${notConnected ? '—' : s.usedToolCount}</td>
-			<td style="padding:5px 8px; color:var(--text-primary); font-size:12px;">${b > 0 ? `~${b.toLocaleString()} tokens` : '—'}</td>
-			<td style="padding:5px 8px; font-size:12px;">${actionCell}</td>
-		</tr>`;
-	}).join('');
-	// Find the best config file to link in the tip — prefer .vscode/mcp.json, then any file.
-	const allConfigFiles = [...new Set(
-		allServers.filter(s => !s.extensionId).flatMap(s => s.configFiles ?? [])
-	)];
-	const preferredFile = allConfigFiles.find(f => f.replace(/\\/g, '/').endsWith('.vscode/mcp.json'))
-		?? allConfigFiles[0];
-	let mcpJsonLink: string;
-	if (preferredFile) {
-		const displayName = preferredFile.replace(/\\/g, '/').split('/').slice(-3).join('/');
-		mcpJsonLink = `<button class="curation-file-btn" data-command="openFile" data-path="${escapeHtml(preferredFile)}" style="background:none;border:none;padding:0;cursor:pointer;color:var(--link-color);font-size:11px;text-decoration:underline;" title="${escapeHtml(preferredFile)}">${escapeHtml(displayName)}</button>`;
-	} else {
-		mcpJsonLink = `<code>.vscode/mcp.json</code>`;
-	}
+	const rows = allServers.map(s => _buildMcpServerRowHtml(s, bloat)).join('');
+	const mcpJsonLink = _buildMcpJsonLink(allServers);
 	const usedCount = allServers.filter(s => s.usedToolCount > 0).length;
 	const unusedCount = allServers.length - usedCount;
 	// Pure CSS checkbox trick: input and .mcp-table-wrap are siblings inside <details>;
@@ -2304,6 +2311,35 @@ function refreshInsightsPanel(insights: EvaluatedInsight[]): void {
 	updateTabButtonCount(insights);
 }
 
+function _postOpenFileFromList(pathsJson: string | null): void {
+	if (!pathsJson) { return; }
+	try {
+		const paths = JSON.parse(pathsJson) as string[];
+		vscode.postMessage({ command: 'openFileFromList', paths });
+	} catch (error) {
+		traceCuration('wireCurationButtons.badPathsJson', { error: error instanceof Error ? error.message : String(error) });
+	}
+}
+
+function _handleCurationBtnClick(btn: HTMLButtonElement): void {
+	const command = btn.getAttribute('data-command');
+	if (!command) { return; }
+	if (command === 'openFile') {
+		const filePath = btn.getAttribute('data-path');
+		if (filePath) { vscode.postMessage({ command: 'openFile', path: filePath }); }
+	} else if (command === 'openFileFromList') {
+		_postOpenFileFromList(btn.getAttribute('data-paths'));
+	} else if (command === 'manageExtension') {
+		const extensionId = btn.getAttribute('data-extension-id');
+		if (extensionId) { vscode.postMessage({ command: 'manageExtension', extensionId }); }
+	} else if (command === 'openAgentPlugins') {
+		const pluginName = btn.getAttribute('data-plugin-name') ?? '';
+		vscode.postMessage({ command: 'openAgentPlugins', pluginName });
+	} else {
+		vscode.postMessage({ command });
+	}
+}
+
 function wireCurationButtons(): void {
 	try {
 		const section = document.getElementById('section-tool-curation');
@@ -2316,43 +2352,14 @@ function wireCurationButtons(): void {
 		buttons.forEach(btn => {
 			btn.addEventListener('click', () => {
 				try {
-					const command = btn.getAttribute('data-command');
-					if (!command) { return; }
-					if (command === 'openFile') {
-						const filePath = btn.getAttribute('data-path');
-						if (filePath) { vscode.postMessage({ command: 'openFile', path: filePath }); }
-					} else if (command === 'openFileFromList') {
-						const pathsJson = btn.getAttribute('data-paths');
-						if (pathsJson) {
-							try {
-								const paths = JSON.parse(pathsJson) as string[];
-								vscode.postMessage({ command: 'openFileFromList', paths });
-							} catch (error) {
-								traceCuration('wireCurationButtons.badPathsJson', {
-									error: error instanceof Error ? error.message : String(error),
-								});
-							}
-						}
-					} else if (command === 'manageExtension') {
-						const extensionId = btn.getAttribute('data-extension-id');
-						if (extensionId) { vscode.postMessage({ command: 'manageExtension', extensionId }); }
-					} else if (command === 'openAgentPlugins') {
-						const pluginName = btn.getAttribute('data-plugin-name') ?? '';
-						vscode.postMessage({ command: 'openAgentPlugins', pluginName });
-					} else {
-						vscode.postMessage({ command });
-					}
+					_handleCurationBtnClick(btn);
 				} catch (error) {
-					traceCuration('wireCurationButtons.clickError', {
-						error: error instanceof Error ? error.message : String(error),
-					});
+					traceCuration('wireCurationButtons.clickError', { error: error instanceof Error ? error.message : String(error) });
 				}
 			});
 		});
 	} catch (error) {
-		traceCuration('wireCurationButtons.error', {
-			error: error instanceof Error ? error.message : String(error),
-		});
+		traceCuration('wireCurationButtons.error', { error: error instanceof Error ? error.message : String(error) });
 	}
 }
 

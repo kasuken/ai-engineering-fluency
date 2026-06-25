@@ -171,21 +171,29 @@ function _peQualifiesForStage4(totalInteractions: number, hasAgentMode: boolean,
 	const T = STAGE_THRESHOLDS.promptEngineering;
 	return totalInteractions >= T.stage4MinInteractions && hasAgentMode && (hasModelSwitching || usedSlashCommands.length >= T.stage4MinSlashCommands);
 }
+function _buildPeTipsForStage3(hasAgentMode: boolean, usedSlashCommands: string[], T: { stage3MinSlashCommands: number }): string[] {
+	const tips: string[] = [];
+	if (!hasAgentMode) { tips.push('Try [agent mode](https://code.visualstudio.com/docs/copilot/agents/overview) for multi-file changes'); }
+	if (usedSlashCommands.length < T.stage3MinSlashCommands) { tips.push('Use [slash commands](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts) like /explain, /fix, or /tests to give structured prompts'); }
+	return tips;
+}
+
+function _buildPeTipsForStage4(hasAgentMode: boolean, hasModelSwitching: boolean, usedSlashCommands: string[], autoUsageRatio: number, T: { stage4MinSlashCommands: number }): string[] {
+	const tips: string[] = [];
+	if (!hasAgentMode) { tips.push('Try [agent mode](https://code.visualstudio.com/docs/copilot/agents/overview) for autonomous, multi-step coding tasks'); }
+	if (!hasModelSwitching) { tips.push('Experiment with [different models](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_choose-a-language-model) for different tasks - use fast models for simple queries and reasoning models for complex problems'); }
+	if (autoUsageRatio === 0) { tips.push('Try the Auto model for cost-sensitive tasks so Copilot can pick the most efficient model for you'); }
+	else if (autoUsageRatio < 0.5) { tips.push('Use the Auto model more often when you want Copilot to balance quality and cost for you'); }
+	if (usedSlashCommands.length < T.stage4MinSlashCommands && hasAgentMode && hasModelSwitching) { tips.push('Explore more [slash commands](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts) like /explain, /tests, or /doc to diversify your prompting'); }
+	return tips;
+}
+
 function _buildPeTips(stage: Stage, hasAgentMode: boolean, hasModelSwitching: boolean, usedSlashCommands: string[], autoUsageRatio: number): string[] {
 	const T = STAGE_THRESHOLDS.promptEngineering;
 	const tips: string[] = [];
 	if (stage < 2) { tips.push('Try asking Copilot a question using the Chat panel'); }
-	if (stage < 3) {
-		if (!hasAgentMode) { tips.push('Try [agent mode](https://code.visualstudio.com/docs/copilot/agents/overview) for multi-file changes'); }
-		if (usedSlashCommands.length < T.stage3MinSlashCommands) { tips.push('Use [slash commands](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts) like /explain, /fix, or /tests to give structured prompts'); }
-	}
-	if (stage < 4) {
-		if (!hasAgentMode) { tips.push('Try [agent mode](https://code.visualstudio.com/docs/copilot/agents/overview) for autonomous, multi-step coding tasks'); }
-		if (!hasModelSwitching) { tips.push('Experiment with [different models](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_choose-a-language-model) for different tasks - use fast models for simple queries and reasoning models for complex problems'); }
-		if (autoUsageRatio === 0) { tips.push('Try the Auto model for cost-sensitive tasks so Copilot can pick the most efficient model for you'); }
-		else if (autoUsageRatio < 0.5) { tips.push('Use the Auto model more often when you want Copilot to balance quality and cost for you'); }
-		if (usedSlashCommands.length < T.stage4MinSlashCommands && hasAgentMode && hasModelSwitching) { tips.push('Explore more [slash commands](https://code.visualstudio.com/docs/copilot/chat/copilot-chat#_add-context-to-your-prompts) like /explain, /tests, or /doc to diversify your prompting'); }
-	}
+	if (stage < 3) { tips.push(..._buildPeTipsForStage3(hasAgentMode, usedSlashCommands, T)); }
+	if (stage < 4) { tips.push(..._buildPeTipsForStage4(hasAgentMode, hasModelSwitching, usedSlashCommands, autoUsageRatio, T)); }
 	return tips;
 }
 function _applyPeConversationStage(p: UsageAnalysisPeriod, evidence: string[], stage: Stage): Stage {
@@ -1009,16 +1017,19 @@ function _calcFluencyAg(fd: FluencyInputData, cv: FluencyVars): FluencyStageResu
 	return { stage, tips };
 }
 
-function _calcFluencyTu(fd: FluencyInputData, cv: FluencyVars, isMCPEnabled?: boolean): FluencyStageResult {
+function _calcFluencyTuStage(fd: FluencyInputData, cv: FluencyVars, isMCPEnabled: boolean | undefined): Stage {
 	const T = STAGE_THRESHOLDS.toolUsage;
-	let stage: Stage = 1;
-	if (cv.nonAutoToolCount > 0) { stage = 2; }
-	if (fd.workspaceAgentCount > 0) { stage = promoteStage(stage, 3); }
 	const advancedToolIds = ["github_pull_request", "github_repo", "run_in_terminal", "editFiles", "listFiles"];
 	const usedAdvancedCount = advancedToolIds.filter(t => (fd.toolCallsByTool[t] ?? 0) > 0).length;
+	let stage: Stage = cv.nonAutoToolCount > 0 ? 2 : 1;
+	if (fd.workspaceAgentCount > 0) { stage = promoteStage(stage, 3); }
 	if (usedAdvancedCount >= T.stage3MinAdvancedTools) { stage = promoteStage(stage, 3); }
 	if (isMCPEnabled !== false && fd.mcpTotal > 0) { stage = promoteStage(stage, 3); }
 	if (isMCPEnabled !== false && Object.keys(fd.mcpByServer).length >= T.stage4MinMcpServers) { stage = 4; }
+	return stage;
+}
+
+function _calcFluencyTuTips(fd: FluencyInputData, stage: Stage, isMCPEnabled: boolean | undefined): string[] {
 	const tips: string[] = [];
 	if (stage < 2) { tips.push("Try agent mode to let Copilot use built-in tools for file operations and terminal commands"); }
 	if (stage < 3) {
@@ -1030,7 +1041,12 @@ function _calcFluencyTu(fd: FluencyInputData, cv: FluencyVars, isMCPEnabled?: bo
 		else if (fd.mcpTotal === 0 && isMCPEnabled !== false) { tips.push("Explore MCP servers for tools that integrate with your workflow"); }
 		else if (fd.mcpTotal > 0) { tips.push("Keep exploring advanced tool combinations"); }
 	}
-	return { stage, tips };
+	return tips;
+}
+
+function _calcFluencyTu(fd: FluencyInputData, cv: FluencyVars, isMCPEnabled?: boolean): FluencyStageResult {
+	const stage = _calcFluencyTuStage(fd, cv, isMCPEnabled);
+	return { stage, tips: _calcFluencyTuTips(fd, stage, isMCPEnabled) };
 }
 
 function _calcFluencyCu(fd: FluencyInputData, cv: FluencyVars): FluencyStageResult {

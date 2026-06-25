@@ -329,6 +329,17 @@ function scanRecursivePattern(ctx: PatternScanContext, excludeDirs: string[]): C
 	return walkDirectoryForPattern(workspaceFolderPath, maxDepth, ctx, regex, excludeDirs);
 }
 
+function _runPatternScan(ctx: PatternScanContext, excludeDirs: string[]): CustomizationFileEntry[] {
+	const scanMode = ctx.pattern.scanMode ?? 'exact';
+	if (scanMode === 'exact') {
+		const entry = scanExactPattern(ctx);
+		return entry ? [entry] : [];
+	}
+	if (scanMode === 'oneLevel') { return scanOneLevelPattern(ctx, excludeDirs); }
+	if (scanMode === 'recursive') { return scanRecursivePattern(ctx, excludeDirs); }
+	return [];
+}
+
 /**
  * Scan a workspace folder for customization files according to `customizationPatterns.json`.
  */
@@ -344,15 +355,7 @@ export function scanWorkspaceCustomizationFiles(workspaceFolderPath: string): Cu
 	for (const pattern of (cfg.patterns ?? [])) {
 		try {
 			const ctx: PatternScanContext = { workspaceFolderPath, pattern, stalenessDays };
-			const scanMode = pattern.scanMode ?? 'exact';
-			if (scanMode === 'exact') {
-				const entry = scanExactPattern(ctx);
-				if (entry) { results.push(entry); }
-			} else if (scanMode === 'oneLevel') {
-				results.push(...scanOneLevelPattern(ctx, excludeDirs));
-			} else if (scanMode === 'recursive') {
-				results.push(...scanRecursivePattern(ctx, excludeDirs));
-			}
+			results.push(..._runPatternScan(ctx, excludeDirs));
 		} catch {
 			// ignore per-pattern errors
 		}
@@ -762,6 +765,16 @@ export async function extractRepositoryFromContentReferences(contentReferences: 
 	return undefined;
 }
 
+function _resolveCodeWorkspaceEntry(entry: unknown): string | undefined {
+	if (typeof entry !== 'object' || entry === null) { return undefined; }
+	const e = entry as { path?: unknown; uri?: unknown };
+	let folderPath: string | undefined;
+	if (typeof e.path === 'string') { folderPath = e.path; }
+	else if (typeof e.uri === 'string' && e.uri.startsWith('file://')) { folderPath = resolveFileUri(e.uri); }
+	if (!folderPath) { return undefined; }
+	try { return fs.realpathSync.native(folderPath); } catch { return folderPath; }
+}
+
 /**
  * Parse a `.code-workspace` multi-root workspace file and return the resolved folder paths.
  * Returns an empty array if the file cannot be read, is invalid JSON, or has no folders.
@@ -778,20 +791,8 @@ export function parseCodeWorkspaceFolders(codeWorkspacePath: string): string[] {
 		}
 		const folders: string[] = [];
 		for (const entry of obj.folders) {
-			if (typeof entry !== 'object' || entry === null) { continue; }
-			let folderPath: string | undefined;
-			if (typeof entry.path === 'string') {
-				folderPath = entry.path;
-			} else if (typeof entry.uri === 'string' && entry.uri.startsWith('file://')) {
-				folderPath = resolveFileUri(entry.uri);
-			}
-			if (!folderPath) { continue; }
-			try {
-				const resolved = fs.realpathSync.native(folderPath);
-				folders.push(resolved);
-			} catch {
-				folders.push(folderPath);
-			}
+			const resolved = _resolveCodeWorkspaceEntry(entry);
+			if (resolved) { folders.push(resolved); }
 		}
 		return folders;
 	} catch {

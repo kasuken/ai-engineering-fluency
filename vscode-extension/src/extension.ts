@@ -719,45 +719,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 					void vscode.window.showTextDocument(vscode.Uri.file(message.path));
 				}
 			},
-			openToolPicker:         async () => {
-				this.log('🔧 openToolPicker: handler invoked');
-				const allCommands = await vscode.commands.getCommands(true);
-				const configureToolsId = 'workbench.action.chat.configureTools';
-				const hasConfigure = allCommands.includes(configureToolsId);
-				this.log(`🔧 openToolPicker: '${configureToolsId}' registered = ${hasConfigure}`);
-
-				if (!hasConfigure) {
-					// Fallback for older VS Code: open chat panel + notify user
-					this.log('🔧 openToolPicker: command not registered, opening chat panel + notifying user');
-					await vscode.commands.executeCommand('workbench.action.chat.open');
-					void vscode.window.showInformationMessage(
-						'To manage tools, click the Tools (⚙) button in the GitHub Copilot Chat input area.'
-					);
-					return;
-				}
-
-				// ConfigureToolsAction requires:
-				//   1. chat in Agent mode (precondition)
-				//   2. a focused chat widget (chatWidgetService.lastFocusedWidget)
-				// Open + focus chat in agent mode first, then invoke the picker.
-				try {
-					this.log('🔧 openToolPicker: opening chat in agent mode');
-					await vscode.commands.executeCommand('workbench.action.chat.open', { mode: 'agent' });
-				} catch (err) {
-					this.log(`🔧 openToolPicker: chat.open failed: ${err instanceof Error ? err.message : String(err)}`);
-				}
-
-				try {
-					this.log(`🔧 openToolPicker: executing '${configureToolsId}'`);
-					await vscode.commands.executeCommand(configureToolsId);
-					this.log('🔧 openToolPicker: command executed successfully');
-				} catch (err) {
-					this.log(`🔧 openToolPicker: command failed: ${err instanceof Error ? err.message : String(err)}`);
-					void vscode.window.showErrorMessage(
-						`Could not open tool picker: ${err instanceof Error ? err.message : String(err)}`
-					);
-				}
-			},
+			openToolPicker:         async () => this._handleOpenToolPickerCommand(),
 			openFileFromList:       async () => {
 				const paths: unknown = message.paths;
 				if (!Array.isArray(paths) || paths.length === 0) { return; }
@@ -806,6 +768,39 @@ class CopilotTokenTracker implements vscode.Disposable {
 		}
 		await this.dispatch(message.command, handler);
 		return true;
+	}
+
+	private async _handleOpenToolPickerCommand(): Promise<void> {
+		this.log('🔧 openToolPicker: handler invoked');
+		const allCommands = await vscode.commands.getCommands(true);
+		const configureToolsId = 'workbench.action.chat.configureTools';
+		const hasConfigure = allCommands.includes(configureToolsId);
+		this.log(`🔧 openToolPicker: '${configureToolsId}' registered = ${hasConfigure}`);
+		if (!hasConfigure) {
+			this.log('🔧 openToolPicker: command not registered, opening chat panel + notifying user');
+			await vscode.commands.executeCommand('workbench.action.chat.open');
+			void vscode.window.showInformationMessage(
+				'To manage tools, click the Tools (⚙) button in the GitHub Copilot Chat input area.'
+			);
+			return;
+		}
+		// ConfigureToolsAction requires: (1) chat in Agent mode, (2) a focused chat widget.
+		try {
+			this.log('🔧 openToolPicker: opening chat in agent mode');
+			await vscode.commands.executeCommand('workbench.action.chat.open', { mode: 'agent' });
+		} catch (err) {
+			this.log(`🔧 openToolPicker: chat.open failed: ${err instanceof Error ? err.message : String(err)}`);
+		}
+		try {
+			this.log(`🔧 openToolPicker: executing '${configureToolsId}'`);
+			await vscode.commands.executeCommand(configureToolsId);
+			this.log('🔧 openToolPicker: command executed successfully');
+		} catch (err) {
+			this.log(`🔧 openToolPicker: command failed: ${err instanceof Error ? err.message : String(err)}`);
+			void vscode.window.showErrorMessage(
+				`Could not open tool picker: ${err instanceof Error ? err.message : String(err)}`
+			);
+		}
 	}
 
 	private consumeLocalViewRegressionProbe(viewId: string): ViewRegressionProbeConfig | undefined {
@@ -3552,33 +3547,29 @@ class CopilotTokenTracker implements vscode.Disposable {
 		};
 	}
 
+	private _mergeCodeWorkspaceCustomizationFiles(norm: string): CustomizationFileEntry[] {
+		const folders = _parseCodeWorkspaceFolders(norm);
+		const allFiles: CustomizationFileEntry[] = [];
+		const seen = new Set<string>();
+		for (const folder of folders) {
+			try {
+				for (const f of _scanWorkspaceCustomizationFiles(folder)) {
+					const key = path.normalize(f.path);
+					if (!seen.has(key)) { seen.add(key); allFiles.push(f); }
+				}
+			} catch { /* skip per-folder scan errors */ }
+		}
+		return allFiles;
+	}
+
 	private ensureWorkspaceCustomizationCached(norm: string): void {
 		if (this._customizationFilesCache.has(norm)) { return; }
 		try {
-			// Handle multi-root workspace (.code-workspace) files — scan each folder and merge
 			if (norm.endsWith('.code-workspace')) {
-				const folders = _parseCodeWorkspaceFolders(norm);
-				if (folders.length > 0) {
-					const allFiles: CustomizationFileEntry[] = [];
-					const seen = new Set<string>();
-					for (const folder of folders) {
-						try {
-							const files = _scanWorkspaceCustomizationFiles(folder);
-							for (const f of files) {
-								const key = path.normalize(f.path);
-								if (!seen.has(key)) {
-									seen.add(key);
-									allFiles.push(f);
-								}
-							}
-						} catch { /* skip per-folder scan errors */ }
-					}
-					this._customizationFilesCache.set(norm, allFiles);
-					return;
-				}
+				const merged = this._mergeCodeWorkspaceCustomizationFiles(norm);
+				if (merged.length > 0) { this._customizationFilesCache.set(norm, merged); return; }
 			}
-			const files = _scanWorkspaceCustomizationFiles(norm);
-			this._customizationFilesCache.set(norm, files);
+			this._customizationFilesCache.set(norm, _scanWorkspaceCustomizationFiles(norm));
 		} catch (e) { /* ignore scan errors per workspace */ }
 	}
 
@@ -5777,6 +5768,25 @@ class CopilotTokenTracker implements vscode.Disposable {
 		void this.analysisPanel?.webview.postMessage({ command: 'switchTab', tab: 'tools', anchor: 'section-tool-curation' });
 	}
 
+	private async _handleSuppressUnknownTool(toolName: string): Promise<void> {
+		this.analysisPanel?.webview.postMessage({ command: 'toolSuppressed', toolName });
+		const config = vscode.workspace.getConfiguration('aiEngineeringFluency');
+		const current = config.get<string[]>('suppressedUnknownTools', []);
+		if (!current.includes(toolName)) {
+			await config.update('suppressedUnknownTools', [...current, toolName], vscode.ConfigurationTarget.Global);
+			this.log(`🔇 Suppressed unknown tool: ${toolName}`);
+		}
+	}
+
+	private _logTraceCuration(message: any): void {
+		const stage = typeof message.stage === 'string' ? message.stage : 'unknown';
+		let details = '{}';
+		if (message.details && typeof message.details === 'object') {
+			try { details = JSON.stringify(message.details); } catch { details = '[circular or non-serializable]'; }
+		}
+		this.log(`🧭 [Tool Curation Trace] ${stage} ${details}`);
+	}
+
 	private async handleAnalysisMessage(message: any): Promise<void> {
 		switch (message.command) {
 			case 'refresh':
@@ -5795,16 +5805,7 @@ class CopilotTokenTracker implements vscode.Disposable {
 				break;
 			case 'suppressUnknownTool': {
 				const toolName = message.toolName as string;
-				if (toolName) {
-					// Acknowledge immediately so the webview can remove the item without waiting for the disk write.
-					this.analysisPanel?.webview.postMessage({ command: 'toolSuppressed', toolName });
-					const config = vscode.workspace.getConfiguration('aiEngineeringFluency');
-					const current = config.get<string[]>('suppressedUnknownTools', []);
-					if (!current.includes(toolName)) {
-						await config.update('suppressedUnknownTools', [...current, toolName], vscode.ConfigurationTarget.Global);
-						this.log(`🔇 Suppressed unknown tool: ${toolName}`);
-					}
-				}
+				if (toolName) { await this._handleSuppressUnknownTool(toolName); }
 				break;
 			}
 			case 'loadRepoPrStats':
@@ -5824,19 +5825,9 @@ class CopilotTokenTracker implements vscode.Disposable {
 			case 'insightAction':
 					await this.dispatch(`insightAction:${message.id ?? ''}`, () => this.handleInsightAction(message));
 					break;
-			case 'traceUsageCuration': {
-				const stage = typeof message.stage === 'string' ? message.stage : 'unknown';
-				let details = '{}';
-				if (message.details && typeof message.details === 'object') {
-					try {
-						details = JSON.stringify(message.details);
-					} catch {
-						details = '[circular or non-serializable]';
-					}
-				}
-				this.log(`🧭 [Tool Curation Trace] ${stage} ${details}`);
+			case 'traceUsageCuration':
+				this._logTraceCuration(message);
 				break;
-			}
 		}
 	}
 
@@ -5876,6 +5867,23 @@ class CopilotTokenTracker implements vscode.Disposable {
 		}
 	}
 
+	private _buildAnalysisUpdateData(analysisStats: Awaited<ReturnType<typeof this.calculateUsageAnalysisStats>>): object {
+		const workspacePaths = vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [];
+		return {
+			today: analysisStats.today, last30Days: analysisStats.last30Days,
+			month: analysisStats.month, lastMonth: analysisStats.lastMonth,
+			locale: analysisStats.locale,
+			customizationMatrix: analysisStats.customizationMatrix || null,
+			missedPotential: analysisStats.missedPotential || [],
+			lastUpdated: analysisStats.lastUpdated.toISOString(),
+			backendConfigured: this.isBackendConfigured(),
+			currentWorkspacePaths: workspacePaths,
+			todaySessions: analysisStats.todaySessions || [],
+			insights: this.buildCurrentInsights(analysisStats),
+			curationAnalysis: analysisStats.curationAnalysis ?? null,
+		};
+	}
+
 	private async loadAnalysisStatsInBackground(panel: vscode.WebviewPanel): Promise<void> {
 		try {
 			this.postUsageLoadingProgress('start');
@@ -5885,24 +5893,10 @@ class CopilotTokenTracker implements vscode.Disposable {
 				availableTools: analysisStats.curationAnalysis?.availableTools.length ?? 0,
 				unusedTools: analysisStats.curationAnalysis?.unusedTools.length ?? 0,
 			});
-			void this.analysisPanel.webview.postMessage({
-				command: 'updateStats',
-				data: {
-					today: analysisStats.today, last30Days: analysisStats.last30Days, month: analysisStats.month, lastMonth: analysisStats.lastMonth,
-					locale: analysisStats.locale, customizationMatrix: analysisStats.customizationMatrix || null,
-					missedPotential: analysisStats.missedPotential || [], lastUpdated: analysisStats.lastUpdated.toISOString(),
-					backendConfigured: this.isBackendConfigured(),
-					currentWorkspacePaths: vscode.workspace.workspaceFolders?.map(f => f.uri.fsPath) ?? [],
-					todaySessions: analysisStats.todaySessions || [],
-					insights: this.buildCurrentInsights(analysisStats),
-					curationAnalysis: analysisStats.curationAnalysis ?? null,
-				},
-			});
+			void this.analysisPanel.webview.postMessage({ command: 'updateStats', data: this._buildAnalysisUpdateData(analysisStats) });
 		} catch (err) {
 			this.error(`Failed to load usage analysis stats: ${err}`);
-			this.postUsageLoadingProgress('error', {
-				error: String(err),
-			});
+			this.postUsageLoadingProgress('error', { error: String(err) });
 			if (this.analysisPanel && this.analysisPanel === panel) {
 				void this.analysisPanel.webview.postMessage({ command: 'updateStatsError', error: String(err) });
 			}

@@ -197,29 +197,43 @@ function _cmsGetSelectedModelCandidate(event: CmsEvent): SelectedModelMetadataRa
 	return v?.selectedModel ?? v?.inputState?.selectedModel;
 }
 
+function _cmsIsAutoModel(normalizedId: string, family: string): boolean {
+	return normalizedId === 'auto' || family === 'auto' || family.includes('auto') || normalizedId.includes('/auto');
+}
+
+function _cmsIsFoundryModel(normalizedId: string, vendor: string, family: string, extension: string, category: string): boolean {
+	const looksFoundry = family.includes('foundry') || family.includes('local') || extension.includes('foundry') || extension.includes('windows') || category.includes('foundry') || category.includes('windows') || normalizedId.includes('foundry');
+	const looksFoundryById = normalizedId.includes('foundry') && (normalizedId.includes('microsoft') || normalizedId.includes('aitk'));
+	return looksFoundryById || (vendor.includes('microsoft') && looksFoundry);
+}
+
+interface CmsModelMetaFields { family: string; vendor: string; extension: string; category: string; rawExtension: string | undefined }
+
+function _cmsExtractModelMetaFields(modelInfo: SelectedModelMetadataRaw | undefined): CmsModelMetaFields {
+	const meta = modelInfo?.metadata;
+	const ext = meta?.extension;
+	return {
+		family: _cmsNormalizeText(meta?.family),
+		vendor: _cmsNormalizeText(meta?.vendor),
+		extension: _cmsNormalizeText(ext?.value),
+		category: _cmsNormalizeText(meta?.modelPickerCategory?.label),
+		rawExtension: ext?.value,
+	};
+}
+
 function _cmsTrackModelSelectionSignals(modelId: string | undefined, modelInfo: SelectedModelMetadataRaw | undefined, analysis: SessionUsageAnalysis): void {
 	const normalizedId = (modelId ?? '').replace(/^copilot\//, '');
 	if (!normalizedId) { return; }
-	const family = _cmsNormalizeText(modelInfo?.metadata?.family);
-	const vendor = _cmsNormalizeText(modelInfo?.metadata?.vendor);
-	const extension = _cmsNormalizeText(modelInfo?.metadata?.extension?.value);
-	const category = _cmsNormalizeText(modelInfo?.metadata?.modelPickerCategory?.label);
-	if (normalizedId === 'auto' || family === 'auto' || family.includes('auto') || normalizedId.includes('/auto')) {
-		analysis.modelSwitching.autoSessions = 1;
-	}
-	const looksFoundry = family.includes('foundry') || family.includes('local') || extension.includes('foundry') || extension.includes('windows') || category.includes('foundry') || category.includes('windows') || normalizedId.includes('foundry');
-	const looksFoundryById = normalizedId.includes('foundry') && (normalizedId.includes('microsoft') || normalizedId.includes('aitk'));
-	if (looksFoundryById || (vendor.includes('microsoft') && looksFoundry)) {
-		analysis.modelSwitching.foundryWindowsSessions = 1;
-	}
+	const { family, vendor, extension, category, rawExtension } = _cmsExtractModelMetaFields(modelInfo);
+	if (_cmsIsAutoModel(normalizedId, family)) { analysis.modelSwitching.autoSessions = 1; }
+	if (_cmsIsFoundryModel(normalizedId, vendor, family, extension, category)) { analysis.modelSwitching.foundryWindowsSessions = 1; }
 	const provider = getModelBillingProvider(normalizedId);
 	if (provider === 'Other') {
 		analysis.modelSwitching.unknownProviderSessions = 1;
 		if (!analysis.modelSwitching.unknownProviderModels.includes(normalizedId)) { analysis.modelSwitching.unknownProviderModels.push(normalizedId); }
 	}
-	const selectedExtension = modelInfo?.metadata?.extension?.value;
-	if (selectedExtension && !analysis.modelSwitching.selectedModelExtensions.includes(selectedExtension)) {
-		analysis.modelSwitching.selectedModelExtensions.push(selectedExtension);
+	if (rawExtension && !analysis.modelSwitching.selectedModelExtensions.includes(rawExtension)) {
+		analysis.modelSwitching.selectedModelExtensions.push(rawExtension);
 	}
 }
 
@@ -586,6 +600,12 @@ function _pdsaCountModelSwitches(models: string[]): number {
 	return count;
 }
 
+function _pdsaGetSessionDefaultModel(sessionState: DeltaSessionState): string {
+	const sm = sessionState.selectedModel;
+	const ism = sessionState.inputState?.selectedModel;
+	return (sm?.identifier || sm?.metadata?.id || ism?.identifier || ism?.metadata?.id || 'gpt-4o').replace(/^copilot\//, '');
+}
+
 /** Extract model switching statistics from a reconstructed delta session state. */
 function _pdsaExtractModelSwitching(
 	deps: Pick<UsageAnalysisDeps, 'modelPricing'>,
@@ -593,26 +613,18 @@ function _pdsaExtractModelSwitching(
 	requests: SessionRequestRaw[],
 	analysis: SessionUsageAnalysis
 ): void {
-	const sessionDefaultModel = (
-		sessionState.selectedModel?.identifier ||
-		sessionState.selectedModel?.metadata?.id ||
-		sessionState.inputState?.selectedModel?.identifier ||
-		sessionState.inputState?.selectedModel?.metadata?.id ||
-		'gpt-4o'
-	).replace(/^copilot\//, '');
+	const sessionDefaultModel = _pdsaGetSessionDefaultModel(sessionState);
 
-	// Detect Auto model from the session-level selected model
-	const sessionSelectedId = (sessionState.selectedModel?.identifier || sessionState.inputState?.selectedModel?.identifier || '').replace(/^copilot\//, '');
-	if (sessionSelectedId === 'auto') {
-		analysis.modelSwitching.autoSessions = 1;
-	}
+	const sm = sessionState.selectedModel;
+	const ism = sessionState.inputState?.selectedModel;
+	const sessionSelectedId = (sm?.identifier || ism?.identifier || '').replace(/^copilot\//, '');
+	if (sessionSelectedId === 'auto') { analysis.modelSwitching.autoSessions = 1; }
 
 	const models: string[] = [];
 	for (const req of requests) {
 		if (!req || !req.requestId) { continue; }
 		const reqModel = _pdsaGetReqModel(req, sessionDefaultModel, deps.modelPricing);
 		models.push(reqModel);
-		// Detect Foundry models from per-request modelId
 		const reqModelLower = reqModel.toLowerCase();
 		if (reqModelLower.includes('foundry') && (reqModelLower.includes('microsoft') || reqModelLower.includes('aitk'))) {
 			analysis.modelSwitching.foundryWindowsSessions = 1;
@@ -1458,7 +1470,10 @@ type CmsEvent = JsonlEventRaw & { type?: string; data?: { selectedModel?: string
 function _cmsGetKind0ModelId(event: CmsEvent): string | null {
 	if (event.kind !== 0) { return null; }
 	const v = event.v as { selectedModel?: { identifier?: string; metadata?: { id?: string } }; inputState?: { selectedModel?: { identifier?: string; metadata?: { id?: string } } } } | undefined;
-	const id = v?.selectedModel?.identifier || v?.selectedModel?.metadata?.id || v?.inputState?.selectedModel?.identifier || v?.inputState?.selectedModel?.metadata?.id;
+	if (!v) { return null; }
+	const sm = v.selectedModel;
+	const ism = v.inputState?.selectedModel;
+	const id = sm?.identifier || sm?.metadata?.id || ism?.identifier || ism?.metadata?.id;
 	if (!id) { return null; }
 	return id.replace(/^copilot\//, '');
 }
