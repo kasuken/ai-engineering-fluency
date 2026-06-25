@@ -829,15 +829,15 @@ function renderFolderAnalyzerTab(): string {
         </label>
         <select id="tool-type-select" class="tool-type-select">
           <option value="auto">🔍 Auto-detect (all JSON / JSONL files)</option>
+          <option value="antigravity">🚀 Antigravity (.jsonl only)</option>
+          <option value="claude-code">🟣 Claude Code (.jsonl only)</option>
+          <option value="claude-desktop">🖥️ Claude Desktop</option>
+          <option value="continue">⚡ Continue</option>
           <option value="copilot-chat">💙 GitHub Copilot Chat (VS Code)</option>
           <option value="copilot-cli">🤖 GitHub Copilot CLI</option>
-          <option value="claude-code">🟣 Claude Code (.jsonl only)</option>
           <option value="gemini-cli">💎 Gemini CLI (.jsonl only)</option>
-          <option value="antigravity">🚀 Antigravity (.jsonl only)</option>
-          <option value="continue">⚡ Continue</option>
-          <option value="opencode">🟢 OpenCode (JSON format only — DB not supported)</option>
           <option value="mistral-vibe">🔥 Mistral Vibe</option>
-          <option value="claude-desktop">🖥️ Claude Desktop</option>
+          <option value="opencode">🟢 OpenCode (JSON format only — DB not supported)</option>
         </select>
       </div>
       <div style="margin-top: 16px;">
