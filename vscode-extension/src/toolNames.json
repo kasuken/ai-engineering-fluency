@@ -974,4 +974,8 @@
   ,"mcp__visualize__read_me": "MCP Visualize: Read Me"
   ,"mcp__visualize__show_widget": "MCP Visualize: Show Widget"
   ,"read_url_content": "Read URL Content"
+  ,"mcp_jira_editJiraIssue": "JIRA MCP (Remote): Edit Jira Issue"
+  ,"mcp_jira_getAccessibleAtlassianResources": "JIRA MCP (Remote): Get Accessible Atlassian Resources"
+  ,"mcp_jira_getConfluencePage": "JIRA MCP (Remote): Get Confluence Page"
+  ,"mcp_jira_getJiraIssue": "JIRA MCP (Remote): Get Jira Issue"
 }
