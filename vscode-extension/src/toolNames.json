@@ -967,4 +967,5 @@
   ,"mcp_azure_bicep_m_list_avm_metadata": "Azure Bicep MCP (Remote): List AVM Metadata"
   ,"mcp_azure_mcp_policy": "Azure MCP Policy"
   ,"workiq_search_emails": "WorkIQ Search Emails"
+  ,"resolve_memory_file_uri": "Serena: Resolve Memory File URI"
 }
