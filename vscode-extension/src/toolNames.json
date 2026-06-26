@@ -968,4 +968,10 @@
   ,"mcp_azure_mcp_policy": "Azure MCP Policy"
   ,"workiq_search_emails": "WorkIQ Search Emails"
   ,"resolve_memory_file_uri": "Serena: Resolve Memory File URI"
+  ,"generate_image": "Generate Image"
+  ,"mcp__plugins__list_plugins": "Plugins List"
+  ,"mcp__skills__list_skills": "Skills List"
+  ,"mcp__visualize__read_me": "Read Me"
+  ,"mcp__visualize__show_widget": "Show Widget"
+  ,"read_url_content": "Read URL Content"
 }
